@@ -23,3 +23,18 @@ jobs:
       - run: cargo doc --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+  live-kdc:
+    # The client against a real MIT KDC, and its GSS tokens against MIT's
+    # own acceptor.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq krb5-kdc krb5-admin-server krb5-user python3-gssapi
+      - run: scripts/test-kdc.sh "$RUNNER_TEMP/krb5test"
+      - run: cat "$RUNNER_TEMP/krb5test/test.env" >> "$GITHUB_ENV"
+      - run: cargo test --test kdc -- --nocapture
+      - run: cargo build --example gss_client
+      - run: KRB5_CONFIG="$KRB5_TEST_DIR/krb5.conf" scripts/mit-acceptor.py "$KRB5_TEST_DIR" target/debug/examples/gss_client

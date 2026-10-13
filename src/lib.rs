@@ -1,31 +1,40 @@
-//! Pure-Rust Kerberos 5, acceptor side.
+//! Pure-Rust Kerberos 5: GSS-API acceptor and initiator, plus a KDC client.
 //!
-//! This crate implements what a server needs to authenticate Kerberos
-//! clients through GSS-API (for example NFS over RPCSEC_GSS), with no
-//! dependency on MIT krb5, Heimdal or glibc:
+//! No dependency on MIT krb5, Heimdal or glibc.
 //!
+//! **Server side**
 //! * [`Keytab`] — load service keys from an MIT-format keytab.
 //! * [`KerberosContext::accept_token`] — validate an AP-REQ (ticket,
 //!   authenticator, clock skew, validity window) and build the AP-REP
 //!   when mutual authentication was requested.
-//! * [`token::PerMessageTokens`] — RFC 4121 §4.2 Wrap and MIC tokens for
-//!   an established context.
+//!
+//! **Client side**
+//! * [`KdcClient`] — the AS exchange (`kinit`, with a password or a
+//!   keytab, including PA-ENC-TIMESTAMP pre-authentication) and the TGS
+//!   exchange (service tickets), over TCP.
+//! * [`InitiatorContext`] — `gss_init_sec_context`: the AP-REQ token and
+//!   verification of the acceptor's AP-REP.
+//!
+//! **Both**: [`token::PerMessageTokens`] — RFC 4121 §4.2 Wrap and MIC.
 //!
 //! Supported enctypes are the four AES ones: 17/18
 //! (`aes{128,256}-cts-hmac-sha1-96`, RFC 3962) and 19/20
 //! (`aes128-cts-hmac-sha256-128`, `aes256-cts-hmac-sha384-192`, RFC 8009).
-//! There is no KDC and no initiator.
+//! Not implemented: a KDC, UDP transport, DNS/krb5.conf KDC discovery,
+//! cross-realm referrals, FAST, PKINIT, credential caches and delegation.
 //!
 //! # Evidence
 //!
-//! Every crypto primitive is pinned to the published RFC test vectors,
-//! and the acceptor is tested against tickets and tokens recorded from a
-//! live MIT KDC and MIT `libgssapi` (see `testdata/`). A self-round-trip
-//! test is not evidence for a wire format: if it round-trips but
-//! disagrees with the RFC, it is a private cipher no other
+//! Every crypto primitive is pinned to the published RFC test vectors.
+//! The acceptor is tested against tickets and tokens recorded from a live
+//! MIT KDC and MIT `libgssapi` (`testdata/`). The client is tested live
+//! against an MIT KDC (`tests/kdc.rs`), and its GSS tokens against MIT's
+//! own acceptor (`scripts/mit-acceptor.py`), for all four enctypes. A
+//! self-round-trip test is not evidence for a wire format: if it
+//! round-trips but disagrees with the RFC, it is a private cipher no other
 //! implementation speaks.
 //!
-//! # Example
+//! # Acceptor
 //!
 //! ```no_run
 //! use krb5::{Keytab, KerberosContext};
@@ -34,16 +43,43 @@
 //! # let init_token: Vec<u8> = vec![];
 //! let keytab = Keytab::load("/etc/krb5.keytab")?;
 //! let (ctx, ap_rep) = KerberosContext::accept_token(&keytab, &init_token)?;
-//! println!("authenticated {}@{}", ctx.client_principal, ctx.client_realm);
+//! println!("authenticated {}", ctx.client_principal);
 //! // Send `ap_rep` back to the client (empty unless mutual auth was asked for).
 //! let tokens = ctx.per_message_tokens()?;
 //! # let _ = (ap_rep, tokens);
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! # Initiator
+//!
+//! ```no_run
+//! use krb5::initiator::{GSS_C_INTEG_FLAG, GSS_C_MUTUAL_FLAG};
+//! use krb5::{InitiatorContext, KdcClient, Principal};
+//!
+//! # fn send(_: &[u8]) -> Vec<u8> { vec![] }
+//! # fn main() -> Result<(), krb5::ClientError> {
+//! let kdc = KdcClient::new("EXAMPLE.COM", ["kdc.example.com"]);
+//! let tgt = kdc.login_with_password(&Principal::parse("alice@EXAMPLE.COM")?, "secret")?;
+//! let creds = kdc.service_ticket(&tgt, &Principal::parse("nfs/server.example.com@EXAMPLE.COM")?)?;
+//!
+//! let (mut ctx, token) = InitiatorContext::new(&creds, GSS_C_MUTUAL_FLAG | GSS_C_INTEG_FLAG)?;
+//! let ap_rep = send(&token);          // to the server, which replies with its AP-REP
+//! ctx.step(&ap_rep)?;
+//! let tokens = ctx.per_message_tokens()?;
+//! let mic = tokens.emit_mic(ctx.send_seq(), b"message")
+//!     .map_err(|e| krb5::ClientError::Protocol(e.to_string()))?;
+//! # let _ = mic;
+//! # Ok(())
+//! # }
+//! ```
 
 pub mod acceptor;
+pub mod client;
+mod der;
+pub mod initiator;
 pub mod kdf;     // RFC 3961 §5.1 DR/DK, RFC 3962 §4, RFC 8009 §3
+pub mod key;
 pub mod nfold;   // RFC 3961 §5.1 n-fold
 pub mod profile; // RFC 3961 §5.3 simplified profile (confounder + HMAC)
 pub mod token;   // RFC 4121 §4.2 per-message Wrap and MIC tokens
@@ -55,3 +91,6 @@ pub use acceptor::{
     EncType, KerberosContext, KerberosError, Keytab, Result, ServiceKey,
     DEFAULT_CLOCK_SKEW_SECS,
 };
+pub use client::{ClientError, Credentials, KdcClient, Principal};
+pub use initiator::InitiatorContext;
+pub use key::Key;
