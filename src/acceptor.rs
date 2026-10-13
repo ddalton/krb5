@@ -313,6 +313,12 @@ impl Keytab {
         candidates.first().copied()
     }
 
+    /// A keytab from keys already in memory (e.g. fetched from a secret
+    /// store rather than a file).
+    pub fn from_keys(keys: Vec<ServiceKey>) -> Self {
+        Keytab { keys }
+    }
+
     /// Get all keys (for debugging)
     pub fn keys(&self) -> &[ServiceKey] {
         &self.keys
@@ -1054,8 +1060,8 @@ fn parse_asn1_integer(data: &[u8]) -> Result<i32> {
     
     let int_bytes = &data[header_size..header_size + length];
     
-    // Convert big-endian bytes to integer
-    let mut value = 0i32;
+    // Big-endian two's complement: sign-extend from the first octet.
+    let mut value: i32 = if int_bytes.first().is_some_and(|b| b & 0x80 != 0) { -1 } else { 0 };
     for &byte in int_bytes {
         value = (value << 8) | (byte as i32);
     }
@@ -1339,19 +1345,13 @@ fn is_leap_year(year: i32) -> bool {
 
 /// Encode ASN.1 INTEGER
 fn encode_asn1_integer(value: i32) -> Vec<u8> {
-    let mut result = vec![0x02];  // INTEGER tag
-    
-    // Convert to big-endian bytes
-    let bytes = value.to_be_bytes();
-    
-    // Find first non-zero byte (or keep at least one byte)
-    let start = bytes.iter().position(|&b| b != 0).unwrap_or(3);
-    let int_bytes = &bytes[start..];
-    
-    result.push(int_bytes.len() as u8);
-    result.extend_from_slice(int_bytes);
-    
-    result
+    // DER INTEGER is minimal TWO'S COMPLEMENT. Stripping every leading
+    // zero octet (as this once did) turns 200 into `02 01 C8`, which every
+    // decoder reads as -56. For the AP-REP's cusec that is a broken echo
+    // whenever the microseconds land in 128..=255 or 32768..=65535 —
+    // about 1 handshake in 30 — and the client rejects mutual auth with
+    // KRB_AP_ERR_MUT_FAIL.
+    crate::der::int(value as i64)
 }
 
 /// Encode ASN.1 OCTET STRING
@@ -2350,6 +2350,28 @@ mod tests {
         assert_eq!(result, "test");
     }
     
+    #[test]
+    fn integers_whose_top_bit_is_set_keep_their_zero_octet() {
+        assert_eq!(encode_asn1_integer(200), [0x02, 0x02, 0x00, 0xC8]);
+        assert_eq!(encode_asn1_integer(40_000), [0x02, 0x03, 0x00, 0x9C, 0x40]);
+        assert_eq!(encode_asn1_integer(127), [0x02, 0x01, 0x7F]);
+        assert_eq!(encode_asn1_integer(0), [0x02, 0x01, 0x00]);
+        for cusec in [0, 127, 128, 200, 255, 256, 32_767, 32_768, 40_000, 65_535, 999_999] {
+            assert_eq!(parse_asn1_integer(&encode_asn1_integer(cusec)).unwrap(), cusec);
+        }
+    }
+
+    /// The AP-REP must echo cusec exactly, including values whose DER
+    /// encoding needs a leading zero octet.
+    #[test]
+    fn the_ap_rep_echoes_every_cusec_exactly() {
+        for cusec in [128u32, 200, 255, 32_768, 65_535] {
+            let part = EncAPRepPart::create(1_790_000_000, cusec, None).encode_asn1();
+            let f = crate::der::Fields::parse_tagged("EncAPRepPart", 0x7B, &part).unwrap();
+            assert_eq!(f.get(1).unwrap().u32().unwrap(), cusec);
+        }
+    }
+
     #[test]
     fn test_encode_asn1_integer() {
         let encoded = encode_asn1_integer(42);
