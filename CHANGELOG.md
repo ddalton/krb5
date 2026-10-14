@@ -28,8 +28,22 @@ may break the API).
   `KerberosContext::accept_token_with_conf`), read as MIT reads it: a
   plain integer, and the default (300) if it is not one.
 
+- UDP, as MIT's `k5_sendto_kdc` uses it: a request of at most
+  `udp_preference_limit` octets (default 1465) goes over UDP first, a
+  larger one over TCP first; a pass over every KDC tries the preferred
+  transport and then the other, two more passes resend over UDP, and a
+  UDP reply of `KRB_ERR_RESPONSE_TOO_BIG` sends the request again over
+  TCP only. `KdcClient::with_udp`, `with_udp_preference_limit`,
+  `client::Transport`, `dns::locate_kdc_servers`.
+
 ### Changed
 
+- Requests go over UDP first by default (see above); `with_udp(false)`
+  keeps the previous TCP-only behaviour.
+- DNS lookup follows MIT's order with both transports: URI `tcp` and
+  `udp` entries together, then `_udp` SRV records before `_tcp` ones, all
+  kept (previously only the first transport that answered). `udp`
+  entries and `_udp` targets may still be tried over TCP.
 - `from_config` and `discover` apply the settings above, so a
   `krb5.conf` that sets them now changes what is asked for, and one whose
   value does not parse, or leaves no AES enctype, is an error.

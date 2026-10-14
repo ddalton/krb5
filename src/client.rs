@@ -22,7 +22,7 @@ use crate::key::{Key, KeyError};
 use rand::RngCore;
 use std::fmt;
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{TcpStream, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::debug;
 pub use xrealm::MAX_HOPS;
@@ -291,6 +291,39 @@ const KDC_OPT_RENEWABLE: u32 = 1 << 23;
 /// MIT's KDC_TKT_COMMON_MASK: the ticket flags a TGS request asks for again.
 const KDC_TKT_COMMON_MASK: u32 = 0x5480_0000;
 
+/// MIT's DEFAULT_UDP_PREF_LIMIT and HARD_UDP_LIMIT (sendto_kdc.c).
+pub const DEFAULT_UDP_PREFERENCE_LIMIT: usize = 1465;
+const HARD_UDP_LIMIT: usize = 32700;
+/// How long the first pass waits for each UDP answer, and how many passes
+/// resend over UDP (MIT's 1 s and MAX_PASS).
+const UDP_FIRST_WAIT: Duration = Duration::from_secs(1);
+const UDP_PASSES: usize = 3;
+/// The largest UDP reply read.
+const UDP_MAX_REPLY: usize = 65535;
+/// KRB_ERR_RESPONSE_TOO_BIG (RFC 4120 §7.5.9).
+pub const KRB_ERR_RESPONSE_TOO_BIG: i32 = 52;
+
+/// How a KDC address may be reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    Tcp,
+    Udp,
+    /// Either, preferred by request size (`krb5.conf` entries, and DNS
+    /// `_udp` records, which this crate also tries over TCP).
+    Either,
+}
+
+/// A KDC's answer, and whether it came over UDP.
+struct Answer {
+    data: Vec<u8>,
+    via_udp: bool,
+}
+
+fn is_too_big(reply: &[u8]) -> bool {
+    reply.first() == Some(&app(30))
+        && KrbError::parse(reply).is_ok_and(|e| e.code == KRB_ERR_RESPONSE_TOO_BIG)
+}
+
 /// The enctypes this crate can use, in the order given.
 fn supported(enctypes: &[i32]) -> Vec<i32> {
     enctypes
@@ -354,6 +387,11 @@ pub struct KdcClient {
     realm: String,
     kdcs: Vec<String>,
     timeout: Duration,
+    /// The transport each of `kdcs` may be reached over.
+    transports: Vec<Transport>,
+    /// Requests up to this many octets go over UDP first.
+    udp_preference_limit: usize,
+    use_udp: bool,
     /// Enctypes asked for in the AS exchange and in TGS exchanges.
     tkt_enctypes: Vec<i32>,
     tgs_enctypes: Vec<i32>,
@@ -375,10 +413,14 @@ impl KdcClient {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
+        let kdcs: Vec<String> = kdcs.into_iter().map(Into::into).collect();
         KdcClient {
             realm: realm.into(),
-            kdcs: kdcs.into_iter().map(Into::into).collect(),
+            transports: vec![Transport::Either; kdcs.len()],
+            kdcs,
             timeout: Duration::from_secs(10),
+            udp_preference_limit: DEFAULT_UDP_PREFERENCE_LIMIT,
+            use_udp: true,
             tkt_enctypes: DEFAULT_ENCTYPES.to_vec(),
             tgs_enctypes: DEFAULT_ENCTYPES.to_vec(),
             lifetime: Duration::from_secs(24 * 3600),
@@ -410,13 +452,17 @@ impl KdcClient {
         if realm == self.realm {
             return Ok(self.clone());
         }
-        let kdcs = match self.realm_kdcs.get(realm) {
-            Some(k) => k.clone(),
-            None => Self::locate(&self.conf, realm, self.resolver.as_ref())?.kdcs,
+        let (kdcs, transports) = match self.realm_kdcs.get(realm) {
+            Some(k) => (k.clone(), vec![Transport::Either; k.len()]),
+            None => {
+                let c = Self::locate(&self.conf, realm, self.resolver.as_ref())?;
+                (c.kdcs, c.transports)
+            }
         };
         Ok(KdcClient {
             realm: realm.to_string(),
             kdcs,
+            transports,
             ..self.clone()
         })
     }
@@ -463,11 +509,14 @@ impl KdcClient {
                     &system
                 }
             };
-            let kdcs =
-                dns::locate_kdcs(resolver, realm, dns::dns_uri_lookup(conf)).map_err(dns_err)?;
-            if !kdcs.is_empty() {
-                debug!("{realm}: KDCs from DNS: {kdcs:?}");
-                return Ok(KdcClient::new(realm, kdcs).remembering(conf, Some(resolver)));
+            let servers = dns::locate_kdc_servers(resolver, realm, dns::dns_uri_lookup(conf))
+                .map_err(dns_err)?;
+            if !servers.is_empty() {
+                debug!("{realm}: KDCs from DNS: {servers:?}");
+                let (kdcs, transports): (Vec<String>, Vec<Transport>) = servers.into_iter().unzip();
+                let mut c = KdcClient::new(realm, kdcs).remembering(conf, Some(resolver));
+                c.transports = transports;
+                return Ok(c);
             }
         }
         Err(ConfigError::NoKdcFound {
@@ -534,6 +583,20 @@ impl KdcClient {
         self
     }
 
+    /// Requests of at most `limit` octets go over UDP first, larger ones
+    /// over TCP first (`udp_preference_limit`, default 1465; at most 32700).
+    pub fn with_udp_preference_limit(mut self, limit: usize) -> Self {
+        self.udp_preference_limit = limit.min(HARD_UDP_LIMIT);
+        self
+    }
+
+    /// Whether to use UDP at all (default true). Off, every request goes
+    /// over TCP, as MIT's `no_udp`.
+    pub fn with_udp(mut self, yes: bool) -> Self {
+        self.use_udp = yes;
+        self
+    }
+
     /// Ask for a forwardable TGT (`forwardable`; `kinit -f`).
     pub fn with_forwardable(mut self, yes: bool) -> Self {
         self.forwardable = yes;
@@ -555,6 +618,7 @@ impl KdcClient {
             .with_renew_lifetime(d.renew_lifetime)
             .with_forwardable(d.forwardable)
             .with_proxiable(d.proxiable)
+            .with_udp_preference_limit(d.udp_preference_limit)
     }
 
     /// Requested ticket lifetime (default 24 h; the KDC may shorten it).
@@ -848,18 +912,87 @@ impl KdcClient {
         der::seq(&parts)
     }
 
-    /// Send one request over TCP, trying each KDC in turn.
+    /// Send one request and return the reply, as MIT's `k5_sendto_kdc`
+    /// does: UDP first for a request of at most `udp_preference_limit`
+    /// octets (1465), TCP first for a larger one, and over TCP only if a
+    /// UDP reply is `KRB_ERR_RESPONSE_TOO_BIG`.
     fn exchange(&self, req: &[u8]) -> Result<Vec<u8>> {
-        let mut last = std::io::Error::new(std::io::ErrorKind::NotFound, "no KDCs configured");
-        for kdc in &self.kdcs {
+        let reply = self.send(req, self.use_udp)?;
+        if reply.via_udp && is_too_big(&reply.data) {
+            debug!(realm = %self.realm, "KDC reply too big for UDP; retrying over TCP");
+            return Ok(self.send(req, false)?.data);
+        }
+        Ok(reply.data)
+    }
+
+    /// MIT's `k5_sendto`, sequentially: a first pass over every server,
+    /// preferred transport first and the other one after (UDP waiting a
+    /// second for its answer), then up to two more passes resending over
+    /// UDP with a growing wait. TCP gets one connection per server.
+    fn send(&self, req: &[u8], allow_udp: bool) -> Result<Answer> {
+        let udp_first = allow_udp && req.len() <= self.udp_preference_limit;
+        let mut first = Vec::new();
+        let mut deferred = Vec::new();
+        for (kdc, &t) in self.kdcs.iter().zip(&self.transports) {
             let addr = with_default_port(kdc);
-            match self.exchange_one(&addr, req) {
-                Ok(r) => return Ok(r),
-                Err(e) => {
-                    debug!(kdc = %addr, error = %e, "KDC did not answer");
-                    last = e;
+            let preferred = if udp_first {
+                Transport::Udp
+            } else {
+                Transport::Tcp
+            };
+            match t {
+                Transport::Udp if !allow_udp => {}
+                Transport::Either => {
+                    first.push((addr.clone(), preferred));
+                    if allow_udp {
+                        let other = if udp_first {
+                            Transport::Tcp
+                        } else {
+                            Transport::Udp
+                        };
+                        deferred.push((addr, other));
+                    }
+                }
+                t if t == preferred => first.push((addr, t)),
+                t => deferred.push((addr, t)),
+            }
+        }
+        let attempts: Vec<(String, Transport)> = first.into_iter().chain(deferred).collect();
+
+        let mut last = std::io::Error::new(std::io::ErrorKind::NotFound, "no KDCs configured");
+        let mut note = |addr: &str, t: Transport, e: std::io::Error| {
+            debug!(kdc = %addr, transport = ?t, error = %e, "KDC did not answer");
+            last = e;
+        };
+        for (addr, t) in &attempts {
+            let r = match t {
+                Transport::Udp => self.exchange_udp(addr, req, UDP_FIRST_WAIT),
+                _ => self.exchange_tcp(addr, req),
+            };
+            match r {
+                Ok(data) => {
+                    return Ok(Answer {
+                        data,
+                        via_udp: *t == Transport::Udp,
+                    });
+                }
+                Err(e) => note(addr, *t, e),
+            }
+        }
+        let mut wait = UDP_FIRST_WAIT * 2;
+        for _ in 1..UDP_PASSES {
+            for (addr, _) in attempts.iter().filter(|(_, t)| *t == Transport::Udp) {
+                match self.exchange_udp(addr, req, wait) {
+                    Ok(data) => {
+                        return Ok(Answer {
+                            data,
+                            via_udp: true,
+                        });
+                    }
+                    Err(e) => note(addr, Transport::Udp, e),
                 }
             }
+            wait *= 2;
         }
         Err(ClientError::Unreachable {
             realm: self.realm.clone(),
@@ -867,7 +1000,35 @@ impl KdcClient {
         })
     }
 
-    fn exchange_one(&self, addr: &str, req: &[u8]) -> std::io::Result<Vec<u8>> {
+    /// One datagram to each address `addr` resolves to, accepting a reply
+    /// only from the address asked (a connected socket).
+    fn exchange_udp(&self, addr: &str, req: &[u8], wait: Duration) -> std::io::Result<Vec<u8>> {
+        use std::io::{Error, ErrorKind};
+        let mut last = Error::new(ErrorKind::NotFound, format!("{addr} did not resolve"));
+        for sa in addr.to_socket_addrs()? {
+            let bind: std::net::SocketAddr = match sa {
+                std::net::SocketAddr::V4(_) => (std::net::Ipv4Addr::UNSPECIFIED, 0).into(),
+                std::net::SocketAddr::V6(_) => (std::net::Ipv6Addr::UNSPECIFIED, 0).into(),
+            };
+            let attempt = || -> std::io::Result<Vec<u8>> {
+                let sock = UdpSocket::bind(bind)?;
+                sock.connect(sa)?;
+                sock.set_read_timeout(Some(wait.min(self.timeout)))?;
+                sock.send(req)?;
+                let mut buf = vec![0u8; UDP_MAX_REPLY];
+                let n = sock.recv(&mut buf)?;
+                buf.truncate(n);
+                Ok(buf)
+            };
+            match attempt() {
+                Ok(r) => return Ok(r),
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
+    }
+
+    fn exchange_tcp(&self, addr: &str, req: &[u8]) -> std::io::Result<Vec<u8>> {
         use std::io::{Error, ErrorKind};
         let mut last = Error::new(ErrorKind::NotFound, format!("{addr} did not resolve"));
         for sa in addr.to_socket_addrs()? {
@@ -1362,5 +1523,161 @@ mod tests {
             .login_with_password(&Principal::parse("a@R").unwrap(), "x")
             .unwrap_err();
         assert!(matches!(err, ClientError::Unreachable { .. }), "{err}");
+    }
+
+    // ------------------------------------------------- UDP and TCP
+
+    use std::net::{TcpListener, UdpSocket};
+    use std::sync::{Arc, Mutex};
+
+    /// What the fake KDC does on each transport.
+    #[derive(Clone, Copy)]
+    enum Does {
+        Answer,
+        TooBig,
+        Silent,
+        Refuse,
+    }
+
+    fn too_big() -> Vec<u8> {
+        der::cons(
+            app(30),
+            &[der::seq(&[
+                der::field(0, der::int(5)),
+                der::field(1, der::int(30)),
+                der::field(4, der::time(0)),
+                der::field(5, der::int(0)),
+                der::field(6, der::int(KRB_ERR_RESPONSE_TOO_BIG as i64)),
+                der::field(9, der::general_string("R")),
+                der::field(10, Principal::krbtgt("R").encode_name()),
+            ])],
+        )
+    }
+
+    /// A UDP and a TCP listener on one port; records which transport each
+    /// request came over and answers with the transport's name.
+    fn fake_kdc(udp: Does, tcp: Does) -> (String, Arc<Mutex<Vec<&'static str>>>) {
+        let u = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = u.local_addr().unwrap().port();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let l = log.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 65535];
+            while let Ok((_, from)) = u.recv_from(&mut buf) {
+                l.lock().unwrap().push("udp");
+                match udp {
+                    Does::Answer => drop(u.send_to(b"udp", from)),
+                    Does::TooBig => drop(u.send_to(&too_big(), from)),
+                    Does::Silent | Does::Refuse => {}
+                }
+            }
+        });
+        if !matches!(tcp, Does::Refuse) {
+            let t = TcpListener::bind(("127.0.0.1", port)).unwrap();
+            let l = log.clone();
+            std::thread::spawn(move || {
+                for c in t.incoming() {
+                    let mut c = c.unwrap();
+                    let mut len = [0u8; 4];
+                    c.read_exact(&mut len).unwrap();
+                    let mut req = vec![0u8; u32::from_be_bytes(len) as usize];
+                    c.read_exact(&mut req).unwrap();
+                    l.lock().unwrap().push("tcp");
+                    if let Does::Answer = tcp {
+                        c.write_all(&3u32.to_be_bytes()).unwrap();
+                        c.write_all(b"tcp").unwrap();
+                    }
+                }
+            });
+        }
+        (format!("127.0.0.1:{port}"), log)
+    }
+
+    fn client(addr: &str) -> KdcClient {
+        KdcClient::new("R", [addr]).with_timeout(Duration::from_secs(2))
+    }
+
+    #[test]
+    fn a_small_request_goes_over_udp_first() {
+        let (addr, log) = fake_kdc(Does::Answer, Does::Answer);
+        assert_eq!(client(&addr).exchange(&[0; 100]).unwrap(), b"udp");
+        assert_eq!(*log.lock().unwrap(), ["udp"]);
+    }
+
+    #[test]
+    fn a_request_over_the_preference_limit_goes_over_tcp_first() {
+        let (addr, log) = fake_kdc(Does::Answer, Does::Answer);
+        let c = client(&addr).with_udp_preference_limit(50);
+        assert_eq!(c.exchange(&[0; 100]).unwrap(), b"tcp");
+        assert_eq!(*log.lock().unwrap(), ["tcp"]);
+        // The default limit, MIT's 1465, is the boundary.
+        let (addr, log) = fake_kdc(Does::Answer, Does::Answer);
+        assert_eq!(client(&addr).exchange(&[0; 1465]).unwrap(), b"udp");
+        assert_eq!(client(&addr).exchange(&[0; 1466]).unwrap(), b"tcp");
+        assert_eq!(*log.lock().unwrap(), ["udp", "tcp"]);
+    }
+
+    #[test]
+    fn response_too_big_over_udp_is_asked_again_over_tcp() {
+        let (addr, log) = fake_kdc(Does::TooBig, Does::Answer);
+        assert_eq!(client(&addr).exchange(&[0; 100]).unwrap(), b"tcp");
+        assert_eq!(*log.lock().unwrap(), ["udp", "tcp"]);
+    }
+
+    #[test]
+    fn a_silent_udp_server_gives_way_to_tcp_after_a_second() {
+        let (addr, log) = fake_kdc(Does::Silent, Does::Answer);
+        let t = std::time::Instant::now();
+        assert_eq!(client(&addr).exchange(&[0; 100]).unwrap(), b"tcp");
+        assert!(
+            t.elapsed() >= Duration::from_millis(900),
+            "{:?}",
+            t.elapsed()
+        );
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+        assert_eq!(*log.lock().unwrap(), ["udp", "tcp"]);
+    }
+
+    #[test]
+    fn udp_is_resent_on_later_passes_when_tcp_is_refused() {
+        let (addr, log) = fake_kdc(Does::Silent, Does::Refuse);
+        let c = client(&addr).with_timeout(Duration::from_millis(300));
+        assert!(matches!(
+            c.exchange(&[0; 100]),
+            Err(ClientError::Unreachable { .. })
+        ));
+        assert_eq!(*log.lock().unwrap(), ["udp", "udp", "udp"], "three passes");
+    }
+
+    #[test]
+    fn with_udp_off_everything_is_tcp() {
+        let (addr, log) = fake_kdc(Does::Answer, Does::Answer);
+        assert_eq!(
+            client(&addr).with_udp(false).exchange(&[0; 10]).unwrap(),
+            b"tcp"
+        );
+        assert_eq!(*log.lock().unwrap(), ["tcp"]);
+    }
+
+    #[test]
+    fn a_tcp_only_address_is_never_sent_udp() {
+        let (addr, log) = fake_kdc(Does::Answer, Does::Answer);
+        let mut c = client(&addr);
+        c.transports = vec![Transport::Tcp];
+        assert_eq!(c.exchange(&[0; 10]).unwrap(), b"tcp");
+        let mut u = client(&addr);
+        u.transports = vec![Transport::Udp];
+        assert_eq!(
+            u.clone()
+                .with_udp_preference_limit(1)
+                .exchange(&[0; 10])
+                .unwrap(),
+            b"udp"
+        );
+        assert!(matches!(
+            u.with_udp(false).exchange(&[0; 10]),
+            Err(ClientError::Unreachable { .. })
+        ));
+        assert_eq!(*log.lock().unwrap(), ["tcp", "udp"]);
     }
 }

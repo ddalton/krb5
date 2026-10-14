@@ -283,6 +283,10 @@ pub struct ClientDefaults {
     pub forwardable: bool,
     /// `proxiable`, default false.
     pub proxiable: bool,
+    /// `udp_preference_limit`: requests up to this many octets go over UDP
+    /// first. Default 1465; a negative value means the default, and more
+    /// than 32700 means 32700, as in MIT. Not realm-specific.
+    pub udp_preference_limit: usize,
 }
 
 impl Krb5Conf {
@@ -347,6 +351,21 @@ impl Krb5Conf {
         };
         let boolean = |tag: &str| self.libdefault(realm, tag).is_some_and(conf_boolean);
         let renew = seconds("renew_lifetime", 0)?;
+        let udp_preference_limit = match self.get(&["libdefaults", "udp_preference_limit"]) {
+            None => 1465,
+            Some(v) => match parse_profile_int(v) {
+                // MIT fails the request on a bad value; we fail here.
+                None => {
+                    return Err(ConfigError::BadValue {
+                        tag: "udp_preference_limit".into(),
+                        value: v.to_string(),
+                        why: "not an integer".into(),
+                    });
+                }
+                Some(n) if n < 0 => 1465,
+                Some(n) => n.min(32700) as usize,
+            },
+        };
         Ok(ClientDefaults {
             tkt_enctypes: enctypes("default_tkt_enctypes")?,
             tgs_enctypes: enctypes("default_tgs_enctypes")?,
@@ -356,6 +375,7 @@ impl Krb5Conf {
             renew_lifetime: (renew > 0).then(|| std::time::Duration::from_secs(renew as u64)),
             forwardable: boolean("forwardable"),
             proxiable: boolean("proxiable"),
+            udp_preference_limit,
         })
     }
 }

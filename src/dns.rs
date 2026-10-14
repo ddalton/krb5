@@ -14,16 +14,16 @@
 //! priority, as MIT's `place_srv_entry` does (weights are ignored). A sole
 //! SRV target of `.` means the realm says it has no KDC service.
 //!
-//! Two deliberate departures, both because this crate speaks only TCP:
-//!
-//! * MIT also queries `_kerberos._udp` and talks UDP to what it finds.
-//!   Here, if `_tcp` gives nothing, the `_udp` targets are used **over
-//!   TCP** on the same port. KDCs listen on both (RFC 4120 §7.2.2; MIT,
-//!   Heimdal and Active Directory all do), and realms that publish only
-//!   `_udp` records, such as ATHENA.MIT.EDU, are common. URI records are
-//!   treated the same way: `tcp` entries if there are any, else `udp`.
-//! * MS-KKDCP (`kkdcp`) URI entries cannot be used; if they are all there
-//!   is, the SRV lookup still runs, where MIT would use the proxy.
+//! As in MIT, URI `tcp` entries are used over TCP and `udp` ones over UDP,
+//! and `_udp` SRV records are asked for before `_tcp` ones, every target
+//! being kept. One departure: `udp` entries and `_udp` targets are also
+//! tried over TCP on the same port, so a request whose reply is too big for
+//! UDP (`KRB_ERR_RESPONSE_TOO_BIG`) still has somewhere to go. KDCs listen
+//! on both (RFC 4120 §7.2.2; MIT, Heimdal and Active Directory all do),
+//! and realms that publish only `_udp` records, such as ATHENA.MIT.EDU,
+//! are common; MIT, retrying over TCP only, finds nothing for them. A URI
+//! answer with only MS-KKDCP (`kkdcp`) entries, which this crate cannot
+//! use, falls through to SRV, where MIT would use the proxy.
 //!
 //! # The resolver
 //!
@@ -39,6 +39,7 @@
 //! On macOS, `/etc/resolv.conf` reflects only the primary resolver, not
 //! per-domain (VPN) resolvers configured with `scutil`.
 
+use crate::client::Transport;
 use crate::config::{Krb5Conf, conf_boolean, parse_host_string};
 use std::fs;
 use std::io::{self, Read, Write};
@@ -281,6 +282,33 @@ fn parse_krb5srv(uri: &str) -> Option<(String, &str)> {
 /// [`KdcClient::new`](crate::KdcClient::new): URI records, then SRV (see
 /// the module docs). An empty list means DNS has none.
 pub fn locate_kdcs(resolver: &Resolver, realm: &str, use_uri: bool) -> io::Result<Vec<String>> {
+    Ok(locate_kdc_servers(resolver, realm, use_uri)?
+        .into_iter()
+        .map(|(addr, _)| addr)
+        .collect())
+}
+
+/// [`locate_kdcs`] with the transport each address may be used over, in
+/// MIT's order: the URI records' `tcp` and `udp` entries by priority; or,
+/// without usable URI records, the `_udp` SRV records and then the `_tcp`
+/// ones. An address found for both transports may use either. `udp`
+/// entries may also be tried over TCP (see the module docs).
+/// Add `addr`, or widen its transport to `Either` if it is already there.
+fn add(found: &mut Vec<(String, Transport)>, addr: String, t: Transport) {
+    match found.iter_mut().find(|(a, _)| *a == addr) {
+        Some((_, have)) if *have != t => *have = Transport::Either,
+        Some(_) => {}
+        None => found.push((addr, t)),
+    }
+}
+
+pub fn locate_kdc_servers(
+    resolver: &Resolver,
+    realm: &str,
+    use_uri: bool,
+) -> io::Result<Vec<(String, Transport)>> {
+    let mut found: Vec<(String, Transport)> = Vec::new();
+
     if use_uri {
         // As in MIT, a URI query that fails (some servers refuse the type)
         // just means "no URI records".
@@ -291,30 +319,38 @@ pub fn locate_kdcs(resolver: &Resolver, realm: &str, use_uri: bool) -> io::Resul
                 Vec::new()
             });
         by_priority(&mut uris);
-        let entries: Vec<(String, &str)> = uris
-            .iter()
-            .filter_map(|r| match r {
-                Record::Uri { target, .. } => parse_krb5srv(target),
-                _ => None,
-            })
-            .collect();
-        for transport in ["tcp", "udp"] {
-            let hosts: Vec<String> = entries
-                .iter()
-                .filter(|(t, _)| t == transport)
-                .filter_map(|(_, h)| parse_host_string(h, 88))
-                .collect();
-            if !hosts.is_empty() {
-                if transport == "udp" {
-                    debug!("{realm}: only udp URI records; using them over TCP");
-                }
-                return Ok(hosts);
+        for r in &uris {
+            let Record::Uri { target, .. } = r else {
+                continue;
+            };
+            let Some((transport, host)) = parse_krb5srv(target) else {
+                continue;
+            };
+            let t = match transport.as_str() {
+                "tcp" => Transport::Tcp,
+                "udp" => Transport::Either,
+                // MS-KKDCP needs HTTPS, which this crate does not speak.
+                _ => continue,
+            };
+            if let Some(addr) = parse_host_string(host, 88) {
+                add(&mut found, addr, t);
             }
         }
+        if !found.is_empty() {
+            return Ok(found);
+        }
     }
-    for protocol in ["_tcp", "_udp"] {
+
+    let mut failed = None;
+    for (protocol, t) in [("_udp", Transport::Either), ("_tcp", Transport::Tcp)] {
         let mut srvs =
-            resolver.query(&lookup_name("_kerberos", Some(protocol), realm), TYPE_SRV)?;
+            match resolver.query(&lookup_name("_kerberos", Some(protocol), realm), TYPE_SRV) {
+                Ok(r) => r,
+                Err(e) => {
+                    failed.get_or_insert(e);
+                    continue;
+                }
+            };
         by_priority(&mut srvs);
         let targets: Vec<(u16, &str)> = srvs
             .iter()
@@ -325,19 +361,17 @@ pub fn locate_kdcs(resolver: &Resolver, realm: &str, use_uri: bool) -> io::Resul
             .collect();
         if let [(_, ".")] = targets[..] {
             debug!("{realm}: SRV {protocol} says there is no KDC service");
-            return Ok(Vec::new());
+            continue;
         }
-        if !targets.is_empty() {
-            if protocol == "_udp" {
-                debug!("{realm}: only _udp SRV records; using them over TCP");
-            }
-            return Ok(targets
-                .iter()
-                .map(|(port, t)| format!("{t}:{port}"))
-                .collect());
+        for (port, target) in targets {
+            add(&mut found, format!("{target}:{port}"), t);
         }
     }
-    Ok(Vec::new())
+    match failed {
+        // Both queries failed: DNS gave no answer at all.
+        Some(e) if found.is_empty() => Err(e),
+        _ => Ok(found),
+    }
 }
 
 // ------------------------------------------------------------- the wire
@@ -950,21 +984,23 @@ mod tests {
     }
 
     #[test]
-    fn udp_only_srv_records_are_used_over_tcp_after_tcp_and_uri_come_up_empty() {
-        // ATHENA.MIT.EDU as it really is: no URI, no _tcp, three _udp.
+    fn srv_records_are_asked_for_udp_first_as_mit_does() {
+        // ATHENA.MIT.EDU as it really is: no URI, three _udp, no _tcp.
         let f = fake(zone(&[(
             "_kerberos._udp.athena.mit.edu.",
             TYPE_SRV,
             Says::Fixture("athena-udp-srv"),
         )]));
-        let kdcs = locate_kdcs(&resolver(&[f.addr]), "ATHENA.MIT.EDU", true).unwrap();
+        let servers = locate_kdc_servers(&resolver(&[f.addr]), "ATHENA.MIT.EDU", true).unwrap();
         assert_eq!(
-            kdcs,
+            servers,
             [
                 "kerberos-2.mit.edu.:88",
                 "kerberos-1.mit.edu.:88",
                 "kerberos.mit.edu.:88"
             ]
+            .map(|a| (a.to_string(), Transport::Either)),
+            "_udp targets, usable over TCP too"
         );
         let asked: Vec<_> = f
             .asked
@@ -977,9 +1013,34 @@ mod tests {
             asked,
             [
                 ("_kerberos.athena.mit.edu.".into(), TYPE_URI),
-                ("_kerberos._tcp.athena.mit.edu.".into(), TYPE_SRV),
                 ("_kerberos._udp.athena.mit.edu.".into(), TYPE_SRV),
+                ("_kerberos._tcp.athena.mit.edu.".into(), TYPE_SRV),
             ]
+        );
+    }
+
+    #[test]
+    fn transports_follow_the_records_and_merge_per_address() {
+        // FreeIPA's URI has the same host for tcp and udp: one address,
+        // either transport.
+        let f = fake(zone(&[(
+            "_kerberos.demo1.freeipa.org.",
+            TYPE_URI,
+            Says::Fixture("freeipa-uri"),
+        )]));
+        assert_eq!(
+            locate_kdc_servers(&resolver(&[f.addr]), "DEMO1.FREEIPA.ORG", true).unwrap(),
+            [("ipa.demo1.freeipa.org.:88".to_string(), Transport::Either)]
+        );
+        // Fedora's _tcp SRV: TCP only.
+        let g = fake(zone(&[(
+            "_kerberos._tcp.fedoraproject.org.",
+            TYPE_SRV,
+            Says::Fixture("fedora-tcp-srv"),
+        )]));
+        assert_eq!(
+            locate_kdc_servers(&resolver(&[g.addr]), "FEDORAPROJECT.ORG", false).unwrap(),
+            [("id.fedoraproject.org.:1088".to_string(), Transport::Tcp)]
         );
     }
 

@@ -818,3 +818,145 @@ fn a_realm_subsection_of_libdefaults_wins() {
         .unwrap();
     assert_eq!(tgt.endtime - tgt.starttime.unwrap_or(tgt.authtime), 45 * 60);
 }
+
+// ------------------------------------------------------------- transports
+
+/// A relay in front of the test KDC: forwards UDP datagrams and (unless
+/// `tcp` is false) TCP connections, counting each. With `too_big`, the
+/// first datagram is answered with KRB_ERR_RESPONSE_TOO_BIG instead.
+fn relay(e: &Env, tcp: bool, too_big: bool) -> (String, Arc<Mutex<Vec<&'static str>>>) {
+    use std::io::{Read, Write};
+    let kdc: std::net::SocketAddr = std::env::var("KRB5_TEST_KDC").unwrap().parse().unwrap();
+    let u = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = u.local_addr().unwrap().port();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let s = seen.clone();
+    let realm = e.realm.clone();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 65535];
+        let mut first = true;
+        while let Ok((n, from)) = u.recv_from(&mut buf) {
+            s.lock().unwrap().push("udp");
+            if too_big && std::mem::take(&mut first) {
+                u.send_to(&krb_error(52, &realm), from).unwrap();
+                continue;
+            }
+            let up = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            up.connect(kdc).unwrap();
+            up.send(&buf[..n]).unwrap();
+            let mut r = [0u8; 65535];
+            let m = up.recv(&mut r).unwrap();
+            u.send_to(&r[..m], from).unwrap();
+        }
+    });
+    if tcp {
+        let t = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let s = seen.clone();
+        std::thread::spawn(move || {
+            for c in t.incoming() {
+                let mut c = c.unwrap();
+                s.lock().unwrap().push("tcp");
+                let mut up = std::net::TcpStream::connect(kdc).unwrap();
+                let mut len = [0u8; 4];
+                c.read_exact(&mut len).unwrap();
+                let mut req = vec![0u8; u32::from_be_bytes(len) as usize];
+                c.read_exact(&mut req).unwrap();
+                up.write_all(&len).unwrap();
+                up.write_all(&req).unwrap();
+                up.read_exact(&mut len).unwrap();
+                let mut rep = vec![0u8; u32::from_be_bytes(len) as usize];
+                up.read_exact(&mut rep).unwrap();
+                c.write_all(&len).unwrap();
+                c.write_all(&rep).unwrap();
+            }
+        });
+    }
+    (format!("127.0.0.1:{port}"), seen)
+}
+
+use std::sync::{Arc, Mutex};
+
+/// A minimal KRB-ERROR with `code`, hand-built.
+fn krb_error(code: u8, realm: &str) -> Vec<u8> {
+    fn tlv(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut v = vec![tag];
+        if body.len() < 128 {
+            v.push(body.len() as u8);
+        } else {
+            v.extend([0x81, body.len() as u8]);
+        }
+        v.extend_from_slice(body);
+        v
+    }
+    let int = |n: u8| tlv(0x02, &[n]);
+    let gs = |s: &str| tlv(0x1B, s.as_bytes());
+    let mut seq = Vec::new();
+    seq.extend(tlv(0xA0, &int(5)));
+    seq.extend(tlv(0xA1, &int(30)));
+    seq.extend(tlv(0xA4, &tlv(0x18, b"20260101000000Z")));
+    seq.extend(tlv(0xA5, &int(0)));
+    seq.extend(tlv(0xA6, &int(code)));
+    seq.extend(tlv(0xA9, &gs(realm)));
+    let mut name = Vec::new();
+    name.extend(tlv(0xA0, &int(2)));
+    name.extend(tlv(0xA1, &tlv(0x30, &[gs("krbtgt"), gs(realm)].concat())));
+    seq.extend(tlv(0xAA, &tlv(0x30, &name)));
+    tlv(0x7E, &tlv(0x30, &seq))
+}
+
+/// Requests go to the real KDC over UDP by default, and only over UDP
+/// when that is all there is.
+#[test]
+fn the_kdc_is_reached_over_udp() {
+    let e = live!();
+    let (addr, seen) = relay(&e, false, false);
+    let kdc = KdcClient::new(e.realm.clone(), [addr.clone()]);
+    let tgt = kdc.login_with_password(&e.p("alice"), "alicepw").unwrap();
+    kdc.service_ticket(&tgt, &e.p("host/svc.krb5.test"))
+        .unwrap();
+    // PREAUTH_REQUIRED, AS-REQ, TGS-REQ: all UDP, nothing else on offer.
+    assert_eq!(*seen.lock().unwrap(), ["udp", "udp", "udp"]);
+    // With UDP off there is no way through.
+    let tcp_only = KdcClient::new(e.realm.clone(), [addr])
+        .with_udp(false)
+        .with_timeout(std::time::Duration::from_secs(2));
+    assert!(matches!(
+        tcp_only.login_with_password(&e.p("alice"), "alicepw"),
+        Err(krb5::ClientError::Unreachable { .. })
+    ));
+}
+
+/// KRB_ERR_RESPONSE_TOO_BIG over UDP: the request is sent again over TCP,
+/// and the real KDC's TCP answer completes the login.
+#[test]
+fn response_too_big_moves_the_request_to_tcp() {
+    let e = live!();
+    let (addr, seen) = relay(&e, true, true);
+    let kdc = KdcClient::new(e.realm.clone(), [addr]);
+    let tgt = kdc.login_with_password(&e.p("alice"), "alicepw").unwrap();
+    assert_eq!(tgt.server, Principal::krbtgt(&e.realm));
+    let seen = seen.lock().unwrap();
+    assert_eq!(&seen[..2], ["udp", "tcp"], "{seen:?}");
+}
+
+/// udp_preference_limit from krb5.conf: a limit of 1 sends everything
+/// over TCP first.
+#[test]
+fn udp_preference_limit_from_krb5_conf() {
+    let e = live!();
+    let (addr, seen) = relay(&e, true, false);
+    let conf = krb5::Krb5Conf::parse(&format!(
+        "[libdefaults]\n udp_preference_limit = 1\n[realms]\n {} = {{\n  kdc = {addr}\n }}\n",
+        e.realm
+    ))
+    .unwrap();
+    KdcClient::from_config(&conf, &e.realm)
+        .unwrap()
+        .login_with_password(&e.p("alice"), "alicepw")
+        .unwrap();
+    assert!(
+        seen.lock().unwrap().iter().all(|t| *t == "tcp"),
+        "{:?}",
+        seen.lock().unwrap()
+    );
+}
