@@ -12,6 +12,8 @@
 //! * [`KdcClient`] — the AS exchange (`kinit`, with a password or a
 //!   keytab, including PA-ENC-TIMESTAMP pre-authentication) and the TGS
 //!   exchange (service tickets), over TCP.
+//! * [`Krb5Conf`] — `krb5.conf`, for the default realm, a realm's KDCs
+//!   ([`KdcClient::discover`]) and `[domain_realm]`.
 //! * [`InitiatorContext`] — `gss_init_sec_context`: the AP-REQ token and
 //!   verification of the acceptor's AP-REP.
 //!
@@ -20,7 +22,7 @@
 //! Supported enctypes are the four AES ones: 17/18
 //! (`aes{128,256}-cts-hmac-sha1-96`, RFC 3962) and 19/20
 //! (`aes128-cts-hmac-sha256-128`, `aes256-cts-hmac-sha384-192`, RFC 8009).
-//! Not implemented: a KDC, UDP transport, DNS/krb5.conf KDC discovery,
+//! Not implemented: a KDC, UDP transport, DNS SRV KDC discovery,
 //! cross-realm referrals, FAST, PKINIT, credential caches and delegation.
 //!
 //! # Evidence
@@ -76,6 +78,7 @@
 
 pub mod acceptor;
 pub mod client;
+pub mod config; // krb5.conf: default realm, KDCs, [domain_realm]
 mod der;
 pub mod initiator;
 pub mod kdf; // RFC 3961 §5.1 DR/DK, RFC 3962 §4, RFC 8009 §3
@@ -93,5 +96,6 @@ pub use acceptor::{
     DEFAULT_CLOCK_SKEW_SECS, EncType, KerberosContext, KerberosError, Keytab, Result, ServiceKey,
 };
 pub use client::{ClientError, Credentials, KdcClient, Principal};
+pub use config::{ConfigError, Krb5Conf};
 pub use initiator::InitiatorContext;
 pub use key::Key;

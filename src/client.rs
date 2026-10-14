@@ -11,6 +11,7 @@
 //! FAST: the caller names the realm and its KDCs.
 
 use crate::acceptor::Keytab;
+use crate::config::{self, Krb5Conf};
 use crate::der::{self, Fields, Reader, app};
 use crate::key::{Key, KeyError};
 use rand::RngCore;
@@ -289,6 +290,19 @@ impl KdcClient {
             enctypes: DEFAULT_ENCTYPES.to_vec(),
             lifetime: Duration::from_secs(24 * 3600),
         }
+    }
+
+    /// A client for `realm` using the KDCs listed for it in `conf`
+    /// (`[realms] REALM kdc`), in order.
+    pub fn from_config(conf: &Krb5Conf, realm: &str) -> config::Result<Self> {
+        Ok(KdcClient::new(realm, conf.kdcs(realm)?))
+    }
+
+    /// A client for `realm` from the system configuration: the
+    /// `KRB5_CONFIG` files, else `/etc/krb5.conf`. DNS SRV lookup is not
+    /// implemented, so the realm must have `kdc` entries there.
+    pub fn discover(realm: &str) -> config::Result<Self> {
+        Self::from_config(&Krb5Conf::load_default()?, realm)
     }
 
     /// Per-KDC connect and read timeout (default 10 s).

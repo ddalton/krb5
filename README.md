@@ -16,7 +16,11 @@ tickets without shelling out to `kinit`.
   subkey, and build the AP-REP for mutual authentication.
 - **KDC client** — AS exchange with a password or keytab, including
   PA-ENC-TIMESTAMP pre-authentication and ETYPE-INFO2 salts; TGS exchange
-  for service tickets; TCP transport.
+  for service tickets; TCP transport. KDCs come from `krb5.conf` or are
+  passed in directly.
+- **krb5.conf** — MIT's profile format, parsed as MIT does (includes,
+  final flags, `KRB5_CONFIG` lists): default realm, a realm's KDCs, and
+  `[domain_realm]` host-to-realm mapping.
 - **Initiator** — the AP-REQ context token (subkey, sequence number,
   RFC 4121 checksum) and AP-REP verification, including acceptor subkeys.
 - **Crypto** — RFC 3961 n-fold and DR/DK, RFC 3962
@@ -24,7 +28,7 @@ tickets without shelling out to `kinit`.
   (`aes128-cts-hmac-sha256-128`, `aes256-cts-hmac-sha384-192`).
 - **Per-message tokens** — RFC 4121 §4.2 Wrap and MIC.
 
-Not implemented: a KDC, UDP, KDC discovery (DNS SRV / krb5.conf),
+Not implemented: a KDC, UDP, KDC discovery through DNS SRV records,
 cross-realm referrals, FAST, PKINIT, credential caches, delegation.
 
 ## Server
@@ -49,7 +53,9 @@ use `accept_token_with_skew` to apply your own policy.
 use krb5::initiator::{GSS_C_INTEG_FLAG, GSS_C_MUTUAL_FLAG};
 use krb5::{InitiatorContext, KdcClient, Keytab, Principal};
 
-let kdc = KdcClient::new("EXAMPLE.COM", ["kdc1.example.com", "kdc2.example.com:88"]);
+// KDCs from KRB5_CONFIG or /etc/krb5.conf ([realms] EXAMPLE.COM kdc = ...)
+let kdc = KdcClient::discover("EXAMPLE.COM")?;
+// or name them: KdcClient::new("EXAMPLE.COM", ["kdc1.example.com", "kdc2.example.com:88"])
 
 let me = Principal::parse("alice@EXAMPLE.COM")?;
 let tgt = kdc.login_with_password(&me, "secret")?;

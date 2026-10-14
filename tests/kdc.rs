@@ -174,3 +174,15 @@ fn unknown_principals_are_reported_by_code() {
         .unwrap_err();
     assert_eq!(err.kdc_code(), Some(KDC_ERR_S_PRINCIPAL_UNKNOWN), "{err}");
 }
+
+/// The krb5.conf `scripts/test-kdc.sh` wrote, which MIT's own tools use
+/// for this realm, is enough to find the KDC and log in.
+#[test]
+fn the_realms_krb5_conf_finds_the_kdc() {
+    let e = live!();
+    let conf = krb5::Krb5Conf::load([format!("{}/krb5.conf", e.dir)]).unwrap();
+    assert_eq!(conf.default_realm(), Some(e.realm.as_str()));
+    let kdc = KdcClient::from_config(&conf, &e.realm).unwrap();
+    let tgt = kdc.login_with_password(&e.p("alice"), "alicepw").unwrap();
+    assert_eq!(tgt.server, Principal::krbtgt(&e.realm));
+}

@@ -7,6 +7,20 @@ may break the API).
 
 ## [Unreleased]
 
+### Added
+
+- `krb5.conf` support (`Krb5Conf`), parsed as MIT's profile library does:
+  `include`/`includedir`, final flags, quoted values, merged sections, and
+  `KRB5_CONFIG` lists of files and directories. Lookups for the default
+  realm, a realm's KDCs (`host`, `host:port`, `[v6]:port`) and
+  `[domain_realm]` host-to-realm mapping.
+- `KdcClient::from_config` and `KdcClient::discover`, which take a realm's
+  KDCs from `krb5.conf`.
+
+### Fixed
+
+- `scripts/test-kdc.sh` runs under macOS's bash 3.2.
+
 ## [0.3.0] - 2026-10-14
 
 ### Changed
