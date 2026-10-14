@@ -7,6 +7,8 @@ may break the API).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-14
+
 ### Added
 
 - PKINIT, behind the new `pkinit` feature (the default build's

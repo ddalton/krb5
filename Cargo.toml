@@ -1,6 +1,6 @@
 [package]
 name = "krb5"
-version = "0.6.2"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Pure-Rust Kerberos 5: GSS-API acceptor and initiator, KDC client (AS/TGS, cross-realm referrals), keytabs, FILE/DIR/KCM credential caches, krb5.conf, RFC 3961/3962/8009 crypto and RFC 4121 Wrap/MIC"
