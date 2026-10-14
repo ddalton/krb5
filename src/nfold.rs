@@ -43,7 +43,7 @@
 /// sum of the replicated, progressively right-rotated input, emitted MSB
 /// first.
 ///
-/// Call sites in the AES profile flint supports:
+/// Call sites in the AES profile this crate supports:
 ///
 ///   * RFC 3961 §5.1 DR — `n-fold(Constant, 128)`, where `Constant` is the
 ///     4-octet big-endian key usage followed by one of 0x99 (Kc), 0xAA (Ke)
@@ -325,7 +325,7 @@ mod tests {
 
     #[test]
     fn rfc3961_s6_3_1_des3_string_to_key_folds_to_168_bits() {
-        // des3-cbc-hmac-sha1-kd is out of flint's scope (AES only), but §6.3.1
+        // des3-cbc-hmac-sha1-kd is out of this crate's scope (AES only), but §6.3.1
         // is the reason the 168-bit output length is published at all, and a
         // 21-octet output is not a whole number of anything convenient — it is
         // the length that catches an implementation assuming the output is a

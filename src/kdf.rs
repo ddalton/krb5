@@ -112,13 +112,13 @@ pub enum KdfError {
     #[error("iteration count {0} exceeds the {MAX_ITERATIONS} cap")]
     IterationsTooHigh(u64),
 
-    #[error("unknown or unsupported enctype {0}; flint supports only 17, 18, 19, 20")]
+    #[error("unknown or unsupported enctype {0}; only 17, 18, 19 and 20 are supported")]
     UnsupportedEnctype(i32),
 }
 
 type Result<T> = std::result::Result<T, KdfError>;
 
-/// The four AES enctypes flint supports.
+/// The four AES enctypes this crate supports.
 ///
 /// Note the spelling of enctype 20: the trailing number is **192**, the
 /// HMAC truncation length. [`crate::acceptor`] spells it `...384196`,

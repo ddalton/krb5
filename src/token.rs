@@ -1,10 +1,9 @@
 //! RFC 4121 §4.2 per-message tokens: Wrap (TOK_ID `05 04`) and MIC (`04 04`).
 //!
-//! This is the acceptor side. flint's NFS server is the GSS *acceptor*: it
-//! verifies tokens the client (the *initiator*) emitted, and emits tokens of
-//! its own. That asymmetry is the whole reason this module exists as a
-//! separate layer, because RFC 4121 §2 keys every operation off the sender's
-//! role:
+//! Both ends use this module. Each side verifies tokens its peer emitted and
+//! emits tokens of its own, and that asymmetry is the whole reason this module
+//! exists as a separate layer, because RFC 4121 §2 keys every operation off
+//! the sender's role:
 //!
 //! ```text
 //!                     MIC (04 04)          Wrap (05 04)
@@ -12,7 +11,8 @@
 //!   sender initiator   25 INITIATOR_SIGN    24 INITIATOR_SEAL
 //! ```
 //!
-//! A server therefore *emits* with 22/23 and *verifies* with 24/25. Swapping
+//! An acceptor therefore *emits* with 22/23 and *verifies* with 24/25, and an
+//! initiator the reverse. Swapping
 //! the pair is the classic bug: it round-trips perfectly against itself —
 //! both sides derive the same wrong key — and fails against every real peer.
 //! [`Role::seal_usage`] and [`Role::sign_usage`] are the only place the
@@ -103,10 +103,10 @@ pub const KG_USAGE_INITIATOR_SIGN: u32 = 25;
 
 /// Which end of the security context an endpoint is.
 ///
-/// flint's NFS server is always [`Role::Acceptor`]; [`Role::Initiator`] exists
-/// so the tests can build the client-side tokens the server must verify
-/// without hand-assembling them, and so the direction check has something to
-/// reject.
+/// [`KerberosContext`](crate::KerberosContext) is [`Role::Acceptor`] and
+/// [`InitiatorContext`](crate::InitiatorContext) is [`Role::Initiator`]. The
+/// direction check rejects a token whose sender claims this endpoint's own
+/// role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Initiator,
@@ -391,8 +391,8 @@ pub struct Verified {
 
 /// The RFC 4121 §4.2 per-message token layer for one established context.
 ///
-/// `role` is *this endpoint's* role — [`Role::Acceptor`] for flint's NFS
-/// server. Emits use `role`; verifies use `role.peer()`. Nothing else in this
+/// `role` is *this endpoint's* role — [`Role::Acceptor`] for a server,
+/// [`Role::Initiator`] for a client. Emits use `role`; verifies use `role.peer()`. Nothing else in this
 /// module names a usage number.
 pub struct PerMessageTokens<C: PerMessageCrypto> {
     crypto: C,
@@ -468,7 +468,7 @@ impl<C: PerMessageCrypto> PerMessageTokens<C> {
     /// accept, and the RFC's MUST binds the sender, not the receiver.
     ///
     /// This is not what stops a forgery — the MAC does that, and a mismatched
-    /// base key fails it anyway. It stops flint reporting an opaque integrity
+    /// base key fails it anyway. It stops us reporting an opaque integrity
     /// failure for what is really a key-agreement disagreement.
     fn check_acceptor_subkey(&self, flags: u8) -> Result<(), TokenError> {
         if flags & FLAG_ACCEPTOR_SUBKEY != 0 && !self.acceptor_subkey {
@@ -1914,7 +1914,7 @@ mod tests {
         }
     }
 
-    /// The configuration flint ACTUALLY RUNS IN, which had no coverage at all.
+    /// The configuration the acceptor ACTUALLY RUNS IN, which had no coverage at all.
     ///
     /// `EncAPRepPart::create(.., None)` never asserts an acceptor subkey, so
     /// this server emits `acceptor_subkey = false` — Flags 0x00 as initiator
@@ -1923,7 +1923,7 @@ mod tests {
     /// so the whole token differs: e19 initiator MIC is
     /// ...94c38586dfe6d40e5059a56329d97785 here against
     /// ...2aee928d6a136c7dcb8d2a8f1cd04e3f with the subkey asserted. Twenty-one
-    /// goldens covering only the flag flint does not set is a suite that could
+    /// goldens covering only the flag the acceptor does not set is a suite that could
     /// go green while the shipped path was wrong.
     ///
     /// Expected octets come from the same independent Python implementation as

@@ -1,27 +1,27 @@
 //! Interop against MIT Kerberos — the gate that vectors cannot close.
 //!
-//! Every other test in `krb` is pinned to published RFC vectors or to a
+//! Every other test in this crate is pinned to published RFC vectors or to a
 //! second implementation written from the RFC text. Both are strong, and
-//! neither can prove that a real peer accepts flint's bytes or that
-//! flint accepts a real peer's.
+//! neither can prove that a real peer accepts our bytes or that we
+//! accept a real peer's.
 //!
 //! The fixtures here were produced by MIT krb5's own `libgssapi`
 //! (`python3-gssapi`) against a live KDC, in a Lima VM, on 2026-08-27:
 //! a real AS-REQ/TGS-REQ for a real service principal, then
-//! `gss_init_sec_context`, `gss_get_mic` and `gss_wrap`. flint is the
-//! acceptor. If these pass, the ticket path, the key derivation, the
+//! `gss_init_sec_context`, `gss_get_mic` and `gss_wrap`. This crate is
+//! the acceptor. If these pass, the ticket path, the key derivation, the
 //! RFC 4121 framing and the enctype handling all agree with the
 //! reference implementation.
 //!
-//! Regenerating: see `scratchpad/krb/setup-kdc.sh` and `gen-tokens.py`
-//! in the session record — realm FLINT.TEST, one service principal per
-//! enctype so each ticket path is exercised.
+//! Regenerating: see `testdata/README.md`. The realm is FLINT.TEST, with
+//! one service principal per enctype so each ticket path is exercised.
 
 use crate::acceptor::{KerberosContext, Keytab};
 
 /// The fixtures are RECORDED, so their authenticators are as old as the
 /// file. Production uses the 5-minute default; replaying a capture needs
-/// the check stood down, which is why  exists.
+/// the check stood down, which is why
+/// [`KerberosContext::accept_token_with_skew`] exists.
 const SKEW: i64 = 100 * 365 * 24 * 3600;
 
 fn unhex(s: &str) -> Vec<u8> {
@@ -32,13 +32,13 @@ fn unhex(s: &str) -> Vec<u8> {
 }
 
 /// Contexts established WITHOUT mutual auth: complete after one step, so
-/// these carry MIC and Wrap tokens — and flint must reply with NO AP-REP.
+/// these carry MIC and Wrap tokens — and the acceptor must reply with NO AP-REP.
 fn fixtures() -> serde_json::Value {
     serde_json::from_str(include_str!("../testdata/interop.json")).expect("interop.json")
 }
 
 /// Contexts established WITH mutual auth: the initiator is NOT complete
-/// until it has flint's AP-REP, so these pin the AP-REP path.
+/// until it has our AP-REP, so these pin the AP-REP path.
 fn fixtures_mutual() -> serde_json::Value {
     serde_json::from_str(include_str!("../testdata/interop-mutual.json"))
         .expect("interop-mutual.json")
@@ -52,7 +52,7 @@ fn keytab() -> Keytab {
     .expect("interop keytab")
 }
 
-/// MIT issues the ticket; flint decrypts it.
+/// MIT issues the ticket; we decrypt it.
 ///
 /// This is the single most load-bearing assertion in the tree. It fails
 /// against every one of the six defects the audit found: the 0x99/0xAA
@@ -85,9 +85,10 @@ fn a_real_kdc_ticket_decrypts() {
     assert_eq!(checked, 4, "all four enctype fixtures must be exercised");
 }
 
-/// MIT signs; flint verifies. Exercises the RFC 4121 MIC framing, the
+/// MIT signs; we verify. Exercises the RFC 4121 MIC framing, the
 /// per-message key usages, and the §2 base-key selection — MIT's
-/// initiator supplies a subkey, which flint discarded until now.
+/// initiator supplies a subkey, which an early version of the acceptor
+/// discarded.
 #[test]
 fn a_real_mic_from_mit_verifies() {
     let kt = keytab();
@@ -119,7 +120,7 @@ fn a_real_mic_from_mit_verifies() {
     }
 }
 
-/// MIT seals; flint unwraps. The confidentiality path end to end.
+/// MIT seals; we unwrap. The confidentiality path end to end.
 #[test]
 fn a_real_wrap_token_from_mit_unwraps() {
     let kt = keytab();
@@ -153,7 +154,7 @@ fn a_real_wrap_token_from_mit_unwraps() {
 
 /// RFC 4120 §3.2.4: an AP-REP answers MUTUAL-REQUIRED and nothing else.
 ///
-/// flint discarded `ap-options` and replied with an AP-REP every time. A
+/// An early version of the acceptor discarded `ap-options` and replied with an AP-REP every time. A
 /// client that did not ask for mutual auth is ALREADY established when it
 /// sends the AP-REQ; handed an unexpected token it feeds it to GSS anyway
 /// and gets "Context is already fully established", after which libtirpc

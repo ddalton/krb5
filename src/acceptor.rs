@@ -109,7 +109,7 @@ impl Keytab {
     }
 
     /// Parse keytab binary format
-    /// Keytab format: https://web.mit.edu/kerberos/krb5-latest/doc/formats/keytab_file_format.html
+    /// Keytab format: <https://web.mit.edu/kerberos/krb5-latest/doc/formats/keytab_file_format.html>
     fn parse(data: &[u8]) -> Result<Self> {
         if data.len() < 2 {
             return Err(KerberosError::ParseError("Keytab too short".to_string()));
@@ -1963,7 +1963,7 @@ impl KerberosContext {
     /// Generate a minimal valid AP-REP token wrapped in GSS-API framing
     ///
     /// Structure:
-    /// - GSS-API Application tag [0x60]
+    /// - GSS-API Application tag `0x60`
     /// - GSS OID for Kerberos (1.2.840.113554.1.2.2)
     /// - Kerberos AP-REP message
     #[allow(dead_code)]

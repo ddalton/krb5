@@ -21,7 +21,7 @@ Do not add a keytab here that belongs to any realm you care about.
 | file | AP-REQ asked for mutual auth? | what it pins |
 |---|---|---|
 | `interop.json` | no | context completes in one step, so these carry MIC and Wrap tokens — and the acceptor must reply with **no** AP-REP |
-| `interop-mutual.json` | yes | the initiator is not complete until it has flint's AP-REP, so these pin the AP-REP path |
+| `interop-mutual.json` | yes | the initiator is not complete until it has this crate's AP-REP, so these pin the AP-REP path |
 
 Both cover all four AES enctypes (17/18/19/20). Note the KDC picks a
 session-key enctype that may differ from the ticket enctype — the
@@ -29,8 +29,11 @@ fixtures exercise that mismatch, which is worth keeping.
 
 ## Regenerating
 
-Needs a KDC. The scripts that built this realm are recorded in the
-project memory for this work; the shape is:
+Needs a KDC. `scripts/test-kdc.sh` builds a suitable realm (it already
+creates one `svcNN/svc.krb5.test` principal per enctype in
+`service.keytab`), though under `KRB5.TEST` rather than `FLINT.TEST`. The
+script that drove `python3-gssapi` to record the tokens was never
+committed; the shape is:
 
 1. `kdb5_util create -s -r FLINT.TEST`
 2. one service principal **per enctype**, each with `addprinc -e <enctype>`

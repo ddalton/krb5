@@ -603,8 +603,8 @@ fn choose_salt(padata: &[(i32, Vec<u8>)], offered: &[i32]) -> Option<SaltInfo> {
     })
 }
 
-/// ETYPE-INFO2-ENTRY ::= SEQUENCE { etype [0], salt [1] KerberosString
-/// OPTIONAL, s2kparams [2] OCTET STRING OPTIONAL }. ETYPE-INFO's salt is
+/// `ETYPE-INFO2-ENTRY ::= SEQUENCE { etype [0], salt [1] KerberosString
+/// OPTIONAL, s2kparams [2] OCTET STRING OPTIONAL }`. ETYPE-INFO's salt is
 /// an OCTET STRING and it has no s2kparams.
 fn parse_etype_info(value: &[u8], v2: bool) -> Result<Vec<SaltInfo>> {
     let mut seq = Reader::new(value).seq()?;
@@ -682,7 +682,7 @@ pub(crate) fn encode_encrypted_data(etype: i32, cipher: &[u8]) -> Vec<u8> {
     ])
 }
 
-/// PA-ENC-TS-ENC ::= SEQUENCE { patimestamp [0], pausec [1] OPTIONAL },
+/// `PA-ENC-TS-ENC ::= SEQUENCE { patimestamp [0], pausec [1] OPTIONAL }`,
 /// encrypted in the client's long-term key with usage 1.
 fn encode_enc_timestamp(key: &Key, now: i64, usec: u32) -> Result<Vec<u8>> {
     let ts = der::seq(&[
@@ -760,7 +760,7 @@ pub(crate) fn decode_key(mut r: Reader<'_>) -> Result<Key> {
     Ok(Key::new(f.get(0)?.i32()?, f.get(1)?.octets()?.to_vec())?)
 }
 
-/// EncryptedData ::= SEQUENCE { etype [0], kvno [1] OPTIONAL, cipher [2] }.
+/// `EncryptedData ::= SEQUENCE { etype [0], kvno [1] OPTIONAL, cipher [2] }`.
 pub(crate) fn decode_encrypted_data(mut r: Reader<'_>) -> Result<(i32, Vec<u8>)> {
     let f = Fields::parse("EncryptedData", r.expect(der::SEQUENCE)?)?;
     Ok((f.get(0)?.i32()?, f.get(2)?.octets()?.to_vec()))

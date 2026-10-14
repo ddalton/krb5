@@ -59,7 +59,7 @@
 //!
 //! Every function here starts from the initial (all-zero) cipher state. RFC
 //! 4120 EncryptedData and RFC 4121 per-message tokens each encrypt from the
-//! initial state, so nothing in flint chains one. RFC 8009 Appendix A notes
+//! initial state, so nothing in this crate chains one. RFC 8009 Appendix A notes
 //! that *all* its samples use the default cipher state, so the chaining rule
 //! has no published vector at all — we expose [`cts_next_iv`] (which RFC 3962
 //! Appendix B *does* pin, as "Next IV") but deliberately do not build a
@@ -79,7 +79,7 @@ pub const BLOCK_SIZE: usize = 16;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProfileError {
-    #[error("unsupported enctype {0} (flint speaks only AES: 17, 18, 19, 20)")]
+    #[error("unsupported enctype {0} (only AES is supported: 17, 18, 19, 20)")]
     UnsupportedEnctype(i32),
 
     /// Raised when a derived key is the wrong length for its role. This is not
@@ -123,7 +123,7 @@ pub enum ProfileError {
 
 pub type Result<T> = std::result::Result<T, ProfileError>;
 
-/// The four AES enctypes flint supports (RFC 3962 §7, RFC 8009 §7).
+/// The four AES enctypes this crate supports (RFC 3962 §7, RFC 8009 §7).
 ///
 /// Note the spelling of 20: the trailing number is the HMAC truncation, 192
 /// bits. [`crate::acceptor::EncType`] spells it `...Sha384196`, which
@@ -462,7 +462,7 @@ pub fn aes_cts_decrypt(key: &[u8], iv: &[u8; BLOCK_SIZE], ciphertext: &[u8]) -> 
 /// encryption of the final zero-extended plaintext block, not the
 /// chronologically penultimate CBC output.
 ///
-/// Nothing in flint chains a cipher state (see the module docs); this exists
+/// Nothing in this crate chains a cipher state (see the module docs); this exists
 /// so that if something ever does, the rule is already pinned.
 pub fn cts_next_iv(ciphertext: &[u8]) -> Result<[u8; BLOCK_SIZE]> {
     let n = ciphertext.len();
