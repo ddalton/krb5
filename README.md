@@ -16,7 +16,8 @@ tickets without shelling out to `kinit`.
   subkey, and build the AP-REP for mutual authentication.
 - **KDC client** — AS exchange with a password or keytab, including
   PA-ENC-TIMESTAMP pre-authentication and ETYPE-INFO2 salts; TGS exchange
-  for service tickets; TCP transport. KDCs come from `krb5.conf`, from DNS
+  for service tickets, in other realms too (RFC 6806 referrals and
+  `[capaths]`, as MIT follows them); TCP transport. KDCs come from `krb5.conf`, from DNS
   (URI and SRV records, as MIT looks them up), or are passed in directly.
 - **Credential caches** — MIT's `FILE:` format (versions 1-4), `DIR:`
   collections, and `KCM:` (sssd-kcm, the Fedora/RHEL default, or
@@ -34,7 +35,7 @@ tickets without shelling out to `kinit`.
   (`aes128-cts-hmac-sha256-128`, `aes256-cts-hmac-sha384-192`).
 - **Per-message tokens** — RFC 4121 §4.2 Wrap and MIC.
 
-Not implemented: a KDC, UDP, cross-realm referrals, FAST, PKINIT, delegation, `KEYRING:` and `API:`
+Not implemented: a KDC, UDP, FAST, PKINIT, delegation, `KEYRING:` and `API:`
 caches, and macOS's KCM, which is reached over Mach IPC rather than a
 socket (point `KRB5CCNAME` at a `FILE:` cache there).
 

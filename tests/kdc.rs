@@ -18,7 +18,12 @@ struct Env {
     client: KdcClient,
     realm: String,
     dir: String,
+    /// The live tests share one KDC and some count its log lines, so they
+    /// run one at a time.
+    _serial: std::sync::MutexGuard<'static, ()>,
 }
+
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn env() -> Option<Env> {
     let kdc = std::env::var("KRB5_TEST_KDC").ok()?;
@@ -28,6 +33,8 @@ fn env() -> Option<Env> {
         client: KdcClient::new(realm.clone(), [kdc]),
         realm,
         dir,
+        // A failed test poisons the lock; the others should still run.
+        _serial: SERIAL.lock().unwrap_or_else(|p| p.into_inner()),
     })
 }
 
@@ -56,9 +63,15 @@ impl Env {
 /// Our initiator against our acceptor, keyed by the KDC's service ticket
 /// and the keytab `kadmin` exported: both halves see MIT-made keys.
 fn establish(e: &Env, svc: &Credentials) {
+    establish_with(e, svc, "service.keytab");
+}
+
+/// [`establish`] against the acceptor holding `keytab` (for services in
+/// the other test realms).
+fn establish_with(e: &Env, svc: &Credentials, keytab: &str) {
     let flags = GSS_C_MUTUAL_FLAG | GSS_C_INTEG_FLAG | GSS_C_CONF_FLAG;
     let (mut ini, token) = InitiatorContext::new(svc, flags).unwrap();
-    let (acc, ap_rep) = KerberosContext::accept_token(&e.keytab("service.keytab"), &token).unwrap();
+    let (acc, ap_rep) = KerberosContext::accept_token(&e.keytab(keytab), &token).unwrap();
     assert_eq!(acc.client_principal, svc.client.to_string());
     ini.step(&ap_rep).unwrap();
     assert!(ini.is_established());
@@ -559,4 +572,170 @@ fn dns_answers_agree_with_dig() {
         compared > 0,
         "no case had records; the test's names are stale"
     );
+}
+
+// ---------------------------------------------------------- cross-realm
+
+/// A client that finds every test realm's KDC through the realm's
+/// krb5.conf, if scripts/test-kdc.sh made the cross-realm realms.
+fn cross(e: &Env) -> Option<(KdcClient, krb5::Krb5Conf)> {
+    std::env::var_os("KRB5_TEST_CROSS_REALMS")?;
+    let conf = krb5::Krb5Conf::load([format!("{}/krb5.conf", e.dir)]).unwrap();
+    Some((KdcClient::from_config(&conf, &e.realm).unwrap(), conf))
+}
+
+macro_rules! cross {
+    ($e:expr) => {
+        match cross(&$e) {
+            Some(c) => c,
+            None => {
+                eprintln!("no cross-realm test realms; skipping");
+                return;
+            }
+        }
+    };
+}
+
+/// The ticket inside names the realm the service really lives in.
+fn ticket_realm(creds: &Credentials) -> String {
+    creds.ticket_server().expect("a parseable ticket").realm
+}
+
+/// No realm on the service: KRB5.TEST refers us to CROSS.TEST (via
+/// [capaths]), CROSS.TEST to FAR.TEST, and FAR.TEST issues the ticket.
+#[test]
+fn cross_realm_referrals_with_no_service_realm() {
+    let e = live!();
+    let (kdc, _) = cross!(e);
+    let tgt = kdc.login_with_password(&e.p("alice"), "alicepw").unwrap();
+    let svc = Principal::new(krb5::client::NT_SRV_HST, ["host", "server.far.test"], "");
+    let st = kdc.service_ticket(&tgt, &svc).unwrap();
+    assert_eq!(st.server, svc, "named as requested, as MIT stores it");
+    assert_eq!(ticket_realm(&st), "FAR.TEST");
+    establish_with(&e, &st, "far.keytab");
+}
+
+/// The realm known up front ([domain_realm]): a TGT path through
+/// CROSS.TEST ([capaths]), then the ticket from FAR.TEST.
+#[test]
+fn cross_realm_by_capaths_path() {
+    let e = live!();
+    let (kdc, conf) = cross!(e);
+    let tgt = kdc.login_with_password(&e.p("alice"), "alicepw").unwrap();
+    let svc = Principal::host_service("host", "server.far.test", &conf);
+    assert_eq!(svc.realm, "FAR.TEST");
+    let st = kdc.service_ticket(&tgt, &svc).unwrap();
+    assert_eq!(ticket_realm(&st), "FAR.TEST");
+    establish_with(&e, &st, "far.keytab");
+
+    // One hop, by referral, to the directly trusted realm.
+    let near = Principal::new(krb5::client::NT_SRV_HST, ["host", "server.cross.test"], "");
+    let st = kdc.service_ticket(&tgt, &near).unwrap();
+    assert_eq!(ticket_realm(&st), "CROSS.TEST");
+    establish_with(&e, &st, "cross.keytab");
+}
+
+/// A realm we cannot reach is an error, not a hang or a wrong ticket.
+#[test]
+fn cross_realm_to_an_unknown_realm_fails() {
+    let e = live!();
+    let (kdc, _) = cross!(e);
+    let tgt = kdc.login_with_password(&e.p("alice"), "alicepw").unwrap();
+    let svc = Principal::new(
+        krb5::client::NT_SRV_HST,
+        ["host", "x.nowhere.test"],
+        "NOWHERE.TEST",
+    );
+    assert!(kdc.service_ticket(&tgt, &svc).is_err());
+}
+
+/// TGS requests the test KDC has logged so far (all three realms).
+fn tgs_requests(e: &Env) -> usize {
+    std::fs::read_to_string(format!("{}/kdc.log", e.dir))
+        .unwrap()
+        .lines()
+        .filter(|l| l.contains("TGS_REQ") && l.contains("ISSUE"))
+        .count()
+}
+
+/// Through a cache: the cross-realm TGT we asked for is stored next to
+/// the ticket and reused; MIT's tools read the cache; and we reuse a
+/// cross-realm TGT MIT's kvno stored.
+#[test]
+fn cross_realm_through_a_credential_cache_shared_with_mit() {
+    let e = live!();
+    let (kdc, conf) = cross!(e);
+    let path = scratch(&e, "xrealm");
+    let name = format!("FILE:{}", path.display());
+    let cache = krb5::CacheName::parse(&name).unwrap();
+    let tgt = kdc.login_with_password(&e.p("alice"), "alicepw").unwrap();
+    cache.write(&krb5::CCache::with_credentials(&tgt)).unwrap();
+
+    let far = Principal::host_service("host", "server.far.test", &conf);
+    let st = kdc.service_ticket_cached(&cache, &far).unwrap();
+    establish_with(&e, &st, "far.keytab");
+    // KRB5.TEST answered "krbtgt/FAR.TEST" with the closer CROSS.TEST TGT,
+    // which, as in MIT, is used but not kept; the FAR.TEST TGT we asked
+    // CROSS.TEST for is kept.
+    let tgts: Vec<String> = cache
+        .read()
+        .unwrap()
+        .credentials()
+        .filter(|c| c.server.components[0] == "krbtgt")
+        .map(|c| c.server.to_string())
+        .collect();
+    assert_eq!(
+        tgts,
+        ["krbtgt/KRB5.TEST@KRB5.TEST", "krbtgt/FAR.TEST@CROSS.TEST"]
+    );
+
+    // Another FAR.TEST service: straight to FAR.TEST with the cached TGT.
+    let before = tgs_requests(&e);
+    let other = Principal::host_service("host", "other.far.test", &conf);
+    let st = kdc.service_ticket_cached(&cache, &other).unwrap();
+    establish_with(&e, &st, "far.keytab");
+    assert_eq!(tgs_requests(&e) - before, 1, "one TGS request, to FAR.TEST");
+    // And the first ticket again: no request at all.
+    let before = tgs_requests(&e);
+    kdc.service_ticket_cached(&cache, &far).unwrap();
+    assert_eq!(tgs_requests(&e), before);
+
+    if mit(&e, &name, "klist", &[], None).is_none() {
+        eprintln!("MIT's krb5 tools not on PATH; skipping the MIT half");
+        return;
+    }
+    let listed = mit(&e, &name, "klist", &[], None).unwrap();
+    assert!(listed.contains("host/other.far.test@FAR.TEST"), "{listed}");
+    mit(
+        &e,
+        &name,
+        "kvno",
+        &["host/server.cross.test@CROSS.TEST"],
+        None,
+    )
+    .unwrap();
+
+    // MIT's kinit and kvno fill a cache; we reuse the FAR.TEST TGT it kept.
+    let mit_path = scratch(&e, "xrealm-mit");
+    let mit_name = format!("FILE:{}", mit_path.display());
+    mit(&e, &mit_name, "kinit", &["alice"], Some("alicepw\n")).unwrap();
+    mit(
+        &e,
+        &mit_name,
+        "kvno",
+        &["host/server.far.test@FAR.TEST"],
+        None,
+    )
+    .unwrap();
+    let before = tgs_requests(&e);
+    let mit_cache = krb5::CacheName::parse(&mit_name).unwrap();
+    let st = kdc.service_ticket_cached(&mit_cache, &other).unwrap();
+    establish_with(&e, &st, "far.keytab");
+    assert_eq!(
+        tgs_requests(&e) - before,
+        1,
+        "MIT's cached FAR.TEST TGT was used"
+    );
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&mit_path);
 }

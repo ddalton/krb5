@@ -11,7 +11,10 @@
 //! FAST: the caller names the realm and its KDCs.
 
 use crate::acceptor::Keytab;
-use crate::ccache::{CacheError, CacheName};
+use crate::ccache::{CCache, CacheError, CacheName, same_principal};
+use std::collections::HashMap;
+
+mod xrealm;
 use crate::config::{self, ConfigError, Krb5Conf};
 use crate::der::{self, Fields, Reader, app};
 use crate::dns::{self, Resolver};
@@ -22,6 +25,8 @@ use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::debug;
+pub use xrealm::MAX_HOPS;
+use xrealm::{KDC_OPT_CANONICALIZE, NoStore, TgtStore, is_tgs, tgt_realm};
 
 /// RFC 4120 §6.2 name types.
 pub const NT_PRINCIPAL: i32 = 1;
@@ -80,6 +85,13 @@ pub enum ClientError {
     /// The cache holds no unexpired ticket-granting ticket.
     #[error("no valid TGT for {principal} in {cache} (run kinit)")]
     NoTgt { principal: String, cache: String },
+    /// Another realm's KDCs could not be located.
+    #[error(transparent)]
+    Config(#[from] ConfigError),
+    /// Cross-realm referrals did not converge: too many hops, a loop, or a
+    /// referral back to where we started.
+    #[error("cross-realm: {0}")]
+    Referral(String),
 }
 
 impl From<der::DerError> for ClientError {
@@ -252,9 +264,53 @@ pub struct Credentials {
 }
 
 impl Credentials {
+    /// The server named inside the ticket (Ticket.realm, Ticket.sname),
+    /// which for a ticket obtained by referral names the realm the service
+    /// really lives in, where `server` is the name as requested. `klist`
+    /// shows it as "Ticket server".
+    pub fn ticket_server(&self) -> Option<Principal> {
+        let tf = Fields::parse_tagged("Ticket", app(1), &self.ticket).ok()?;
+        let realm = tf.get(1).ok()?.string().ok()?;
+        Principal::decode_name(tf.get(2).ok()?, realm).ok()
+    }
+
     /// True once `now` (Unix seconds) has reached the ticket's end time.
     pub fn is_expired_at(&self, now: i64) -> bool {
         now >= self.endtime
+    }
+}
+
+/// TicketFlags ok-as-delegate (bit 13).
+const TKT_FLG_OK_AS_DELEGATE: u32 = 1 << 18;
+
+/// Cross-realm TGTs from a credential cache, and the ones fetched on the
+/// way, to be written back with the ticket.
+struct CacheStore<'a> {
+    cache: &'a CCache,
+    now: i64,
+    got: Vec<Credentials>,
+}
+
+impl TgtStore for CacheStore<'_> {
+    /// Any unexpired `krbtgt/realm@...` for the cache's principal, the
+    /// issuing realm not mattering (MIT's KRB5_TC_MATCH_SRV_NAMEONLY).
+    fn cached_tgt(&self, realm: &str) -> Option<Credentials> {
+        self.got
+            .iter()
+            .rev()
+            .cloned()
+            .chain(self.cache.credentials())
+            .filter(|c| {
+                is_tgs(&c.server)
+                    && tgt_realm(c) == realm
+                    && same_principal(&c.client, &self.cache.principal)
+                    && !c.is_expired_at(self.now)
+            })
+            .max_by_key(|c| c.endtime)
+    }
+
+    fn remember(&mut self, tgt: &Credentials) {
+        self.got.push(tgt.clone());
     }
 }
 
@@ -274,7 +330,8 @@ struct SaltInfo {
     params: Option<[u8; 4]>,
 }
 
-/// A client bound to one realm and its KDCs.
+/// A client for one realm and its KDCs, which reaches other realms' KDCs
+/// for cross-realm tickets through the same `krb5.conf` and DNS.
 #[derive(Debug, Clone)]
 pub struct KdcClient {
     realm: String,
@@ -282,6 +339,11 @@ pub struct KdcClient {
     timeout: Duration,
     enctypes: Vec<i32>,
     lifetime: Duration,
+    /// For locating other realms' KDCs.
+    conf: Krb5Conf,
+    resolver: Option<Resolver>,
+    /// Other realms' KDCs given explicitly, ahead of `conf` and DNS.
+    realm_kdcs: HashMap<String, Vec<String>>,
 }
 
 impl KdcClient {
@@ -297,7 +359,40 @@ impl KdcClient {
             timeout: Duration::from_secs(10),
             enctypes: DEFAULT_ENCTYPES.to_vec(),
             lifetime: Duration::from_secs(24 * 3600),
+            conf: Krb5Conf::empty(),
+            resolver: None,
+            realm_kdcs: HashMap::new(),
         }
+    }
+
+    /// Use `kdcs` for `realm` when a cross-realm request needs its KDC,
+    /// instead of looking it up in `krb5.conf` or DNS.
+    pub fn with_realm_kdcs<I, S>(mut self, realm: impl Into<String>, kdcs: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.realm_kdcs
+            .insert(realm.into(), kdcs.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// A client for `realm` with this one's settings: itself, an explicit
+    /// [`KdcClient::with_realm_kdcs`] entry, or the realm's KDCs located
+    /// through the `krb5.conf` and resolver this client was made with.
+    pub fn for_realm(&self, realm: &str) -> Result<KdcClient> {
+        if realm == self.realm {
+            return Ok(self.clone());
+        }
+        let kdcs = match self.realm_kdcs.get(realm) {
+            Some(k) => k.clone(),
+            None => Self::locate(&self.conf, realm, self.resolver.as_ref())?.kdcs,
+        };
+        Ok(KdcClient {
+            realm: realm.to_string(),
+            kdcs,
+            ..self.clone()
+        })
     }
 
     /// A client for `realm`, finding its KDCs as MIT does: the `kdc`
@@ -320,7 +415,7 @@ impl KdcClient {
 
     fn locate(conf: &Krb5Conf, realm: &str, resolver: Option<&Resolver>) -> config::Result<Self> {
         match conf.kdcs(realm) {
-            Ok(kdcs) => return Ok(KdcClient::new(realm, kdcs)),
+            Ok(kdcs) => return Ok(KdcClient::new(realm, kdcs).remembering(conf, resolver)),
             // Entries this crate cannot use are not "none": MIT would use
             // them and not ask DNS, so neither do we.
             Err(ConfigError::NoKdcs { skipped, .. }) if skipped.is_empty() => {}
@@ -344,13 +439,19 @@ impl KdcClient {
                 dns::locate_kdcs(resolver, realm, dns::dns_uri_lookup(conf)).map_err(dns_err)?;
             if !kdcs.is_empty() {
                 debug!("{realm}: KDCs from DNS: {kdcs:?}");
-                return Ok(KdcClient::new(realm, kdcs));
+                return Ok(KdcClient::new(realm, kdcs).remembering(conf, Some(resolver)));
             }
         }
         Err(ConfigError::NoKdcFound {
             realm: realm.to_string(),
             dns,
         })
+    }
+
+    fn remembering(mut self, conf: &Krb5Conf, resolver: Option<&Resolver>) -> Self {
+        self.conf = conf.clone();
+        self.resolver = resolver.cloned();
+        self
     }
 
     /// A client for `realm` from the system configuration: the
@@ -420,8 +521,10 @@ impl KdcClient {
     /// as is; otherwise the cache's TGT buys one from the KDC, and it is
     /// stored in the cache for next time.
     ///
-    /// The cache is read again just before the new ticket is written, so
-    /// a ticket another process cached meanwhile is not dropped.
+    /// Cross-realm TGTs come from the cache when it has them, and the ones
+    /// fetched on the way are stored with the ticket, as MIT does. The
+    /// cache is read again just before writing, so a ticket another
+    /// process cached meanwhile is not dropped.
     pub fn service_ticket_cached(
         &self,
         cache: &CacheName,
@@ -438,18 +541,40 @@ impl KdcClient {
             cache: cache.to_string(),
         })?;
 
-        let creds = self.service_ticket(&tgt, service)?;
+        let mut store = CacheStore {
+            cache: &cc,
+            now,
+            got: Vec::new(),
+        };
+        let creds = self.get_creds(&tgt, service, &mut store)?;
+        let got = store.got;
         let mut cc = cache.read()?;
-        cc.store(&creds);
+        for t in got.iter().chain([&creds]) {
+            cc.store(t);
+        }
         cache.write(&cc)?;
         Ok(creds)
     }
 
-    /// TGS exchange: trade a TGT for a ticket to `service`.
+    /// A ticket for `service`, from `tgt` (a TGT for the client's realm),
+    /// following cross-realm referrals and `[capaths]` as MIT's
+    /// `krb5_get_credentials` does (see the `xrealm` module docs). A
+    /// service in the client's own realm takes one request.
+    ///
+    /// Give `service` an empty realm (or build it with
+    /// [`Principal::host_service`]) to let the KDC say where it lives.
     pub fn service_ticket(&self, tgt: &Credentials, service: &Principal) -> Result<Credentials> {
+        self.get_creds(tgt, service, &mut NoStore)
+    }
+
+    /// One TGS exchange with the KDC of the realm `tgt` is for: a ticket
+    /// for `server` (whose realm is the request realm), checked as MIT's
+    /// `krb5int_process_tgs_reply` checks it.
+    fn tgs(&self, tgt: &Credentials, server: &Principal, kdc_options: u32) -> Result<Credentials> {
+        let kdc = self.for_realm(tgt_realm(tgt))?;
         let (now, usec) = now();
         let nonce = random_nonce();
-        let body = self.req_body(None, service, nonce, now);
+        let body = kdc.req_body_with(None, server, nonce, now, &kdc.enctypes, kdc_options);
 
         let cksum = tgt.session_key.checksum(KU_TGS_REQ_AUTH_CKSUM, &body)?;
         let authenticator = encode_authenticator(
@@ -464,14 +589,48 @@ impl KdcClient {
         let ap_req = encode_ap_req(0, &tgt.ticket, tgt.session_key.enctype(), &enc_auth);
 
         let req = encode_kdc_req(12, &[(PA_TGS_REQ, ap_req)], body);
-        let rep = match parse_reply(&self.exchange(&req)?, 13)? {
+        let rep = match parse_reply(&kdc.exchange(&req)?, 13)? {
             Reply::Error(e) => return Err(e.into_error()),
             Reply::Rep(r) => r,
         };
+        if !same_principal(&rep.client, &tgt.client) {
+            return protocol(format!(
+                "TGS reply is for {}, not {} (KRB5_KDCREP_MODIFIED)",
+                rep.client, tgt.client
+            ));
+        }
+        let ticket_server = rep.ticket_server.clone();
         let plain = tgt
             .session_key
             .decrypt(KU_TGS_REP_ENC_PART_SESSION, &rep.cipher)?;
-        rep.into_credentials(&plain, nonce)
+        let mut creds = rep.into_credentials(&plain, nonce)?;
+
+        // MIT's check_reply_server: the ticket and the encrypted part must
+        // agree, and a different server than the one asked for is allowed
+        // only if we asked for canonicalization or both are TGTs (a
+        // closer-realm TGT on the way to a foreign one).
+        if !same_principal(&ticket_server, &creds.server) {
+            return protocol(format!(
+                "ticket is for {ticket_server} but the reply says {} (KRB5_KDCREP_MODIFIED)",
+                creds.server
+            ));
+        }
+        if !same_principal(&creds.server, server)
+            && kdc_options & KDC_OPT_CANONICALIZE == 0
+            && !(is_tgs(server) && is_tgs(&creds.server))
+        {
+            return protocol(format!(
+                "asked for {server}, got {} (KRB5_KDCREP_MODIFIED)",
+                creds.server
+            ));
+        }
+        // A foreign realm's ok-as-delegate counts only if every TGT on the
+        // way had it (MIT gc_via_tkt.c).
+        let local = tgt.server.realm == tgt.client.realm && tgt_realm(tgt) == tgt.client.realm;
+        if !local && tgt.flags & TKT_FLG_OK_AS_DELEGATE == 0 {
+            creds.flags &= !TKT_FLG_OK_AS_DELEGATE;
+        }
+        Ok(creds)
     }
 
     fn as_exchange(
@@ -487,7 +646,7 @@ impl KdcClient {
         for round in 0..2 {
             let (now, usec) = now();
             let nonce = random_nonce();
-            let body = self.req_body_with(Some(client), &krbtgt, nonce, now, &enctypes);
+            let body = self.req_body_with(Some(client), &krbtgt, nonce, now, &enctypes, 0);
             let req = encode_kdc_req(10, &padata, body);
 
             let rep = match parse_reply(&self.exchange(&req)?, 11)? {
@@ -547,6 +706,7 @@ impl KdcClient {
         })
     }
 
+    #[cfg(test)]
     fn req_body(
         &self,
         cname: Option<&Principal>,
@@ -554,7 +714,7 @@ impl KdcClient {
         nonce: u32,
         now: i64,
     ) -> Vec<u8> {
-        self.req_body_with(cname, sname, nonce, now, &self.enctypes)
+        self.req_body_with(cname, sname, nonce, now, &self.enctypes, 0)
     }
 
     fn req_body_with(
@@ -564,8 +724,9 @@ impl KdcClient {
         nonce: u32,
         now: i64,
         enctypes: &[i32],
+        kdc_options: u32,
     ) -> Vec<u8> {
-        let mut parts = vec![der::field(0, der::flags32(0))];
+        let mut parts = vec![der::field(0, der::flags32(kdc_options))];
         if let Some(c) = cname {
             parts.push(der::field(1, c.encode_name()));
         }
@@ -880,6 +1041,8 @@ struct KdcRep {
     padata: Vec<(i32, Vec<u8>)>,
     client: Principal,
     ticket: Vec<u8>,
+    /// The server named in the ticket itself (Ticket.realm, Ticket.sname).
+    ticket_server: Principal,
     ticket_enctype: i32,
     enc_etype: i32,
     cipher: Vec<u8>,
@@ -950,12 +1113,14 @@ fn parse_reply(data: &[u8], rep_app: u8) -> Result<Reply> {
     let client = Principal::decode_name(f.get(4)?, crealm)?;
     let ticket = f.raw(5)?.to_vec();
     let tf = Fields::parse_tagged("Ticket", app(1), &ticket)?;
+    let ticket_server = Principal::decode_name(tf.get(2)?, tf.get(1)?.string()?)?;
     let (ticket_enctype, _) = decode_encrypted_data(tf.get(3)?)?;
     let (enc_etype, cipher) = decode_encrypted_data(f.get(6)?)?;
     Ok(Reply::Rep(KdcRep {
         padata,
         client,
         ticket,
+        ticket_server,
         ticket_enctype,
         enc_etype,
         cipher,

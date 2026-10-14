@@ -7,6 +7,36 @@ may break the API).
 
 ## [Unreleased]
 
+### Added
+
+- Cross-realm service tickets, as MIT's `krb5_get_credentials` gets
+  them: RFC 6806 referrals (canonicalize, followed realm by realm, at
+  most 10 hops, loops refused), a TGT path through `[capaths]`
+  intermediates when the service's realm is known (backing off to closer
+  realms and chasing off-path TGTs), and the host-domain fallback realm
+  when the first referral fails. `KdcClient::service_ticket` and
+  `service_ticket_cached` do this; other realms' KDCs come from the
+  client's `krb5.conf` and DNS, or `KdcClient::with_realm_kdcs`.
+  `service_ticket_cached` reuses cached cross-realm TGTs (including
+  MIT's) and stores the ones it asked for.
+- `Principal::host_service` (`krb5_sname_to_principal`: realm from
+  `[domain_realm]`, else the empty referral realm),
+  `Principal::krbtgt_for`, `Credentials::ticket_server`,
+  `KdcClient::for_realm`, `client::MAX_HOPS`.
+- `ClientError::Config` and `ClientError::Referral`.
+- TGS replies are checked as MIT checks them: the reply's client is the
+  TGT's, the ticket and the encrypted part name the same server, and a
+  server other than the one asked for is accepted only with
+  canonicalize or between TGTs. A foreign realm's ok-as-delegate is
+  cleared unless the TGT used had it.
+
+### Changed
+
+- `service_ticket` sets the canonicalize option on its first request,
+  as MIT does, so a KDC may return the service's canonical name. The
+  credentials keep the name as requested (as MIT stores them);
+  `ticket_server()` gives the name in the ticket.
+
 ## [0.4.1] - 2026-10-14
 
 ### Added
