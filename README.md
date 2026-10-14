@@ -72,8 +72,9 @@ let tokens = ctx.per_message_tokens()?;
 cargo test
 ```
 
-Every primitive carries known-answer tests copied from the RFCs, and the
-acceptor is tested against tickets, AP-REQs, MIC and Wrap tokens recorded
+Every primitive carries known-answer tests copied from the RFCs and from
+MIT krb5's own `crypto_tests` (decrypt, checksum, key derivation,
+string-to-key and PRF, `testdata/mit-crypto.json`), and the acceptor is tested against tickets, AP-REQs, MIC and Wrap tokens recorded
 from a live MIT KDC and MIT `libgssapi` for all four enctypes, with and
 without mutual authentication (`testdata/`). The keytab in `testdata/`
 belongs to a throwaway test realm and protects nothing.

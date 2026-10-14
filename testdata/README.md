@@ -49,3 +49,19 @@ and picked an arbitrary enctype. See
 
 The authenticators in these fixtures are frozen in time, so the tests use
 `accept_token_with_skew`. Production keeps the 5-minute default.
+
+## `mit-crypto.json` — MIT krb5's crypto known-answer tests
+
+The enctype 17-20 entries of the tables in MIT krb5's
+`src/lib/crypto/crypto_tests/` (`t_decrypt.c`, `t_cksums.c`,
+`t_derive.c`, `t_str2key.c`, `t_prf.c`), consumed by
+`src/mit_vectors.rs`. The file records the MIT commit it came from;
+`MIT-KRB5-NOTICE` carries the source files' copyright notices.
+
+Regenerate from a krb5 checkout with:
+
+```sh
+scripts/import-mit-vectors.py <krb5>/src/lib/crypto/crypto_tests <commit> > testdata/mit-crypto.json
+```
+
+The script only reformats: every value is MIT's.

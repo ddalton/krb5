@@ -86,6 +86,8 @@ pub mod token; // RFC 4121 §4.2 per-message Wrap and MIC tokens
 
 #[cfg(test)]
 mod interop; // MIT krb5 interop fixtures — the gate vectors cannot close
+#[cfg(test)]
+mod mit_vectors; // MIT krb5's crypto_tests known answers, enctypes 17-20
 
 pub use acceptor::{
     DEFAULT_CLOCK_SKEW_SECS, EncType, KerberosContext, KerberosError, Keytab, Result, ServiceKey,
