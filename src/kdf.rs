@@ -112,6 +112,9 @@ pub enum KdfError {
     #[error("iteration count {0} exceeds the {MAX_ITERATIONS} cap")]
     IterationsTooHigh(u64),
 
+    #[error("iteration count {count} is below the enctype's default of {min}")]
+    IterationsTooLow { count: u64, min: u64 },
+
     #[error("unknown or unsupported enctype {0}; only 17, 18, 19 and 20 are supported")]
     UnsupportedEnctype(i32),
 }
@@ -518,7 +521,13 @@ pub fn prf_hmac_sha2(enctype: Enctype, input_key: &[u8], octet_string: &[u8]) ->
 /// iteration count is 1"). Reading it as signed, or mapping it to zero
 /// iterations, is a silent catastrophe; here it resolves to 2^32 and is
 /// then refused by the cap.
-fn s2k_iterations(enctype: Enctype, params: Option<[u8; 4]>) -> Result<u32> {
+///
+/// A count below the enctype's default is refused too, as MIT does
+/// (`pbkdf2_string_to_key`): `s2kparams` arrive in an unauthenticated
+/// ETYPE-INFO2, so a spoofed KDC could otherwise ask for one iteration and
+/// make the PA-ENC-TIMESTAMP a cheap offline password guess. `allow_weak`
+/// lifts the floor for the published vectors, which use 1, 2 and 1200.
+fn s2k_iterations(enctype: Enctype, params: Option<[u8; 4]>, allow_weak: bool) -> Result<u32> {
     let count = match params {
         None => enctype.default_s2k_iterations(),
         Some(p) => match u32::from_be_bytes(p) {
@@ -528,6 +537,10 @@ fn s2k_iterations(enctype: Enctype, params: Option<[u8; 4]>) -> Result<u32> {
     };
     if count > MAX_ITERATIONS {
         return Err(KdfError::IterationsTooHigh(count));
+    }
+    let min = enctype.default_s2k_iterations();
+    if count < min && !allow_weak {
+        return Err(KdfError::IterationsTooLow { count, min });
     }
     Ok(count as u32)
 }
@@ -557,13 +570,38 @@ fn s2k_iterations(enctype: Enctype, params: Option<[u8; 4]>) -> Result<u32> {
 ///
 /// Only needed when deriving from a password. A keytab already holds the
 /// derived long-term key — do not run string-to-key over it.
+///
+/// An iteration count below the enctype's default (4096 for 17/18, 32768
+/// for 19/20) is refused with [`KdfError::IterationsTooLow`].
 pub fn string_to_key(
     enctype: Enctype,
     passphrase: &[u8],
     salt: &[u8],
     params: Option<[u8; 4]>,
 ) -> Result<Vec<u8>> {
-    let iter = s2k_iterations(enctype, params)?;
+    string_to_key_inner(enctype, passphrase, salt, params, false)
+}
+
+/// [`string_to_key`] without the iteration floor, for the RFC and MIT
+/// vectors.
+#[cfg(test)]
+pub(crate) fn string_to_key_allow_weak(
+    enctype: Enctype,
+    passphrase: &[u8],
+    salt: &[u8],
+    params: Option<[u8; 4]>,
+) -> Result<Vec<u8>> {
+    string_to_key_inner(enctype, passphrase, salt, params, true)
+}
+
+fn string_to_key_inner(
+    enctype: Enctype,
+    passphrase: &[u8],
+    salt: &[u8],
+    params: Option<[u8; 4]>,
+    allow_weak: bool,
+) -> Result<Vec<u8>> {
+    let iter = s2k_iterations(enctype, params, allow_weak)?;
     let keylen = enctype.key_size();
     let mut tkey = vec![0u8; keylen];
 
@@ -880,10 +918,12 @@ mod tests {
             .enumerate()
         {
             let params = Some(iter.to_be_bytes());
-            let got128 = string_to_key(Enctype::Aes128CtsHmacSha196, pass, salt, params).unwrap();
+            let got128 =
+                string_to_key_allow_weak(Enctype::Aes128CtsHmacSha196, pass, salt, params).unwrap();
             assert_eq!(hexs(&got128), hexs(&h(k128)), "case {} aes128 key", i + 1);
 
-            let got256 = string_to_key(Enctype::Aes256CtsHmacSha196, pass, salt, params).unwrap();
+            let got256 =
+                string_to_key_allow_weak(Enctype::Aes256CtsHmacSha196, pass, salt, params).unwrap();
             assert_eq!(hexs(&got256), hexs(&h(k256)), "case {} aes256 key", i + 1);
         }
     }
@@ -900,6 +940,34 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(e, KdfError::IterationsTooHigh(1u64 << 32));
+    }
+
+    /// MIT `pbkdf2_string_to_key`: fewer iterations than the default is a
+    /// downgrade, refused unless the caller opts in. One under the floor
+    /// fails; the floor itself and no params at all both pass.
+    #[test]
+    fn an_iteration_count_below_the_default_is_refused() {
+        for (e, min) in [
+            (Enctype::Aes128CtsHmacSha196, 4096u32),
+            (Enctype::Aes256CtsHmacSha196, 4096),
+            (Enctype::Aes128CtsHmacSha256128, 32768),
+            (Enctype::Aes256CtsHmacSha384192, 32768),
+        ] {
+            assert_eq!(
+                string_to_key(e, b"password", b"salt", Some((min - 1).to_be_bytes())).unwrap_err(),
+                KdfError::IterationsTooLow {
+                    count: u64::from(min) - 1,
+                    min: u64::from(min)
+                },
+                "{e:?}"
+            );
+            let at_floor = string_to_key(e, b"password", b"salt", Some(min.to_be_bytes())).unwrap();
+            assert_eq!(
+                string_to_key(e, b"password", b"salt", None).unwrap(),
+                at_floor,
+                "{e:?}"
+            );
+        }
     }
 
     #[test]

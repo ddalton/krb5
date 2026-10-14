@@ -145,19 +145,28 @@ mod tests {
     }
 
     #[test]
-    fn rfc3962_password_key_matches_the_published_vector() {
-        // RFC 3962 Appendix B, iteration count 1200, 256-bit key.
-        let k = Key::from_password(
+    fn rfc8009_password_key_matches_the_published_vector() {
+        // RFC 8009 Appendix A, iteration count 32768, aes256-sha384.
+        let mut salt = hex("10df9dd783e5bc8acea1730e74355f61");
+        salt.extend_from_slice(b"ATHENA.MIT.EDUraeburn");
+        let k = Key::from_password(20, "password", &salt, Some(32768u32.to_be_bytes())).unwrap();
+        assert_eq!(
+            k.bytes(),
+            hex("45bd806dbf6a833a9cffc1c94589a222367a79bc21c413718906e9f578a78467")
+        );
+    }
+
+    #[test]
+    fn a_kdc_asking_for_too_few_iterations_is_refused() {
+        // RFC 3962 Appendix B's 1200 iterations are below the 4096 default.
+        let e = Key::from_password(
             18,
             "password",
             b"ATHENA.MIT.EDUraeburn",
             Some(1200u32.to_be_bytes()),
         )
-        .unwrap();
-        assert_eq!(
-            k.bytes(),
-            hex("55a6ac740ad17b4846941051e1e8b0a7548d93b0ab30a8bc3ff16280382b8c2a")
-        );
+        .unwrap_err();
+        assert!(e.0.contains("below the enctype's default"), "{e}");
     }
 
     #[test]
