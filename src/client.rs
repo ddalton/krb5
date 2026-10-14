@@ -11,7 +11,7 @@
 //! FAST: the caller names the realm and its KDCs.
 
 use crate::acceptor::Keytab;
-use crate::der::{self, app, Fields, Reader};
+use crate::der::{self, Fields, Reader, app};
 use crate::key::{Key, KeyError};
 use rand::RngCore;
 use std::fmt;
@@ -156,7 +156,11 @@ impl Principal {
         if name.contains('@') || realm.is_empty() || components.iter().any(|c| c.is_empty()) {
             return protocol(format!("bad principal {name:?}@{realm:?}"));
         }
-        let nt = if components[0] == "krbtgt" { NT_SRV_INST } else { NT_PRINCIPAL };
+        let nt = if components[0] == "krbtgt" {
+            NT_SRV_INST
+        } else {
+            NT_PRINCIPAL
+        };
         Ok(Principal::new(nt, components, realm))
     }
 
@@ -185,7 +189,13 @@ impl Principal {
             der::field(0, der::int(self.name_type as i64)),
             der::field(
                 1,
-                der::seq(&self.components.iter().map(|c| der::general_string(c)).collect::<Vec<_>>()),
+                der::seq(
+                    &self
+                        .components
+                        .iter()
+                        .map(|c| der::general_string(c))
+                        .collect::<Vec<_>>(),
+                ),
             ),
         ])
     }
@@ -198,7 +208,11 @@ impl Principal {
         while !strings.is_empty() {
             components.push(strings.string()?);
         }
-        Ok(Principal { name_type, components, realm })
+        Ok(Principal {
+            name_type,
+            components,
+            realm,
+        })
     }
 }
 
@@ -286,7 +300,11 @@ impl KdcClient {
     /// Enctypes to request, most preferred first. Unsupported ones are
     /// dropped.
     pub fn with_enctypes(mut self, enctypes: &[i32]) -> Self {
-        self.enctypes = enctypes.iter().copied().filter(|e| (17..=20).contains(e)).collect();
+        self.enctypes = enctypes
+            .iter()
+            .copied()
+            .filter(|e| (17..=20).contains(e))
+            .collect();
         self
     }
 
@@ -317,7 +335,9 @@ impl KdcClient {
             .filter(|&e| keytab_key(keytab, client, e).is_some())
             .collect();
         if have.is_empty() {
-            return Err(ClientError::NoKey(format!("keytab has no AES key for {client}")));
+            return Err(ClientError::NoKey(format!(
+                "keytab has no AES key for {client}"
+            )));
         }
         self.as_exchange(client, Secret::Keytab(keytab), have)
     }
@@ -329,7 +349,14 @@ impl KdcClient {
         let body = self.req_body(None, service, nonce, now);
 
         let cksum = tgt.session_key.checksum(KU_TGS_REQ_AUTH_CKSUM, &body)?;
-        let authenticator = encode_authenticator(&tgt.client, Some((tgt.session_key.checksum_type(), cksum)), usec, now, None, None);
+        let authenticator = encode_authenticator(
+            &tgt.client,
+            Some((tgt.session_key.checksum_type(), cksum)),
+            usec,
+            now,
+            None,
+            None,
+        );
         let enc_auth = tgt.session_key.encrypt(KU_TGS_REQ_AUTH, &authenticator)?;
         let ap_req = encode_ap_req(0, &tgt.ticket, tgt.session_key.enctype(), &enc_auth);
 
@@ -338,11 +365,18 @@ impl KdcClient {
             Reply::Error(e) => return Err(e.into_error()),
             Reply::Rep(r) => r,
         };
-        let plain = tgt.session_key.decrypt(KU_TGS_REP_ENC_PART_SESSION, &rep.cipher)?;
+        let plain = tgt
+            .session_key
+            .decrypt(KU_TGS_REP_ENC_PART_SESSION, &rep.cipher)?;
         rep.into_credentials(&plain, nonce)
     }
 
-    fn as_exchange(&self, client: &Principal, secret: Secret<'_>, enctypes: Vec<i32>) -> Result<Credentials> {
+    fn as_exchange(
+        &self,
+        client: &Principal,
+        secret: Secret<'_>,
+        enctypes: Vec<i32>,
+    ) -> Result<Credentials> {
         let krbtgt = Principal::krbtgt(&client.realm);
         let mut padata: Vec<(i32, Vec<u8>)> = Vec::new();
         let mut preauth_key: Option<Key> = None;
@@ -358,10 +392,15 @@ impl KdcClient {
                 Reply::Error(e) if e.code == KDC_ERR_PREAUTH_REQUIRED && round == 0 => {
                     let methods = e.method_data()?;
                     let info = choose_salt(&methods, &enctypes).ok_or_else(|| {
-                        ClientError::NoKey("KDC offered no supported enctype for pre-authentication".into())
+                        ClientError::NoKey(
+                            "KDC offered no supported enctype for pre-authentication".into(),
+                        )
                     })?;
                     let key = derive_key(&secret, client, &info)?;
-                    debug!(etype = info.etype, "pre-authenticating with PA-ENC-TIMESTAMP");
+                    debug!(
+                        etype = info.etype,
+                        "pre-authenticating with PA-ENC-TIMESTAMP"
+                    );
                     padata = vec![(PA_ENC_TIMESTAMP, encode_enc_timestamp(&key, now, usec)?)];
                     // RFC 6113 §5.2: echo the cookie so a stateless KDC can
                     // continue the conversation.
@@ -388,13 +427,15 @@ impl KdcClient {
                     derive_key(&secret, client, &info)?
                 }
             };
-            let plain = key.decrypt(KU_AS_REP_ENC_PART, &rep.cipher).map_err(|e| match secret {
-                Secret::Password(_) => ClientError::Crypto(KeyError(format!(
-                    "cannot decrypt AS-REP (wrong password?): {}",
-                    e.0
-                ))),
-                Secret::Keytab(_) => ClientError::Crypto(e),
-            })?;
+            let plain = key
+                .decrypt(KU_AS_REP_ENC_PART, &rep.cipher)
+                .map_err(|e| match secret {
+                    Secret::Password(_) => ClientError::Crypto(KeyError(format!(
+                        "cannot decrypt AS-REP (wrong password?): {}",
+                        e.0
+                    ))),
+                    Secret::Keytab(_) => ClientError::Crypto(e),
+                })?;
             return rep.into_credentials(&plain, nonce);
         }
         Err(ClientError::Kdc {
@@ -403,7 +444,13 @@ impl KdcClient {
         })
     }
 
-    fn req_body(&self, cname: Option<&Principal>, sname: &Principal, nonce: u32, now: i64) -> Vec<u8> {
+    fn req_body(
+        &self,
+        cname: Option<&Principal>,
+        sname: &Principal,
+        nonce: u32,
+        now: i64,
+    ) -> Vec<u8> {
         self.req_body_with(cname, sname, nonce, now, &self.enctypes)
     }
 
@@ -421,9 +468,20 @@ impl KdcClient {
         }
         parts.push(der::field(2, der::general_string(&sname.realm)));
         parts.push(der::field(3, sname.encode_name()));
-        parts.push(der::field(5, der::time(now + self.lifetime.as_secs() as i64)));
+        parts.push(der::field(
+            5,
+            der::time(now + self.lifetime.as_secs() as i64),
+        ));
         parts.push(der::field(7, der::int(nonce as i64)));
-        parts.push(der::field(8, der::seq(&enctypes.iter().map(|&e| der::int(e as i64)).collect::<Vec<_>>())));
+        parts.push(der::field(
+            8,
+            der::seq(
+                &enctypes
+                    .iter()
+                    .map(|&e| der::int(e as i64))
+                    .collect::<Vec<_>>(),
+            ),
+        ));
         der::seq(&parts)
     }
 
@@ -440,7 +498,10 @@ impl KdcClient {
                 }
             }
         }
-        Err(ClientError::Unreachable { realm: self.realm.clone(), last })
+        Err(ClientError::Unreachable {
+            realm: self.realm.clone(),
+            last,
+        })
     }
 
     fn exchange_one(&self, addr: &str, req: &[u8]) -> std::io::Result<Vec<u8>> {
@@ -464,7 +525,10 @@ impl KdcClient {
             let len = u32::from_be_bytes(len);
             // RFC 4120 §7.2.2: the high bit is reserved and must be zero.
             if len & 0x8000_0000 != 0 || len as usize > MAX_REPLY {
-                return Err(Error::new(ErrorKind::InvalidData, format!("bad reply length {len:#x}")));
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("bad reply length {len:#x}"),
+                ));
             }
             let mut buf = vec![0u8; len as usize];
             s.read_exact(&mut buf)?;
@@ -503,8 +567,12 @@ fn derive_key(secret: &Secret<'_>, client: &Principal, info: &SaltInfo) -> Resul
             let salt = info.salt.clone().unwrap_or_else(|| client.default_salt());
             Ok(Key::from_password(info.etype, pw, &salt, info.params)?)
         }
-        Secret::Keytab(kt) => keytab_key(kt, client, info.etype)
-            .ok_or_else(|| ClientError::NoKey(format!("keytab has no enctype {} key for {client}", info.etype))),
+        Secret::Keytab(kt) => keytab_key(kt, client, info.etype).ok_or_else(|| {
+            ClientError::NoKey(format!(
+                "keytab has no enctype {} key for {client}",
+                info.etype
+            ))
+        }),
     }
 }
 
@@ -524,8 +592,15 @@ fn choose_salt(padata: &[(i32, Vec<u8>)], offered: &[i32]) -> Option<SaltInfo> {
     }
     // PW-SALT carries a salt but no enctype; it applies to whichever
     // enctype the reply used.
-    let salt = padata.iter().find(|(t, _)| *t == PA_PW_SALT).map(|(_, v)| v.clone())?;
-    Some(SaltInfo { etype: *offered.first()?, salt: Some(salt), params: None })
+    let salt = padata
+        .iter()
+        .find(|(t, _)| *t == PA_PW_SALT)
+        .map(|(_, v)| v.clone())?;
+    Some(SaltInfo {
+        etype: *offered.first()?,
+        salt: Some(salt),
+        params: None,
+    })
 }
 
 /// ETYPE-INFO2-ENTRY ::= SEQUENCE { etype [0], salt [1] KerberosString
@@ -545,11 +620,17 @@ fn parse_etype_info(value: &[u8], v2: bool) -> Result<Vec<SaltInfo>> {
         let params = match f.opt(2) {
             Some(mut r) if v2 => {
                 let p = r.octets()?;
-                Some(p.try_into().map_err(|_| ClientError::Protocol(format!("s2kparams of {} octets", p.len())))?)
+                Some(p.try_into().map_err(|_| {
+                    ClientError::Protocol(format!("s2kparams of {} octets", p.len()))
+                })?)
             }
             _ => None,
         };
-        out.push(SaltInfo { etype, salt, params });
+        out.push(SaltInfo {
+            etype,
+            salt,
+            params,
+        });
     }
     Ok(out)
 }
@@ -557,7 +638,9 @@ fn parse_etype_info(value: &[u8], v2: bool) -> Result<Vec<SaltInfo>> {
 // ------------------------------------------------------------- encoding
 
 fn now() -> (i64, u32) {
-    let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let d = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     (d.as_secs() as i64, d.subsec_micros())
 }
 
@@ -570,13 +653,21 @@ fn encode_pa_data(padata: &[(i32, Vec<u8>)]) -> Vec<u8> {
     der::seq(
         &padata
             .iter()
-            .map(|(t, v)| der::seq(&[der::field(1, der::int(*t as i64)), der::field(2, der::octets(v))]))
+            .map(|(t, v)| {
+                der::seq(&[
+                    der::field(1, der::int(*t as i64)),
+                    der::field(2, der::octets(v)),
+                ])
+            })
             .collect::<Vec<_>>(),
     )
 }
 
 fn encode_kdc_req(msg_type: u8, padata: &[(i32, Vec<u8>)], body: Vec<u8>) -> Vec<u8> {
-    let mut parts = vec![der::field(1, der::int(5)), der::field(2, der::int(msg_type as i64))];
+    let mut parts = vec![
+        der::field(1, der::int(5)),
+        der::field(2, der::int(msg_type as i64)),
+    ];
     if !padata.is_empty() {
         parts.push(der::field(3, encode_pa_data(padata)));
     }
@@ -585,14 +676,23 @@ fn encode_kdc_req(msg_type: u8, padata: &[(i32, Vec<u8>)], body: Vec<u8>) -> Vec
 }
 
 pub(crate) fn encode_encrypted_data(etype: i32, cipher: &[u8]) -> Vec<u8> {
-    der::seq(&[der::field(0, der::int(etype as i64)), der::field(2, der::octets(cipher))])
+    der::seq(&[
+        der::field(0, der::int(etype as i64)),
+        der::field(2, der::octets(cipher)),
+    ])
 }
 
 /// PA-ENC-TS-ENC ::= SEQUENCE { patimestamp [0], pausec [1] OPTIONAL },
 /// encrypted in the client's long-term key with usage 1.
 fn encode_enc_timestamp(key: &Key, now: i64, usec: u32) -> Result<Vec<u8>> {
-    let ts = der::seq(&[der::field(0, der::time(now)), der::field(1, der::int(usec as i64))]);
-    Ok(encode_encrypted_data(key.enctype(), &key.encrypt(KU_PA_ENC_TIMESTAMP, &ts)?))
+    let ts = der::seq(&[
+        der::field(0, der::time(now)),
+        der::field(1, der::int(usec as i64)),
+    ]);
+    Ok(encode_encrypted_data(
+        key.enctype(),
+        &key.encrypt(KU_PA_ENC_TIMESTAMP, &ts)?,
+    ))
 }
 
 /// Authenticator ::= [APPLICATION 2] SEQUENCE (RFC 4120 §5.5.1).
@@ -610,7 +710,13 @@ pub(crate) fn encode_authenticator(
         der::field(2, client.encode_name()),
     ];
     if let Some((ty, sum)) = cksum {
-        parts.push(der::field(3, der::seq(&[der::field(0, der::int(ty as i64)), der::field(1, der::octets(&sum))])));
+        parts.push(der::field(
+            3,
+            der::seq(&[
+                der::field(0, der::int(ty as i64)),
+                der::field(1, der::octets(&sum)),
+            ]),
+        ));
     }
     parts.push(der::field(4, der::int(cusec as i64)));
     parts.push(der::field(5, der::time(ctime)));
@@ -624,7 +730,12 @@ pub(crate) fn encode_authenticator(
 }
 
 /// AP-REQ ::= [APPLICATION 14] SEQUENCE (RFC 4120 §5.5.1).
-pub(crate) fn encode_ap_req(ap_options: u32, ticket: &[u8], auth_etype: i32, enc_auth: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_ap_req(
+    ap_options: u32,
+    ticket: &[u8],
+    auth_etype: i32,
+    enc_auth: &[u8],
+) -> Vec<u8> {
     der::cons(
         app(14),
         &[der::seq(&[
@@ -638,7 +749,10 @@ pub(crate) fn encode_ap_req(ap_options: u32, ticket: &[u8], auth_etype: i32, enc
 }
 
 pub(crate) fn encode_key(k: &Key) -> Vec<u8> {
-    der::seq(&[der::field(0, der::int(k.enctype() as i64)), der::field(1, der::octets(k.bytes()))])
+    der::seq(&[
+        der::field(0, der::int(k.enctype() as i64)),
+        der::field(1, der::octets(k.bytes())),
+    ])
 }
 
 pub(crate) fn decode_key(mut r: Reader<'_>) -> Result<Key> {
@@ -681,12 +795,18 @@ impl KrbError {
         Ok(KrbError {
             code: f.get(6)?.i32()?,
             text: f.opt(11).map(|mut r| r.string()).transpose()?,
-            e_data: f.opt(12).map(|mut r| r.octets().map(<[u8]>::to_vec)).transpose()?,
+            e_data: f
+                .opt(12)
+                .map(|mut r| r.octets().map(<[u8]>::to_vec))
+                .transpose()?,
         })
     }
 
     pub(crate) fn into_error(self) -> ClientError {
-        ClientError::Kdc { code: self.code, text: self.text }
+        ClientError::Kdc {
+            code: self.code,
+            text: self.text,
+        }
     }
 
     /// METHOD-DATA ::= SEQUENCE OF PA-DATA, in e-data of PREAUTH_REQUIRED.
@@ -729,7 +849,14 @@ fn parse_reply(data: &[u8], rep_app: u8) -> Result<Reply> {
     let tf = Fields::parse_tagged("Ticket", app(1), &ticket)?;
     let (ticket_enctype, _) = decode_encrypted_data(tf.get(3)?)?;
     let (enc_etype, cipher) = decode_encrypted_data(f.get(6)?)?;
-    Ok(Reply::Rep(KdcRep { padata, client, ticket, ticket_enctype, enc_etype, cipher }))
+    Ok(Reply::Rep(KdcRep {
+        padata,
+        client,
+        ticket,
+        ticket_enctype,
+        enc_etype,
+        cipher,
+    }))
 }
 
 impl KdcRep {
@@ -772,7 +899,10 @@ mod tests {
         assert_eq!(p.realm, "EXAMPLE.COM");
         assert_eq!(p.name_type, NT_PRINCIPAL);
         assert_eq!(p.to_string(), "nfs/server.example.com@EXAMPLE.COM");
-        assert_eq!(Principal::parse("krbtgt/R@R").unwrap(), Principal::krbtgt("R"));
+        assert_eq!(
+            Principal::parse("krbtgt/R@R").unwrap(),
+            Principal::krbtgt("R")
+        );
         assert!(Principal::parse("alice").is_err());
         assert!(Principal::parse("a//b@R").is_err());
         assert!(Principal::parse("a@").is_err());
@@ -815,23 +945,31 @@ mod tests {
 
     #[test]
     fn a_krb_error_carries_code_text_and_method_data() {
-        let md = encode_pa_data(&[(PA_ETYPE_INFO2, der::seq(&[der::seq(&[
-            der::field(0, der::int(18)),
-            der::field(1, der::general_string("R.COMalice")),
-            der::field(2, der::octets(&4096u32.to_be_bytes())),
-        ])]))]);
-        let err = der::cons(app(30), &[der::seq(&[
-            der::field(0, der::int(5)),
-            der::field(1, der::int(30)),
-            der::field(4, der::time(0)),
-            der::field(5, der::int(0)),
-            der::field(6, der::int(25)),
-            der::field(9, der::general_string("R")),
-            der::field(10, Principal::krbtgt("R").encode_name()),
-            der::field(11, der::general_string("need preauth")),
-            der::field(12, der::octets(&md)),
-        ])]);
-        let Reply::Error(e) = parse_reply(&err, 11).unwrap() else { panic!("not an error") };
+        let md = encode_pa_data(&[(
+            PA_ETYPE_INFO2,
+            der::seq(&[der::seq(&[
+                der::field(0, der::int(18)),
+                der::field(1, der::general_string("R.COMalice")),
+                der::field(2, der::octets(&4096u32.to_be_bytes())),
+            ])]),
+        )]);
+        let err = der::cons(
+            app(30),
+            &[der::seq(&[
+                der::field(0, der::int(5)),
+                der::field(1, der::int(30)),
+                der::field(4, der::time(0)),
+                der::field(5, der::int(0)),
+                der::field(6, der::int(25)),
+                der::field(9, der::general_string("R")),
+                der::field(10, Principal::krbtgt("R").encode_name()),
+                der::field(11, der::general_string("need preauth")),
+                der::field(12, der::octets(&md)),
+            ])],
+        );
+        let Reply::Error(e) = parse_reply(&err, 11).unwrap() else {
+            panic!("not an error")
+        };
         assert_eq!(e.code, KDC_ERR_PREAUTH_REQUIRED);
         assert_eq!(e.text.as_deref(), Some("need preauth"));
         let info = choose_salt(&e.method_data().unwrap(), &[17, 18]).unwrap();
@@ -853,7 +991,9 @@ mod tests {
     #[test]
     fn an_unreachable_kdc_is_reported_not_hung_on() {
         let c = KdcClient::new("R", ["127.0.0.1:1"]).with_timeout(Duration::from_millis(500));
-        let err = c.login_with_password(&Principal::parse("a@R").unwrap(), "x").unwrap_err();
+        let err = c
+            .login_with_password(&Principal::parse("a@R").unwrap(), "x")
+            .unwrap_err();
         assert!(matches!(err, ClientError::Unreachable { .. }), "{err}");
     }
 }

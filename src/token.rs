@@ -826,8 +826,10 @@ impl ContextKey {
     /// subkey from the AP-REQ authenticator, else the service ticket's
     /// session key.
     pub fn new(etype: i32, base_key: &[u8]) -> Result<Self, TokenError> {
-        let pe = profile::Enctype::from_i32(etype).map_err(|e| TokenError::Crypto(e.to_string()))?;
-        let ke_type = kdf::Enctype::from_i32(etype).map_err(|e| TokenError::Crypto(e.to_string()))?;
+        let pe =
+            profile::Enctype::from_i32(etype).map_err(|e| TokenError::Crypto(e.to_string()))?;
+        let ke_type =
+            kdf::Enctype::from_i32(etype).map_err(|e| TokenError::Crypto(e.to_string()))?;
 
         let derive = |usage: u32, which: kdf::KeyUse| -> Result<Vec<u8>, TokenError> {
             kdf::derive_key(ke_type, base_key, usage, which)
@@ -888,9 +890,7 @@ impl PerMessageCrypto for ContextKey {
     ) -> Result<Vec<u8>, TokenError> {
         let k = self.keys(usage)?;
         match confounder {
-            Some(c) => {
-                profile::encrypt_with_confounder(self.enctype, &k.ke, &k.ki, c, plaintext)
-            }
+            Some(c) => profile::encrypt_with_confounder(self.enctype, &k.ke, &k.ki, c, plaintext),
             None => profile::encrypt(self.enctype, &k.ke, &k.ki, plaintext),
         }
         .map_err(|e| TokenError::Crypto(e.to_string()))
@@ -1007,7 +1007,9 @@ mod tests {
             lg.last_enc_input = plaintext.to_vec();
             lg.last_enc_usage = usage;
             drop(lg);
-            let conf = confounder.map(|c| c.to_vec()).unwrap_or_else(|| vec![0x5a; 16]);
+            let conf = confounder
+                .map(|c| c.to_vec())
+                .unwrap_or_else(|| vec![0x5a; 16]);
             let mut p = conf;
             p.extend_from_slice(plaintext);
             let tag = stub_mac(usage, &p, self.h);
@@ -1226,7 +1228,9 @@ mod tests {
     #[test]
     fn rfc4121_4_2_4_mic_checksum_input_is_data_then_header() {
         let srv = acceptor(16);
-        let token = srv.emit_mic(0x0102030405060708, b"\x00\x01\x02\x03\x04\x05\x06\x07").unwrap();
+        let token = srv
+            .emit_mic(0x0102030405060708, b"\x00\x01\x02\x03\x04\x05\x06\x07")
+            .unwrap();
 
         let header = hex("040405ffffffffff0102030405060708");
         assert_eq!(&token[0..16], &header[..]);
@@ -1239,7 +1243,10 @@ mod tests {
         // would notice -- only this assertion does.
         let mut inverted = header.clone();
         inverted.extend_from_slice(b"\x00\x01\x02\x03\x04\x05\x06\x07");
-        assert_eq!(inverted.len(), srv.crypto().log.borrow().last_mic_input.len());
+        assert_eq!(
+            inverted.len(),
+            srv.crypto().log.borrow().last_mic_input.len()
+        );
         assert_ne!(srv.crypto().log.borrow().last_mic_input, inverted);
     }
 
@@ -1249,8 +1256,14 @@ mod tests {
     fn rfc4121_4_2_4_sealed_encrypt_input_is_data_filler_header() {
         let srv = acceptor(16);
         // EC = 5 filler octets, RRC = 13, so both rules are exercised at once.
-        srv.emit_wrap_full(7, b"\x00\x01\x02\x03\x04\x05\x06\x07", 5, 13, Some(&[0u8; 16]))
-            .unwrap();
+        srv.emit_wrap_full(
+            7,
+            b"\x00\x01\x02\x03\x04\x05\x06\x07",
+            5,
+            13,
+            Some(&[0u8; 16]),
+        )
+        .unwrap();
         assert_eq!(
             hexs(&srv.crypto().log.borrow().last_enc_input),
             concat!(
@@ -1268,9 +1281,15 @@ mod tests {
     #[test]
     fn rfc4121_4_2_6_1_mic_header_layout() {
         // Initiator, not sealed, acceptor subkey asserted -> Flags 0x04.
-        assert_eq!(hexs(&mic_header(0x04, 0)), "040404ffffffffff0000000000000000");
+        assert_eq!(
+            hexs(&mic_header(0x04, 0)),
+            "040404ffffffffff0000000000000000"
+        );
         // Acceptor -> SentByAcceptor set -> Flags 0x05.
-        assert_eq!(hexs(&mic_header(0x05, 1)), "040405ffffffffff0000000000000001");
+        assert_eq!(
+            hexs(&mic_header(0x05, 1)),
+            "040405ffffffffff0000000000000001"
+        );
     }
 
     /// RFC 4121 §4.2.6.2 layout, octet by octet. EC and RRC are big-endian
@@ -1372,7 +1391,10 @@ mod tests {
         let mut asn1 = cli.emit_wrap(0, b"msg").unwrap();
         asn1[0] = 0x60;
         asn1[1] = 0x2a;
-        assert!(matches!(srv.unwrap(&asn1), Err(TokenError::BadTokId { .. })));
+        assert!(matches!(
+            srv.unwrap(&asn1),
+            Err(TokenError::BadTokId { .. })
+        ));
     }
 
     /// RFC 4121 §4.2.2: SentByAcceptor is the direction indicator, "thus
@@ -1525,7 +1547,9 @@ mod tests {
         // turn away a peer MIT krb5 accepts.
         let srv_sub = acceptor(16);
         srv_sub.verify_mic(&mic, b"msg").unwrap();
-        srv_sub.unwrap(&plain.emit_wrap(0, b"msg").unwrap()).unwrap();
+        srv_sub
+            .unwrap(&plain.emit_wrap(0, b"msg").unwrap())
+            .unwrap();
     }
 
     #[test]
@@ -1738,22 +1762,62 @@ mod tests {
     #[test]
     fn derived_mic_tokens_match_an_independent_implementation() {
         let cases: &[(i32, &str, Role, u64, &str)] = &[
-            (17, BASE_17, Role::Initiator, 0,
-             "040404ffffffffff00000000000000002c8776d63e1586f0b7d54e4a"),
-            (17, BASE_17, Role::Acceptor, 0x0102030405060708,
-             "040405ffffffffff010203040506070878852f2225938ea28a11a28f"),
-            (18, BASE_18, Role::Initiator, 0,
-             "040404ffffffffff0000000000000000532d63a1e102523cbaa5c097"),
-            (18, BASE_18, Role::Acceptor, 0x0102030405060708,
-             "040405ffffffffff0102030405060708ff34e97cde9edb2e1c58a327"),
-            (19, BASE_19, Role::Initiator, 0,
-             "040404ffffffffff00000000000000002aee928d6a136c7dcb8d2a8f1cd04e3f"),
-            (19, BASE_19, Role::Acceptor, 0x0102030405060708,
-             "040405ffffffffff0102030405060708db1d3db90b88d7410a75910578e0b835"),
-            (20, BASE_20, Role::Initiator, 0,
-             "040404ffffffffff0000000000000000e08e6d060dbe9f71ad6ab85fa00c7f25241392b4f8c7361f"),
-            (20, BASE_20, Role::Acceptor, 0x0102030405060708,
-             "040405ffffffffff010203040506070854a34723bc61a71f7141a1fd460025e432936f08059dc312"),
+            (
+                17,
+                BASE_17,
+                Role::Initiator,
+                0,
+                "040404ffffffffff00000000000000002c8776d63e1586f0b7d54e4a",
+            ),
+            (
+                17,
+                BASE_17,
+                Role::Acceptor,
+                0x0102030405060708,
+                "040405ffffffffff010203040506070878852f2225938ea28a11a28f",
+            ),
+            (
+                18,
+                BASE_18,
+                Role::Initiator,
+                0,
+                "040404ffffffffff0000000000000000532d63a1e102523cbaa5c097",
+            ),
+            (
+                18,
+                BASE_18,
+                Role::Acceptor,
+                0x0102030405060708,
+                "040405ffffffffff0102030405060708ff34e97cde9edb2e1c58a327",
+            ),
+            (
+                19,
+                BASE_19,
+                Role::Initiator,
+                0,
+                "040404ffffffffff00000000000000002aee928d6a136c7dcb8d2a8f1cd04e3f",
+            ),
+            (
+                19,
+                BASE_19,
+                Role::Acceptor,
+                0x0102030405060708,
+                "040405ffffffffff0102030405060708db1d3db90b88d7410a75910578e0b835",
+            ),
+            (
+                20,
+                BASE_20,
+                Role::Initiator,
+                0,
+                "040404ffffffffff0000000000000000e08e6d060dbe9f71ad6ab85fa00c7f25241392b4f8c7361f",
+            ),
+            (
+                20,
+                BASE_20,
+                Role::Acceptor,
+                0x0102030405060708,
+                "040405ffffffffff010203040506070854a34723bc61a71f7141a1fd460025e432936f08059dc312",
+            ),
         ];
         for (etype, base, role, seq, want) in cases {
             let me = ctx(*etype, base, *role);
@@ -1772,30 +1836,62 @@ mod tests {
     #[test]
     fn derived_sealed_wrap_tokens_match_an_independent_implementation() {
         let cases: &[(i32, &str, Role, &str)] = &[
-            (17, BASE_17, Role::Initiator,
-             "050406ff000000000000000000000007ffbf18b827f96b5c325be75e8d595e4f8d8d392596\
-              79b917ea5fb3f74c2d4a0f287b6584dfbe3885e86d50aa6ec2506a270ee36b"),
-            (17, BASE_17, Role::Acceptor,
-             "050407ff0000000000000000000000074caaa925fccd83c289056bf912f70de8e5d062651a\
-              08359699b637dc9453aa3d57e5ffb97203592acee19d963a097d7278696c46"),
-            (18, BASE_18, Role::Initiator,
-             "050406ff0000000000000000000000077e299b9a83dc44dfaa519480cdf11cbc2b83185d98fd2255\
-              4be602ed9e90a85de734d16810b93c3278531bc0aa14022fccdf9847"),
-            (18, BASE_18, Role::Acceptor,
-             "050407ff000000000000000000000007af8e603aa82b1b47f135223602e8b05e6473e05d6a72e38b\
-              72075d60a699760fe39dccab9098fd2cae301f8e6730eef182588c60"),
-            (19, BASE_19, Role::Initiator,
-             "050406ff0000000000000000000000074ceb0df199bd3b95bf86a2581e55e1ed95487197e7e5c41d\
-              8ad94cba6250977b196b889a93566d07a0c906e1a64a3bc5050738d2b67b43c8"),
-            (19, BASE_19, Role::Acceptor,
-             "050407ff000000000000000000000007f024d936e836196982be25c96741b999b34a807a9ec9b126\
-              f8d771c590a6b0c2934948627a7fd7a5311f8118410239f45d8c840254ab4b7b"),
-            (20, BASE_20, Role::Initiator,
-             "050406ff00000000000000000000000784b137d2eb9bb504415a9327d9e95821d59efeea7d2e40cc\
-              993f03ca397a27d62daf2896a4bf6712173a6a1024ac5ca099ea3fe6a4306693195801bff6417e79"),
-            (20, BASE_20, Role::Acceptor,
-             "050407ff000000000000000000000007eab86ebfc360463fcb19dda4f08aac54cb7bdc8a4f89309f\
-              3d66647295b796aaf873ae75c15e94d47c4ab0f2598cc9c007a50e27b13226519bc432b92c5f2e65"),
+            (
+                17,
+                BASE_17,
+                Role::Initiator,
+                "050406ff000000000000000000000007ffbf18b827f96b5c325be75e8d595e4f8d8d392596\
+              79b917ea5fb3f74c2d4a0f287b6584dfbe3885e86d50aa6ec2506a270ee36b",
+            ),
+            (
+                17,
+                BASE_17,
+                Role::Acceptor,
+                "050407ff0000000000000000000000074caaa925fccd83c289056bf912f70de8e5d062651a\
+              08359699b637dc9453aa3d57e5ffb97203592acee19d963a097d7278696c46",
+            ),
+            (
+                18,
+                BASE_18,
+                Role::Initiator,
+                "050406ff0000000000000000000000077e299b9a83dc44dfaa519480cdf11cbc2b83185d98fd2255\
+              4be602ed9e90a85de734d16810b93c3278531bc0aa14022fccdf9847",
+            ),
+            (
+                18,
+                BASE_18,
+                Role::Acceptor,
+                "050407ff000000000000000000000007af8e603aa82b1b47f135223602e8b05e6473e05d6a72e38b\
+              72075d60a699760fe39dccab9098fd2cae301f8e6730eef182588c60",
+            ),
+            (
+                19,
+                BASE_19,
+                Role::Initiator,
+                "050406ff0000000000000000000000074ceb0df199bd3b95bf86a2581e55e1ed95487197e7e5c41d\
+              8ad94cba6250977b196b889a93566d07a0c906e1a64a3bc5050738d2b67b43c8",
+            ),
+            (
+                19,
+                BASE_19,
+                Role::Acceptor,
+                "050407ff000000000000000000000007f024d936e836196982be25c96741b999b34a807a9ec9b126\
+              f8d771c590a6b0c2934948627a7fd7a5311f8118410239f45d8c840254ab4b7b",
+            ),
+            (
+                20,
+                BASE_20,
+                Role::Initiator,
+                "050406ff00000000000000000000000784b137d2eb9bb504415a9327d9e95821d59efeea7d2e40cc\
+              993f03ca397a27d62daf2896a4bf6712173a6a1024ac5ca099ea3fe6a4306693195801bff6417e79",
+            ),
+            (
+                20,
+                BASE_20,
+                Role::Acceptor,
+                "050407ff000000000000000000000007eab86ebfc360463fcb19dda4f08aac54cb7bdc8a4f89309f\
+              3d66647295b796aaf873ae75c15e94d47c4ab0f2598cc9c007a50e27b13226519bc432b92c5f2e65",
+            ),
         ];
         for (etype, base, role, want) in cases {
             let me = ctx(*etype, base, *role);
@@ -1804,7 +1900,9 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 hexs(&token),
-                want.chars().filter(|c| !c.is_whitespace()).collect::<String>(),
+                want.chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect::<String>(),
                 "enctype {} role {:?}",
                 etype,
                 role
@@ -1836,22 +1934,62 @@ mod tests {
     #[test]
     fn derived_mic_tokens_without_an_acceptor_subkey() {
         let cases: &[(i32, &str, Role, u64, &str)] = &[
-            (17, BASE_17, Role::Initiator, 0x0,
-             "040400ffffffffff0000000000000000daec54d205dfeb4713361254"),
-            (17, BASE_17, Role::Acceptor, 0x102030405060708,
-             "040401ffffffffff0102030405060708a6851aa0c42611ab402c53c4"),
-            (18, BASE_18, Role::Initiator, 0x0,
-             "040400ffffffffff0000000000000000d3dc7bbc47571ee7e303a9a4"),
-            (18, BASE_18, Role::Acceptor, 0x102030405060708,
-             "040401ffffffffff0102030405060708142ccd49757fa8aa54438b58"),
-            (19, BASE_19, Role::Initiator, 0x0,
-             "040400ffffffffff000000000000000094c38586dfe6d40e5059a56329d97785"),
-            (19, BASE_19, Role::Acceptor, 0x102030405060708,
-             "040401ffffffffff01020304050607082dc2fd69c700476bb953c76e9feed764"),
-            (20, BASE_20, Role::Initiator, 0x0,
-             "040400ffffffffff0000000000000000090ed891f36ae4d9029043c0a34d4e0a1673f43de2164ed7"),
-            (20, BASE_20, Role::Acceptor, 0x102030405060708,
-             "040401ffffffffff01020304050607085f54e155bc000419b30b1c6d32eea775242d7158ee61083e"),
+            (
+                17,
+                BASE_17,
+                Role::Initiator,
+                0x0,
+                "040400ffffffffff0000000000000000daec54d205dfeb4713361254",
+            ),
+            (
+                17,
+                BASE_17,
+                Role::Acceptor,
+                0x102030405060708,
+                "040401ffffffffff0102030405060708a6851aa0c42611ab402c53c4",
+            ),
+            (
+                18,
+                BASE_18,
+                Role::Initiator,
+                0x0,
+                "040400ffffffffff0000000000000000d3dc7bbc47571ee7e303a9a4",
+            ),
+            (
+                18,
+                BASE_18,
+                Role::Acceptor,
+                0x102030405060708,
+                "040401ffffffffff0102030405060708142ccd49757fa8aa54438b58",
+            ),
+            (
+                19,
+                BASE_19,
+                Role::Initiator,
+                0x0,
+                "040400ffffffffff000000000000000094c38586dfe6d40e5059a56329d97785",
+            ),
+            (
+                19,
+                BASE_19,
+                Role::Acceptor,
+                0x102030405060708,
+                "040401ffffffffff01020304050607082dc2fd69c700476bb953c76e9feed764",
+            ),
+            (
+                20,
+                BASE_20,
+                Role::Initiator,
+                0x0,
+                "040400ffffffffff0000000000000000090ed891f36ae4d9029043c0a34d4e0a1673f43de2164ed7",
+            ),
+            (
+                20,
+                BASE_20,
+                Role::Acceptor,
+                0x102030405060708,
+                "040401ffffffffff01020304050607085f54e155bc000419b30b1c6d32eea775242d7158ee61083e",
+            ),
         ];
         for (etype, base, role, seq, want) in cases {
             let me = ctx_nosub(*etype, base, *role);
@@ -1866,40 +2004,78 @@ mod tests {
     #[test]
     fn derived_sealed_wrap_without_an_acceptor_subkey() {
         let cases: &[(i32, &str, Role, &str)] = &[
-            (17, BASE_17, Role::Initiator,
-             "050402ff000000000000000000000007ffbf18b827f96b5c325be75e8d595e4f41dcba7ec80ace\
-              ed80be324c5e924fedc529347823737ca6d42951437408bf00860dce6e"),
-            (17, BASE_17, Role::Acceptor,
-             "050403ff0000000000000000000000074caaa925fccd83c289056bf912f70de8e8c0515e3ba197\
-              a87a013b1586fda4aae94b5ac6f44c2e0771f1f682309f3f1ffc01650d"),
-            (18, BASE_18, Role::Initiator,
-             "050402ff0000000000000000000000077e299b9a83dc44dfaa519480cdf11cbcfbb6fe270041e5\
-              474dd18adc2d57a0726d56e48c96d726cc7fd07b8b12fc9592a32dfdbc"),
-            (18, BASE_18, Role::Acceptor,
-             "050403ff000000000000000000000007af8e603aa82b1b47f135223602e8b05edf10e3a1459381\
-              e7395d7422d2091272a03382245b30d45f7e113eb326098f450191bc2a"),
-            (19, BASE_19, Role::Initiator,
-             "050402ff0000000000000000000000074ceb0df199bd3b95bf86a2581e55e1ed68cb051d172a3e\
-              d6d3ee9a0b8a27c11adcdfa411787cb6728c4f1c5af77965e413223ccf353aa4ef"),
-            (19, BASE_19, Role::Acceptor,
-             "050403ff000000000000000000000007f024d936e836196982be25c96741b99986d9e9b456223b\
-              7c8603be2925d01e1dde62fc57c0fe5ab796c337b06f116c75b54dcab5bd3dfb1a"),
-            (20, BASE_20, Role::Initiator,
-             "050402ff00000000000000000000000784b137d2eb9bb504415a9327d9e958217bb9eeba253f35\
+            (
+                17,
+                BASE_17,
+                Role::Initiator,
+                "050402ff000000000000000000000007ffbf18b827f96b5c325be75e8d595e4f41dcba7ec80ace\
+              ed80be324c5e924fedc529347823737ca6d42951437408bf00860dce6e",
+            ),
+            (
+                17,
+                BASE_17,
+                Role::Acceptor,
+                "050403ff0000000000000000000000074caaa925fccd83c289056bf912f70de8e8c0515e3ba197\
+              a87a013b1586fda4aae94b5ac6f44c2e0771f1f682309f3f1ffc01650d",
+            ),
+            (
+                18,
+                BASE_18,
+                Role::Initiator,
+                "050402ff0000000000000000000000077e299b9a83dc44dfaa519480cdf11cbcfbb6fe270041e5\
+              474dd18adc2d57a0726d56e48c96d726cc7fd07b8b12fc9592a32dfdbc",
+            ),
+            (
+                18,
+                BASE_18,
+                Role::Acceptor,
+                "050403ff000000000000000000000007af8e603aa82b1b47f135223602e8b05edf10e3a1459381\
+              e7395d7422d2091272a03382245b30d45f7e113eb326098f450191bc2a",
+            ),
+            (
+                19,
+                BASE_19,
+                Role::Initiator,
+                "050402ff0000000000000000000000074ceb0df199bd3b95bf86a2581e55e1ed68cb051d172a3e\
+              d6d3ee9a0b8a27c11adcdfa411787cb6728c4f1c5af77965e413223ccf353aa4ef",
+            ),
+            (
+                19,
+                BASE_19,
+                Role::Acceptor,
+                "050403ff000000000000000000000007f024d936e836196982be25c96741b99986d9e9b456223b\
+              7c8603be2925d01e1dde62fc57c0fe5ab796c337b06f116c75b54dcab5bd3dfb1a",
+            ),
+            (
+                20,
+                BASE_20,
+                Role::Initiator,
+                "050402ff00000000000000000000000784b137d2eb9bb504415a9327d9e958217bb9eeba253f35\
               d14280a73cba41ba34f194784df10cfdd1c8c81b26ad286c3eb0bb09149344f6f9359fc31b23f1\
-              fc76"),
-            (20, BASE_20, Role::Acceptor,
-             "050403ff000000000000000000000007eab86ebfc360463fcb19dda4f08aac541a024c3bd3046f\
+              fc76",
+            ),
+            (
+                20,
+                BASE_20,
+                Role::Acceptor,
+                "050403ff000000000000000000000007eab86ebfc360463fcb19dda4f08aac541a024c3bd3046f\
               867bde394ff0555c50d7550ba2c93e5256d7bc261fc163d8a5f2876433b2a121b33de92fe15388\
-              77a2"),
+              77a2",
+            ),
         ];
         for (etype, base, role, want) in cases {
             let me = ctx_nosub(*etype, base, *role);
-            let token = me.emit_wrap_full(7, PAYLOAD, 0, 0, Some(&hex(CONF))).unwrap();
+            let token = me
+                .emit_wrap_full(7, PAYLOAD, 0, 0, Some(&hex(CONF)))
+                .unwrap();
             assert_eq!(
                 hexs(&token),
-                want.chars().filter(|c| !c.is_whitespace()).collect::<String>(),
-                "enctype {} role {:?}", etype, role
+                want.chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect::<String>(),
+                "enctype {} role {:?}",
+                etype,
+                role
             );
             let peer = ctx_nosub(*etype, base, role.peer());
             let v = peer.unwrap(&token).unwrap();
@@ -1913,7 +2089,12 @@ mod tests {
     #[test]
     fn the_acceptor_subkey_flag_changes_every_token() {
         for etype in [17, 18, 19, 20] {
-            let base = match etype { 17 => BASE_17, 18 => BASE_18, 19 => BASE_19, _ => BASE_20 };
+            let base = match etype {
+                17 => BASE_17,
+                18 => BASE_18,
+                19 => BASE_19,
+                _ => BASE_20,
+            };
             for role in [Role::Initiator, Role::Acceptor] {
                 let with = ctx(etype, base, role).emit_mic(0, PAYLOAD).unwrap();
                 let without = ctx_nosub(etype, base, role).emit_mic(0, PAYLOAD).unwrap();
@@ -1973,22 +2154,54 @@ mod tests {
     #[test]
     fn derived_unsealed_wrap_tokens_match_an_independent_implementation() {
         let cases: &[(i32, &str, Role, &str)] = &[
-            (17, BASE_17, Role::Initiator,
-             "050404ff000c000000000000000000090001020304050607a0d8ce1cac59e693a9c31230"),
-            (17, BASE_17, Role::Acceptor,
-             "050405ff000c000000000000000000090001020304050607af6df208c51d424d9acabfab"),
-            (18, BASE_18, Role::Initiator,
-             "050404ff000c00000000000000000009000102030405060712af097d1370b835c36fc046"),
-            (18, BASE_18, Role::Acceptor,
-             "050405ff000c000000000000000000090001020304050607403313145b239381c75a5fe5"),
-            (19, BASE_19, Role::Initiator,
-             "050404ff0010000000000000000000090001020304050607ce9c8b54b0cb9c79b4329797998a5bd7"),
-            (19, BASE_19, Role::Acceptor,
-             "050405ff0010000000000000000000090001020304050607dcf0a1550d3a0636fee742b06d358f71"),
-            (20, BASE_20, Role::Initiator,
-             "050404ff001800000000000000000009000102030405060798df9d2a07a12525b2122f4ec702d0fbfe9a2ad36f045659"),
-            (20, BASE_20, Role::Acceptor,
-             "050405ff0018000000000000000000090001020304050607584893509f118a3f2bafab2f7b193979b1e4d1ce7af6032f"),
+            (
+                17,
+                BASE_17,
+                Role::Initiator,
+                "050404ff000c000000000000000000090001020304050607a0d8ce1cac59e693a9c31230",
+            ),
+            (
+                17,
+                BASE_17,
+                Role::Acceptor,
+                "050405ff000c000000000000000000090001020304050607af6df208c51d424d9acabfab",
+            ),
+            (
+                18,
+                BASE_18,
+                Role::Initiator,
+                "050404ff000c00000000000000000009000102030405060712af097d1370b835c36fc046",
+            ),
+            (
+                18,
+                BASE_18,
+                Role::Acceptor,
+                "050405ff000c000000000000000000090001020304050607403313145b239381c75a5fe5",
+            ),
+            (
+                19,
+                BASE_19,
+                Role::Initiator,
+                "050404ff0010000000000000000000090001020304050607ce9c8b54b0cb9c79b4329797998a5bd7",
+            ),
+            (
+                19,
+                BASE_19,
+                Role::Acceptor,
+                "050405ff0010000000000000000000090001020304050607dcf0a1550d3a0636fee742b06d358f71",
+            ),
+            (
+                20,
+                BASE_20,
+                Role::Initiator,
+                "050404ff001800000000000000000009000102030405060798df9d2a07a12525b2122f4ec702d0fbfe9a2ad36f045659",
+            ),
+            (
+                20,
+                BASE_20,
+                Role::Acceptor,
+                "050405ff0018000000000000000000090001020304050607584893509f118a3f2bafab2f7b193979b1e4d1ce7af6032f",
+            ),
         ];
         for (etype, base, role, want) in cases {
             let me = ctx(*etype, base, *role);
@@ -2021,7 +2234,12 @@ mod tests {
             for usage in 22u32..=25 {
                 let ks = k.keys(usage).unwrap();
                 for key in [&ks.kc, &ks.ke, &ks.ki] {
-                    assert!(!seen.contains(key), "enctype {} usage {} key reused", etype, usage);
+                    assert!(
+                        !seen.contains(key),
+                        "enctype {} usage {} key reused",
+                        etype,
+                        usage
+                    );
                     seen.push(key.clone());
                 }
                 // RFC 8009 §5's length asymmetry: for enctype 20 Ke is 32
@@ -2086,7 +2304,10 @@ mod tests {
 
             // A fresh confounder per message: the same plaintext twice must
             // not give the same ciphertext.
-            assert_ne!(srv.emit_wrap(3, payload).unwrap(), srv.emit_wrap(3, payload).unwrap());
+            assert_ne!(
+                srv.emit_wrap(3, payload).unwrap(),
+                srv.emit_wrap(3, payload).unwrap()
+            );
         }
     }
 
@@ -2094,7 +2315,12 @@ mod tests {
     /// MIC = 16 + h. Sealed Wrap = 16 + 16 + len + 16 + h with EC = 0.
     #[test]
     fn derived_token_lengths() {
-        for (etype, base, h) in [(17, BASE_17, 12usize), (18, BASE_18, 12), (19, BASE_19, 16), (20, BASE_20, 24)] {
+        for (etype, base, h) in [
+            (17, BASE_17, 12usize),
+            (18, BASE_18, 12),
+            (19, BASE_19, 16),
+            (20, BASE_20, 24),
+        ] {
             let srv = ctx(etype, base, Role::Acceptor);
             for n in [0usize, 1, 15, 16, 17, 1000] {
                 let p = vec![0xa5u8; n];
@@ -2142,4 +2368,3 @@ mod tests {
         }
     }
 }
-

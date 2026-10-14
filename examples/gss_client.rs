@@ -20,7 +20,10 @@ fn hex(b: &[u8]) -> String {
 
 fn unhex(s: &str) -> Vec<u8> {
     let s = s.trim();
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex")).collect()
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
+        .collect()
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -39,11 +42,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let creds = kdc.service_ticket(&tgt, &service)?;
     eprintln!(
         "service ticket for {}: ticket enctype {}, session enctype {}",
-        creds.server, creds.ticket_enctype, creds.session_key.enctype()
+        creds.server,
+        creds.ticket_enctype,
+        creds.session_key.enctype()
     );
 
-    let (mut ctx, token) =
-        InitiatorContext::new(&creds, GSS_C_MUTUAL_FLAG | GSS_C_INTEG_FLAG | GSS_C_CONF_FLAG)?;
+    let (mut ctx, token) = InitiatorContext::new(
+        &creds,
+        GSS_C_MUTUAL_FLAG | GSS_C_INTEG_FLAG | GSS_C_CONF_FLAG,
+    )?;
     println!("{}", hex(&token));
 
     let mut lines = std::io::stdin().lock().lines();
@@ -51,7 +58,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(unhex(&lines.next().ok_or("acceptor hung up")??))
     };
     ctx.step(&next()?)?;
-    eprintln!("established; acceptor subkey: {}", ctx.has_acceptor_subkey());
+    eprintln!(
+        "established; acceptor subkey: {}",
+        ctx.has_acceptor_subkey()
+    );
 
     let tokens = ctx.per_message_tokens()?;
     println!("{}", hex(&tokens.emit_wrap(ctx.send_seq(), b"ping")?));

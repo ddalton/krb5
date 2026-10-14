@@ -36,8 +36,8 @@
 #![allow(dead_code)]
 
 use aes::{
-    cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit},
     Aes128, Aes256,
+    cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray},
 };
 use hmac::{Hmac, Mac};
 use pbkdf2::pbkdf2_hmac;
@@ -78,7 +78,9 @@ pub enum KdfError {
     #[error("DR/DK requires a 16- or 32-octet AES key, got {0} octets")]
     AesKeyLength(usize),
 
-    #[error("DR constant is {0} octets; RFC 3961 §5.1 forbids more than the 16-octet cipher block size")]
+    #[error(
+        "DR constant is {0} octets; RFC 3961 §5.1 forbids more than the 16-octet cipher block size"
+    )]
     ConstantTooLong(usize),
 
     /// n-fold of an empty octet string is undefined (there is nothing to
@@ -99,7 +101,9 @@ pub enum KdfError {
     #[error("requested {want} bits but RFC 8009 §3 caps k at {max} for this enctype")]
     KLengthTooLong { want: u32, max: u32 },
 
-    #[error("enctype {0} uses RFC 3961 DR/DK, not the RFC 8009 KDF — these are different functions, not variants")]
+    #[error(
+        "enctype {0} uses RFC 3961 DR/DK, not the RFC 8009 KDF — these are different functions, not variants"
+    )]
     NotAnRfc8009Enctype(i32),
 
     #[error("enctype {0} uses the RFC 8009 KDF, not RFC 3961 DR/DK")]
@@ -410,8 +414,8 @@ pub fn kdf_hmac_sha2(
                     max: 256,
                 });
             }
-            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key)
-                .expect("HMAC accepts any key length");
+            let mut mac =
+                <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
             mac.update(&msg);
             Ok(mac.finalize().into_bytes()[..out].to_vec())
         }
@@ -422,8 +426,8 @@ pub fn kdf_hmac_sha2(
                     max: 384,
                 });
             }
-            let mut mac = <Hmac<Sha384> as Mac>::new_from_slice(key)
-                .expect("HMAC accepts any key length");
+            let mut mac =
+                <Hmac<Sha384> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
             mac.update(&msg);
             Ok(mac.finalize().into_bytes()[..out].to_vec())
         }
@@ -453,12 +457,7 @@ pub fn kdf_hmac_sha2(
 /// Key usage numbers live in RFC 4120 §7.5.1 and RFC 4121 §2 — note that a
 /// checksum and the message it accompanies deliberately carry *different*
 /// usages (AP-REQ authenticator cksum is 10, the authenticator itself 11).
-pub fn derive_key(
-    enctype: Enctype,
-    base_key: &[u8],
-    usage: u32,
-    which: KeyUse,
-) -> Result<Vec<u8>> {
+pub fn derive_key(enctype: Enctype, base_key: &[u8], usage: u32, which: KeyUse) -> Result<Vec<u8>> {
     if base_key.len() != enctype.key_size() {
         return Err(KdfError::BaseKeyLength {
             etype: enctype.etype(),
@@ -718,7 +717,12 @@ mod tests {
     fn rfc3962_b_dk_aes128_kerberos() {
         for (i, (tkey, key, _, _)) in RFC3962_B_DK.iter().enumerate() {
             let got = dk(&h(tkey), KERBEROS, 16).unwrap();
-            assert_eq!(hexs(&got), hexs(&h(key)), "RFC 3962 B case {} (aes128)", i + 1);
+            assert_eq!(
+                hexs(&got),
+                hexs(&h(key)),
+                "RFC 3962 B case {} (aes128)",
+                i + 1
+            );
         }
     }
 
@@ -731,7 +735,12 @@ mod tests {
     fn rfc3962_b_dk_aes256_kerberos() {
         for (i, (_, _, tkey, key)) in RFC3962_B_DK.iter().enumerate() {
             let got = dk(&h(tkey), KERBEROS, 32).unwrap();
-            assert_eq!(hexs(&got), hexs(&h(key)), "RFC 3962 B case {} (aes256)", i + 1);
+            assert_eq!(
+                hexs(&got),
+                hexs(&h(key)),
+                "RFC 3962 B case {} (aes256)",
+                i + 1
+            );
         }
     }
 
@@ -762,8 +771,16 @@ mod tests {
         aes_encrypt_block(&tkey, &mut k2).unwrap();
         let chained: Vec<u8> = k1.iter().chain(k2.iter()).copied().collect();
 
-        assert_eq!(&chained[..16], &published[..16], "the readings must agree in block 1 — that is what makes this a trap");
-        assert_ne!(hexs(&chained), hexs(&published), "chained-IV must NOT reproduce the vector, or this test proves nothing");
+        assert_eq!(
+            &chained[..16],
+            &published[..16],
+            "the readings must agree in block 1 — that is what makes this a trap"
+        );
+        assert_ne!(
+            hexs(&chained),
+            hexs(&published),
+            "chained-IV must NOT reproduce the vector, or this test proves nothing"
+        );
     }
 
     /// Falsifiability: prove the DK vectors discriminate against the
@@ -778,7 +795,11 @@ mod tests {
         let mut padded = KERBEROS.to_vec();
         padded.resize(16, 0);
         let wrong = dk(&tkey, &padded, 16).unwrap();
-        assert_ne!(hexs(&wrong), hexs(&published), "zero-padding must NOT reproduce the vector");
+        assert_ne!(
+            hexs(&wrong),
+            hexs(&published),
+            "zero-padding must NOT reproduce the vector"
+        );
     }
 
     /// RFC 3961 §A.1's 128-fold of "kerberos" is the exact n-fold DR runs
@@ -800,11 +821,23 @@ mod tests {
         vec![
             (b"password".to_vec(), b"ATHENA.MIT.EDUraeburn".to_vec(), 1),
             (b"password".to_vec(), b"ATHENA.MIT.EDUraeburn".to_vec(), 2),
-            (b"password".to_vec(), b"ATHENA.MIT.EDUraeburn".to_vec(), 1200),
+            (
+                b"password".to_vec(),
+                b"ATHENA.MIT.EDUraeburn".to_vec(),
+                1200,
+            ),
             // Salt=0x1234567878563412 — the RAW octets, not the ASCII digits.
             (b"password".to_vec(), h("12 34 56 78 78 56 34 12"), 5),
-            (vec![b'X'; 64], b"pass phrase equals block size".to_vec(), 1200),
-            (vec![b'X'; 65], b"pass phrase exceeds block size".to_vec(), 1200),
+            (
+                vec![b'X'; 64],
+                b"pass phrase equals block size".to_vec(),
+                1200,
+            ),
+            (
+                vec![b'X'; 65],
+                b"pass phrase exceeds block size".to_vec(),
+                1200,
+            ),
             // g-clef U+1D11E as UTF-8: f0 9d 84 9e.
             (h("f0 9d 84 9e"), b"EXAMPLE.COMpianist".to_vec(), 50),
         ]
@@ -814,31 +847,43 @@ mod tests {
     /// passes and `rfc3962_b_string_to_key` fails, the bug is in DK.
     #[test]
     fn rfc3962_b_pbkdf2_hmac_sha1_intermediate_tkey() {
-        for (i, ((pass, salt, iter), (t128, _, t256, _))) in
-            rfc3962_b_inputs().iter().zip(RFC3962_B_DK.iter()).enumerate()
+        for (i, ((pass, salt, iter), (t128, _, t256, _))) in rfc3962_b_inputs()
+            .iter()
+            .zip(RFC3962_B_DK.iter())
+            .enumerate()
         {
             let mut got128 = [0u8; 16];
             pbkdf2_hmac::<Sha1>(pass, salt, *iter, &mut got128);
-            assert_eq!(hexs(&got128), hexs(&h(t128)), "case {} 128-bit PBKDF2", i + 1);
+            assert_eq!(
+                hexs(&got128),
+                hexs(&h(t128)),
+                "case {} 128-bit PBKDF2",
+                i + 1
+            );
 
             let mut got256 = [0u8; 32];
             pbkdf2_hmac::<Sha1>(pass, salt, *iter, &mut got256);
-            assert_eq!(hexs(&got256), hexs(&h(t256)), "case {} 256-bit PBKDF2", i + 1);
+            assert_eq!(
+                hexs(&got256),
+                hexs(&h(t256)),
+                "case {} 256-bit PBKDF2",
+                i + 1
+            );
         }
     }
 
     #[test]
     fn rfc3962_b_string_to_key_aes128_and_aes256() {
-        for (i, ((pass, salt, iter), (_, k128, _, k256))) in
-            rfc3962_b_inputs().iter().zip(RFC3962_B_DK.iter()).enumerate()
+        for (i, ((pass, salt, iter), (_, k128, _, k256))) in rfc3962_b_inputs()
+            .iter()
+            .zip(RFC3962_B_DK.iter())
+            .enumerate()
         {
             let params = Some(iter.to_be_bytes());
-            let got128 =
-                string_to_key(Enctype::Aes128CtsHmacSha196, pass, salt, params).unwrap();
+            let got128 = string_to_key(Enctype::Aes128CtsHmacSha196, pass, salt, params).unwrap();
             assert_eq!(hexs(&got128), hexs(&h(k128)), "case {} aes128 key", i + 1);
 
-            let got256 =
-                string_to_key(Enctype::Aes256CtsHmacSha196, pass, salt, params).unwrap();
+            let got256 = string_to_key(Enctype::Aes256CtsHmacSha196, pass, salt, params).unwrap();
             assert_eq!(hexs(&got256), hexs(&h(k256)), "case {} aes256 key", i + 1);
         }
     }
@@ -1050,23 +1095,17 @@ mod tests {
         let params = Some(32768u32.to_be_bytes());
 
         assert_eq!(
-            hexs(&string_to_key(
-                Enctype::Aes128CtsHmacSha256128,
-                b"password",
-                &salt,
-                params
-            )
-            .unwrap()),
+            hexs(
+                &string_to_key(Enctype::Aes128CtsHmacSha256128, b"password", &salt, params)
+                    .unwrap()
+            ),
             hexs(&h("08 9B CA 48 B1 05 EA 6E A7 7C A5 D2 F3 9D C5 E7"))
         );
         assert_eq!(
-            hexs(&string_to_key(
-                Enctype::Aes256CtsHmacSha384192,
-                b"password",
-                &salt,
-                params
-            )
-            .unwrap()),
+            hexs(
+                &string_to_key(Enctype::Aes256CtsHmacSha384192, b"password", &salt, params)
+                    .unwrap()
+            ),
             hexs(&h("45 BD 80 6D BF 6A 83 3A 9C FF C1 C9 45 89 A2 22
                      36 7A 79 BC 21 C4 13 71 89 06 E9 F5 78 A7 84 67"))
         );
@@ -1163,7 +1202,10 @@ mod tests {
         assert_eq!(
             kdf_hmac_sha2(Enctype::Aes128CtsHmacSha256128, &[0u8; 16], b"x", None, 384)
                 .unwrap_err(),
-            KdfError::KLengthTooLong { want: 384, max: 256 }
+            KdfError::KLengthTooLong {
+                want: 384,
+                max: 256
+            }
         );
         assert!(
             kdf_hmac_sha2(Enctype::Aes256CtsHmacSha384192, &[0u8; 32], b"x", None, 384).is_ok()
@@ -1171,7 +1213,10 @@ mod tests {
         assert_eq!(
             kdf_hmac_sha2(Enctype::Aes256CtsHmacSha384192, &[0u8; 32], b"x", None, 448)
                 .unwrap_err(),
-            KdfError::KLengthTooLong { want: 448, max: 384 }
+            KdfError::KLengthTooLong {
+                want: 448,
+                max: 384
+            }
         );
     }
 
@@ -1191,8 +1236,14 @@ mod tests {
     /// instead of receiving a `KdfError`.
     #[test]
     fn rfc3961_51_dr_refuses_an_empty_constant_instead_of_panicking() {
-        assert_eq!(dr(&[0u8; 16], &[], 16).unwrap_err(), KdfError::ConstantEmpty);
-        assert_eq!(dk(&[0u8; 32], &[], 32).unwrap_err(), KdfError::ConstantEmpty);
+        assert_eq!(
+            dr(&[0u8; 16], &[], 16).unwrap_err(),
+            KdfError::ConstantEmpty
+        );
+        assert_eq!(
+            dk(&[0u8; 32], &[], 32).unwrap_err(),
+            KdfError::ConstantEmpty
+        );
     }
 
     /// k = 0 is a whole number of octets, so the `% 8` check waves it
@@ -1212,8 +1263,13 @@ mod tests {
 
     #[test]
     fn derive_key_refuses_a_base_key_of_the_wrong_length() {
-        let err = derive_key(Enctype::Aes256CtsHmacSha384192, &[0u8; 16], 2, KeyUse::Encryption)
-            .unwrap_err();
+        let err = derive_key(
+            Enctype::Aes256CtsHmacSha384192,
+            &[0u8; 16],
+            2,
+            KeyUse::Encryption,
+        )
+        .unwrap_err();
         assert_eq!(
             err,
             KdfError::BaseKeyLength {
@@ -1237,8 +1293,14 @@ mod tests {
             Enctype::Aes256CtsHmacSha384192
         );
         // DES and DES3 are deliberately out of scope.
-        assert_eq!(Enctype::from_i32(16).unwrap_err(), KdfError::UnsupportedEnctype(16));
-        assert_eq!(Enctype::from_i32(23).unwrap_err(), KdfError::UnsupportedEnctype(23));
+        assert_eq!(
+            Enctype::from_i32(16).unwrap_err(),
+            KdfError::UnsupportedEnctype(16)
+        );
+        assert_eq!(
+            Enctype::from_i32(23).unwrap_err(),
+            KdfError::UnsupportedEnctype(23)
+        );
         assert_eq!(Enctype::Aes256CtsHmacSha384192.etype(), 20);
     }
 

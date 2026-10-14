@@ -14,30 +14,30 @@
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
-use tracing::{debug, info};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::{debug, info};
 
 /// Kerberos error types
 #[derive(Debug, thiserror::Error)]
 pub enum KerberosError {
     #[error("Failed to load keytab: {0}")]
     KeytabLoad(String),
-    
+
     #[error("Service principal not found in keytab: {0}")]
     PrincipalNotFound(String),
-    
+
     #[error("Failed to decrypt ticket: {0}")]
     DecryptionFailed(String),
-    
+
     #[error("Failed to parse Kerberos token: {0}")]
     ParseError(String),
-    
+
     #[error("Invalid authenticator: {0}")]
     InvalidAuthenticator(String),
 
     #[error("Ticket is not valid now: {0}")]
     TicketNotValid(String),
-    
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -64,7 +64,7 @@ impl EncType {
             _ => None,
         }
     }
-    
+
     /// REMOVED. Key sizes now come from [`crate::kdf`], which is the
     /// only thing that derives keys. One `key_size()` could never express
     /// enctype 20 anyway — RFC 8009 gives it Ke = 32 but Kc = Ki = 24, and
@@ -81,7 +81,7 @@ impl EncType {
 pub struct ServiceKey {
     pub principal: String,
     pub realm: String,
-    pub kvno: u32,  // Key version number
+    pub kvno: u32, // Key version number
     pub enctype: EncType,
     pub key: Vec<u8>,
 }
@@ -97,32 +97,36 @@ impl Keytab {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
         info!("Loading keytab from: {}", path.display());
-        
-        let mut file = File::open(path)
-            .map_err(|e| KerberosError::KeytabLoad(format!("Cannot open {}: {}", path.display(), e)))?;
-        
+
+        let mut file = File::open(path).map_err(|e| {
+            KerberosError::KeytabLoad(format!("Cannot open {}: {}", path.display(), e))
+        })?;
+
         let mut data = Vec::new();
         file.read_to_end(&mut data)?;
-        
+
         Self::parse(&data)
     }
-    
+
     /// Parse keytab binary format
     /// Keytab format: https://web.mit.edu/kerberos/krb5-latest/doc/formats/keytab_file_format.html
     fn parse(data: &[u8]) -> Result<Self> {
         if data.len() < 2 {
             return Err(KerberosError::ParseError("Keytab too short".to_string()));
         }
-        
+
         // Check format version (0x05 0x02 = v5.2)
         let version = u16::from_be_bytes([data[0], data[1]]);
         if version != 0x0502 {
-            return Err(KerberosError::ParseError(format!("Unsupported keytab version: 0x{:04x}", version)));
+            return Err(KerberosError::ParseError(format!(
+                "Unsupported keytab version: 0x{:04x}",
+                version
+            )));
         }
-        
+
         let mut keys = Vec::new();
         let mut offset = 2;
-        
+
         // Parse entries
         while offset + 4 <= data.len() {
             // Entry size (signed 32-bit, negative means hole)
@@ -133,117 +137,142 @@ impl Keytab {
                 data[offset + 3],
             ]);
             offset += 4;
-            
+
             if size < 0 {
                 // Hole in keytab (deleted entry), skip
                 let hole_size = (-size) as usize;
                 offset += hole_size;
                 continue;
             }
-            
+
             let entry_size = size as usize;
             if offset + entry_size > data.len() {
                 break;
             }
-            
+
             // Parse entry
             if let Ok(key) = Self::parse_entry(&data[offset..offset + entry_size]) {
-                debug!("Loaded key: principal={}@{}, kvno={}, enctype={:?}",
-                       key.principal, key.realm, key.kvno, key.enctype);
+                debug!(
+                    "Loaded key: principal={}@{}, kvno={}, enctype={:?}",
+                    key.principal, key.realm, key.kvno, key.enctype
+                );
                 keys.push(key);
             }
-            
+
             offset += entry_size;
         }
-        
+
         info!("Loaded {} keys from keytab", keys.len());
         Ok(Self { keys })
     }
-    
+
     /// Parse a single keytab entry
     fn parse_entry(data: &[u8]) -> Result<ServiceKey> {
         let mut offset = 0;
-        
+
         // Read principal components count
         if offset + 2 > data.len() {
-            return Err(KerberosError::ParseError("Entry too short for component count".to_string()));
+            return Err(KerberosError::ParseError(
+                "Entry too short for component count".to_string(),
+            ));
         }
         let num_components = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
         offset += 2;
-        
+
         // Read realm
         if offset + 2 > data.len() {
-            return Err(KerberosError::ParseError("Entry too short for realm".to_string()));
+            return Err(KerberosError::ParseError(
+                "Entry too short for realm".to_string(),
+            ));
         }
         let realm_len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
         offset += 2;
-        
+
         if offset + realm_len > data.len() {
-            return Err(KerberosError::ParseError("Entry too short for realm data".to_string()));
+            return Err(KerberosError::ParseError(
+                "Entry too short for realm data".to_string(),
+            ));
         }
         let realm = String::from_utf8_lossy(&data[offset..offset + realm_len]).to_string();
         offset += realm_len;
-        
+
         // Read principal components
         let mut components = Vec::new();
         for _ in 0..num_components {
             if offset + 2 > data.len() {
-                return Err(KerberosError::ParseError("Entry too short for component".to_string()));
+                return Err(KerberosError::ParseError(
+                    "Entry too short for component".to_string(),
+                ));
             }
             let comp_len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
             offset += 2;
-            
+
             if offset + comp_len > data.len() {
-                return Err(KerberosError::ParseError("Entry too short for component data".to_string()));
+                return Err(KerberosError::ParseError(
+                    "Entry too short for component data".to_string(),
+                ));
             }
             let comp = String::from_utf8_lossy(&data[offset..offset + comp_len]).to_string();
             components.push(comp);
             offset += comp_len;
         }
-        
+
         let principal = components.join("/");
-        
+
         // Read name type (skip)
         if offset + 4 > data.len() {
-            return Err(KerberosError::ParseError("Entry too short for name type".to_string()));
+            return Err(KerberosError::ParseError(
+                "Entry too short for name type".to_string(),
+            ));
         }
         offset += 4;
-        
+
         // Read timestamp (skip)
         if offset + 4 > data.len() {
-            return Err(KerberosError::ParseError("Entry too short for timestamp".to_string()));
+            return Err(KerberosError::ParseError(
+                "Entry too short for timestamp".to_string(),
+            ));
         }
         offset += 4;
-        
+
         // Read KVNO
         if offset + 1 > data.len() {
-            return Err(KerberosError::ParseError("Entry too short for kvno".to_string()));
+            return Err(KerberosError::ParseError(
+                "Entry too short for kvno".to_string(),
+            ));
         }
         let kvno = data[offset] as u32;
         offset += 1;
-        
+
         // Read encryption type
         if offset + 2 > data.len() {
-            return Err(KerberosError::ParseError("Entry too short for enctype".to_string()));
+            return Err(KerberosError::ParseError(
+                "Entry too short for enctype".to_string(),
+            ));
         }
         let enctype_val = u16::from_be_bytes([data[offset], data[offset + 1]]) as i32;
         offset += 2;
-        
-        let enctype = EncType::from_i32(enctype_val)
-            .ok_or_else(|| KerberosError::ParseError(format!("Unsupported enctype: {}", enctype_val)))?;
-        
+
+        let enctype = EncType::from_i32(enctype_val).ok_or_else(|| {
+            KerberosError::ParseError(format!("Unsupported enctype: {}", enctype_val))
+        })?;
+
         // Read key length and data
         if offset + 2 > data.len() {
-            return Err(KerberosError::ParseError("Entry too short for key length".to_string()));
+            return Err(KerberosError::ParseError(
+                "Entry too short for key length".to_string(),
+            ));
         }
         let key_len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
         offset += 2;
-        
+
         if offset + key_len > data.len() {
-            return Err(KerberosError::ParseError("Entry too short for key data".to_string()));
+            return Err(KerberosError::ParseError(
+                "Entry too short for key data".to_string(),
+            ));
         }
         let key = data[offset..offset + key_len].to_vec();
-        
+
         Ok(ServiceKey {
             principal,
             realm,
@@ -252,7 +281,7 @@ impl Keytab {
             key,
         })
     }
-    
+
     /// Find a service key for the given principal
     pub fn find_key(&self, principal: &str) -> Option<&ServiceKey> {
         // Try exact match first
@@ -260,7 +289,7 @@ impl Keytab {
         if let Some(key) = self.keys.iter().find(|k| k.principal == principal) {
             return Some(key);
         }
-        
+
         // Try matching principal without realm
         // guard-lint: allow — plain Vec iterator, no lock guard
         if let Some(key) = self.keys.iter().find(|k| {
@@ -269,10 +298,10 @@ impl Keytab {
         }) {
             return Some(key);
         }
-        
+
         None
     }
-    
+
     /// Select the key a specific ticket was encrypted with.
     ///
     /// ⚠ A REAL KEYTAB HOLDS ONE KEY PER ENCTYPE FOR THE SAME PRINCIPAL —
@@ -298,8 +327,7 @@ impl Keytab {
             .keys
             .iter()
             .filter(|k| {
-                (k.principal == principal
-                    || format!("{}@{}", k.principal, k.realm) == principal)
+                (k.principal == principal || format!("{}@{}", k.principal, k.realm) == principal)
                     && k.enctype == enctype
             })
             .collect();
@@ -409,9 +437,11 @@ fn select_base_key(
 /// pinned to published test vectors. Passing the *declared* enctype with
 /// the service key also makes a key/enctype mismatch an error rather
 /// than a silently short key — `kdf::derive_key` length-checks its base.
-fn spec_keys(enctype: EncType, base_key: &[u8], usage: i32)
-    -> Result<(crate::profile::Enctype, Vec<u8>, Vec<u8>)>
-{
+fn spec_keys(
+    enctype: EncType,
+    base_key: &[u8],
+    usage: i32,
+) -> Result<(crate::profile::Enctype, Vec<u8>, Vec<u8>)> {
     let e = enctype as i32;
     let map = |m: String| KerberosError::DecryptionFailed(m);
     let kd = crate::kdf::Enctype::from_i32(e).map_err(|x| map(x.to_string()))?;
@@ -426,14 +456,24 @@ fn spec_keys(enctype: EncType, base_key: &[u8], usage: i32)
 
 /// RFC 3961 §5.3 / RFC 8009 §5 decrypt. Verifies the HMAC in constant
 /// time before returning any plaintext.
-fn spec_decrypt(enctype: EncType, base_key: &[u8], usage: i32, ciphertext: &[u8]) -> Result<Vec<u8>> {
+fn spec_decrypt(
+    enctype: EncType,
+    base_key: &[u8],
+    usage: i32,
+    ciphertext: &[u8],
+) -> Result<Vec<u8>> {
     let (pr, ke, ki) = spec_keys(enctype, base_key, usage)?;
     crate::profile::decrypt(pr, &ke, &ki, ciphertext)
         .map_err(|x| KerberosError::DecryptionFailed(x.to_string()))
 }
 
 /// RFC 3961 §5.3 / RFC 8009 §5 encrypt. Draws its own random confounder.
-fn spec_encrypt(enctype: EncType, base_key: &[u8], usage: i32, plaintext: &[u8]) -> Result<Vec<u8>> {
+fn spec_encrypt(
+    enctype: EncType,
+    base_key: &[u8],
+    usage: i32,
+    plaintext: &[u8],
+) -> Result<Vec<u8>> {
     let (pr, ke, ki) = spec_keys(enctype, base_key, usage)?;
     crate::profile::encrypt(pr, &ke, &ki, plaintext)
         .map_err(|x| KerberosError::DecryptionFailed(x.to_string()))
@@ -497,22 +537,25 @@ impl EncryptedData {
         //   kvno[1] INTEGER OPTIONAL,
         //   cipher[2] OCTET STRING
         // }
-        
+
         let (tag, _len, header_size) = parse_der_tag_length(data)?;
-        if tag != 0x30 {  // SEQUENCE
-            return Err(KerberosError::ParseError(
-                format!("Expected SEQUENCE for EncryptedData, got 0x{:02x}", tag)
-            ));
+        if tag != 0x30 {
+            // SEQUENCE
+            return Err(KerberosError::ParseError(format!(
+                "Expected SEQUENCE for EncryptedData, got 0x{:02x}",
+                tag
+            )));
         }
-        
+
         let content = &data[header_size..];
-        
+
         // Parse etype[0]
         let (etype_data, mut remaining) = extract_tagged_field(content, 0xA0)?;
         let enctype_val = parse_asn1_integer(etype_data)?;
-        let enctype = EncType::from_i32(enctype_val)
-            .ok_or_else(|| KerberosError::ParseError(format!("Unknown enctype: {}", enctype_val)))?;
-        
+        let enctype = EncType::from_i32(enctype_val).ok_or_else(|| {
+            KerberosError::ParseError(format!("Unknown enctype: {}", enctype_val))
+        })?;
+
         // Try to parse kvno[1] (optional)
         let kvno = if !remaining.is_empty() && remaining[0] == 0xA1 {
             let (kvno_data, rest) = extract_tagged_field(remaining, 0xA1)?;
@@ -521,28 +564,28 @@ impl EncryptedData {
         } else {
             None
         };
-        
+
         // Parse cipher[2]
         let (cipher_data, _) = extract_tagged_field(remaining, 0xA2)?;
         let cipher = parse_asn1_octet_string(cipher_data)?;
-        
+
         Ok(EncryptedData {
             enctype,
             kvno,
             cipher,
         })
     }
-    
+
     /// Encode EncryptedData to ASN.1 DER
     fn encode(&self) -> Vec<u8> {
         let mut content = Vec::new();
-        
+
         // etype[0]
         content.push(0xA0);
         let etype_bytes = encode_asn1_integer(self.enctype as i32);
         KerberosContext::encode_length(&mut content, etype_bytes.len());
         content.extend_from_slice(&etype_bytes);
-        
+
         // kvno[1] (optional)
         if let Some(kvno) = self.kvno {
             content.push(0xA1);
@@ -550,18 +593,18 @@ impl EncryptedData {
             KerberosContext::encode_length(&mut content, kvno_bytes.len());
             content.extend_from_slice(&kvno_bytes);
         }
-        
+
         // cipher[2]
         content.push(0xA2);
         let cipher_bytes = encode_asn1_octet_string(&self.cipher);
         KerberosContext::encode_length(&mut content, cipher_bytes.len());
         content.extend_from_slice(&cipher_bytes);
-        
+
         // Wrap in SEQUENCE
         let mut result = vec![0x30];
         KerberosContext::encode_length(&mut result, content.len());
         result.extend_from_slice(&content);
-        
+
         result
     }
 }
@@ -590,55 +633,65 @@ impl Ticket {
         //   sname[2] PrincipalName,
         //   enc-part[3] EncryptedData
         // }
-        
+
         let (tag, _len, header_size) = parse_der_tag_length(data)?;
-        if tag != 0x61 {  // APPLICATION 1
-            return Err(KerberosError::ParseError(
-                format!("Expected APPLICATION 1 for Ticket, got 0x{:02x}", tag)
-            ));
+        if tag != 0x61 {
+            // APPLICATION 1
+            return Err(KerberosError::ParseError(format!(
+                "Expected APPLICATION 1 for Ticket, got 0x{:02x}",
+                tag
+            )));
         }
-        
+
         // Parse inner SEQUENCE
         let seq_data = &data[header_size..];
         let (seq_tag, _seq_len, seq_header) = parse_der_tag_length(seq_data)?;
         if seq_tag != 0x30 {
-            return Err(KerberosError::ParseError("Expected SEQUENCE in Ticket".to_string()));
+            return Err(KerberosError::ParseError(
+                "Expected SEQUENCE in Ticket".to_string(),
+            ));
         }
-        
+
         let content = &seq_data[seq_header..];
-        
+
         // Parse tkt-vno[0] (should be 5)
         let (vno_data, mut remaining) = extract_tagged_field(content, 0xA0)?;
         let vno = parse_asn1_integer(vno_data)?;
         if vno != 5 {
-            return Err(KerberosError::ParseError(format!("Expected tkt-vno=5, got {}", vno)));
+            return Err(KerberosError::ParseError(format!(
+                "Expected tkt-vno=5, got {}",
+                vno
+            )));
         }
-        
+
         // Parse realm[1]
         let (realm_data, rest) = extract_tagged_field(remaining, 0xA1)?;
         let realm = parse_asn1_general_string(realm_data)?;
         remaining = rest;
-        
+
         // Parse sname[2] (PrincipalName)
         let (sname_data, rest) = extract_tagged_field(remaining, 0xA2)?;
         let sname = parse_principal_name(sname_data)?;
         remaining = rest;
-        
+
         // Parse enc-part[3]
         let (enc_data, _) = extract_tagged_field(remaining, 0xA3)?;
         let enc_part = EncryptedData::parse(enc_data)?;
-        
+
         Ok(Ticket {
             realm,
             sname,
             enc_part,
         })
     }
-    
+
     /// Decrypt ticket and extract session key
     fn decrypt(&self, service_key: &ServiceKey) -> Result<EncTicketPart> {
-        debug!("   Decrypting ticket with service key (enctype={:?})", service_key.enctype);
-        
+        debug!(
+            "   Decrypting ticket with service key (enctype={:?})",
+            service_key.enctype
+        );
+
         // Usage 2 — RFC 4120 §7.5.1. This was TGS_REP_ENC_PART (8), the
         // usage for the TGS-REP *encrypted part*, which derives a
         // different key and cannot decrypt any real KDC's ticket.
@@ -730,52 +783,58 @@ impl EncTicketPart {
         //   endtime[7] KerberosTime,
         //   ...
         // }
-        
+
         let (tag, _len, header_size) = parse_der_tag_length(data)?;
-        if tag != 0x63 {  // APPLICATION 3
-            return Err(KerberosError::ParseError(
-                format!("Expected APPLICATION 3 for EncTicketPart, got 0x{:02x}", tag)
-            ));
+        if tag != 0x63 {
+            // APPLICATION 3
+            return Err(KerberosError::ParseError(format!(
+                "Expected APPLICATION 3 for EncTicketPart, got 0x{:02x}",
+                tag
+            )));
         }
-        
+
         let seq_data = &data[header_size..];
         let (seq_tag, _seq_len, seq_header) = parse_der_tag_length(seq_data)?;
         if seq_tag != 0x30 {
             return Err(KerberosError::ParseError("Expected SEQUENCE".to_string()));
         }
-        
+
         let content = &seq_data[seq_header..];
-        
+
         // Parse flags[0]
         let (flags_data, mut remaining) = extract_tagged_field(content, 0xA0)?;
         let flags = parse_asn1_bit_string(flags_data)?;
-        
+
         // Parse key[1] - THE SESSION KEY!
         let (key_data, rest) = extract_tagged_field(remaining, 0xA1)?;
         let key = parse_encryption_key(key_data)?;
         remaining = rest;
-        
-        debug!("   🔑 Extracted session key: {} bytes, enctype={:?}", key.key.len(), key.enctype);
-        
+
+        debug!(
+            "   🔑 Extracted session key: {} bytes, enctype={:?}",
+            key.key.len(),
+            key.enctype
+        );
+
         // Parse crealm[2]
         let (crealm_data, rest) = extract_tagged_field(remaining, 0xA2)?;
         let crealm = parse_asn1_general_string(crealm_data)?;
         remaining = rest;
-        
+
         // Parse cname[3]
         let (cname_data, rest) = extract_tagged_field(remaining, 0xA3)?;
         let cname = parse_principal_name(cname_data)?;
         remaining = rest;
-        
+
         // Skip transited[4]
         let (_, rest) = extract_tagged_field(remaining, 0xA4)?;
         remaining = rest;
-        
+
         // Parse authtime[5]
         let (authtime_data, rest) = extract_tagged_field(remaining, 0xA5)?;
         let authtime = parse_kerberos_time(authtime_data)?;
         remaining = rest;
-        
+
         // Parse optional starttime[6]
         let starttime = if !remaining.is_empty() && remaining[0] == 0xA6 {
             let (time_data, rest) = extract_tagged_field(remaining, 0xA6)?;
@@ -784,11 +843,11 @@ impl EncTicketPart {
         } else {
             None
         };
-        
+
         // Parse endtime[7]
         let (endtime_data, _) = extract_tagged_field(remaining, 0xA7)?;
         let endtime = parse_kerberos_time(endtime_data)?;
-        
+
         Ok(EncTicketPart {
             flags,
             key,
@@ -834,7 +893,7 @@ impl Authenticator {
         // Parse authenticator structure
         Self::parse_from_plaintext(&data)
     }
-    
+
     /// Parse Authenticator structure from plaintext
     fn parse_from_plaintext(data: &[u8]) -> Result<Self> {
         // Authenticator ::= [APPLICATION 2] SEQUENCE {
@@ -847,62 +906,65 @@ impl Authenticator {
         //   subkey[6] EncryptionKey OPTIONAL,
         //   seq-number[7] INTEGER OPTIONAL
         // }
-        
+
         let (tag, _len, header_size) = parse_der_tag_length(data)?;
         // RFC 4120 §5.10 assigns the Authenticator APPLICATION **2**
         // (0x62). This checked for APPLICATION 11 (0x6b) — which is
         // AS-REP's tag, and also the key usage number for the AP-REQ
         // authenticator, which is where the 11 almost certainly came
         // from. The two are unrelated numbers that happen to collide.
-        if tag != 0x62 {  // APPLICATION 2
-            return Err(KerberosError::ParseError(
-                format!("Expected APPLICATION 2 for Authenticator, got 0x{:02x}", tag)
-            ));
+        if tag != 0x62 {
+            // APPLICATION 2
+            return Err(KerberosError::ParseError(format!(
+                "Expected APPLICATION 2 for Authenticator, got 0x{:02x}",
+                tag
+            )));
         }
-        
+
         let seq_data = &data[header_size..];
         let (seq_tag, _seq_len, seq_header) = parse_der_tag_length(seq_data)?;
         if seq_tag != 0x30 {
             return Err(KerberosError::ParseError("Expected SEQUENCE".to_string()));
         }
-        
+
         let content = &seq_data[seq_header..];
-        
+
         // Parse authenticator-vno[0]
         let (vno_data, mut remaining) = extract_tagged_field(content, 0xA0)?;
         let vno = parse_asn1_integer(vno_data)?;
         if vno != 5 {
-            return Err(KerberosError::ParseError(
-                format!("Expected authenticator-vno=5, got {}", vno)
-            ));
+            return Err(KerberosError::ParseError(format!(
+                "Expected authenticator-vno=5, got {}",
+                vno
+            )));
         }
-        
+
         // Parse crealm[1]
         let (crealm_data, rest) = extract_tagged_field(remaining, 0xA1)?;
         let crealm = parse_asn1_general_string(crealm_data)?;
         remaining = rest;
-        
+
         // Parse cname[2]
         let (cname_data, rest) = extract_tagged_field(remaining, 0xA2)?;
         let cname = parse_principal_name(cname_data)?;
         remaining = rest;
-        
+
         // Skip optional cksum[3]
         if !remaining.is_empty() && remaining[0] == 0xA3 {
             let (_, rest) = extract_tagged_field(remaining, 0xA3)?;
             remaining = rest;
         }
-        
+
         // Parse cusec[4]
         let (cusec_data, rest) = extract_tagged_field(remaining, 0xA4)?;
         let cusec = parse_asn1_integer(cusec_data)? as u32;
         remaining = rest;
-        
+
         // Parse ctime[5]
         let (ctime_data, rest) = extract_tagged_field(remaining, 0xA5)?;
         let ctime = parse_kerberos_time(ctime_data)?;
         remaining = rest;
-        
+
         // Parse optional subkey[6]
         let subkey = if !remaining.is_empty() && remaining[0] == 0xA6 {
             let (subkey_data, rest) = extract_tagged_field(remaining, 0xA6)?;
@@ -911,7 +973,7 @@ impl Authenticator {
         } else {
             None
         };
-        
+
         // Parse optional seq-number[7]
         let seq_number = if !remaining.is_empty() && remaining[0] == 0xA7 {
             let (seq_data, _) = extract_tagged_field(remaining, 0xA7)?;
@@ -919,7 +981,7 @@ impl Authenticator {
         } else {
             None
         };
-        
+
         Ok(Authenticator {
             crealm,
             cname,
@@ -929,18 +991,22 @@ impl Authenticator {
             seq_number,
         })
     }
-    
+
     /// Validate authenticator timestamp
     fn validate(&self, now: i64, tolerance_seconds: i64) -> Result<()> {
         let time_diff = (now - self.ctime).abs();
-        
+
         if time_diff > tolerance_seconds {
-            return Err(KerberosError::InvalidAuthenticator(
-                format!("Time skew too large: {} seconds (tolerance: {})", time_diff, tolerance_seconds)
-            ));
+            return Err(KerberosError::InvalidAuthenticator(format!(
+                "Time skew too large: {} seconds (tolerance: {})",
+                time_diff, tolerance_seconds
+            )));
         }
-        
-        debug!("   ✅ Authenticator timestamp validated (skew: {}s)", time_diff);
+
+        debug!(
+            "   ✅ Authenticator timestamp validated (skew: {}s)",
+            time_diff
+        );
         Ok(())
     }
 }
@@ -968,7 +1034,7 @@ impl EncAPRepPart {
             seq_number: Some(0),
         }
     }
-    
+
     /// Encode as ASN.1 DER
     fn encode_asn1(&self) -> Vec<u8> {
         // EncAPRepPart ::= [APPLICATION 27] SEQUENCE {
@@ -977,21 +1043,21 @@ impl EncAPRepPart {
         //   subkey[2] EncryptionKey OPTIONAL,
         //   seq-number[3] INTEGER OPTIONAL
         // }
-        
+
         let mut content = Vec::new();
-        
+
         // ctime[0]
         content.push(0xA0);
         let ctime_bytes = encode_kerberos_time(self.ctime);
         KerberosContext::encode_length(&mut content, ctime_bytes.len());
         content.extend_from_slice(&ctime_bytes);
-        
+
         // cusec[1]
         content.push(0xA1);
         let cusec_bytes = encode_asn1_integer(self.cusec as i32);
         KerberosContext::encode_length(&mut content, cusec_bytes.len());
         content.extend_from_slice(&cusec_bytes);
-        
+
         // subkey[2] (optional)
         if let Some(ref subkey) = self.subkey {
             content.push(0xA2);
@@ -999,7 +1065,7 @@ impl EncAPRepPart {
             KerberosContext::encode_length(&mut content, subkey_bytes.len());
             content.extend_from_slice(&subkey_bytes);
         }
-        
+
         // seq-number[3] (optional)
         if let Some(seq_num) = self.seq_number {
             content.push(0xA3);
@@ -1007,20 +1073,20 @@ impl EncAPRepPart {
             KerberosContext::encode_length(&mut content, seq_bytes.len());
             content.extend_from_slice(&seq_bytes);
         }
-        
+
         // Wrap in SEQUENCE
         let mut seq = vec![0x30];
         KerberosContext::encode_length(&mut seq, content.len());
         seq.extend_from_slice(&content);
-        
+
         // Wrap in APPLICATION 27
-        let mut result = vec![0x7B];  // APPLICATION 27
+        let mut result = vec![0x7B]; // APPLICATION 27
         KerberosContext::encode_length(&mut result, seq.len());
         result.extend_from_slice(&seq);
-        
+
         result
     }
-    
+
     /// Encrypt and return as EncryptedData
     fn encrypt(&self, session_key: &SessionKey) -> Result<Vec<u8>> {
         let plaintext = self.encode_asn1();
@@ -1040,7 +1106,7 @@ impl EncAPRepPart {
             kvno: None,
             cipher: ciphertext,
         };
-        
+
         Ok(enc_data.encode())
     }
 }
@@ -1052,46 +1118,55 @@ impl EncAPRepPart {
 /// Parse ASN.1 INTEGER
 fn parse_asn1_integer(data: &[u8]) -> Result<i32> {
     let (tag, length, header_size) = parse_der_tag_length(data)?;
-    if tag != 0x02 {  // INTEGER
-        return Err(KerberosError::ParseError(
-            format!("Expected INTEGER tag 0x02, got 0x{:02x}", tag)
-        ));
+    if tag != 0x02 {
+        // INTEGER
+        return Err(KerberosError::ParseError(format!(
+            "Expected INTEGER tag 0x02, got 0x{:02x}",
+            tag
+        )));
     }
-    
+
     let int_bytes = &data[header_size..header_size + length];
-    
+
     // Big-endian two's complement: sign-extend from the first octet.
-    let mut value: i32 = if int_bytes.first().is_some_and(|b| b & 0x80 != 0) { -1 } else { 0 };
+    let mut value: i32 = if int_bytes.first().is_some_and(|b| b & 0x80 != 0) {
+        -1
+    } else {
+        0
+    };
     for &byte in int_bytes {
         value = (value << 8) | (byte as i32);
     }
-    
+
     Ok(value)
 }
 
 /// Parse ASN.1 OCTET STRING
 fn parse_asn1_octet_string(data: &[u8]) -> Result<Vec<u8>> {
     let (tag, length, header_size) = parse_der_tag_length(data)?;
-    if tag != 0x04 {  // OCTET STRING
-        return Err(KerberosError::ParseError(
-            format!("Expected OCTET STRING tag 0x04, got 0x{:02x}", tag)
-        ));
+    if tag != 0x04 {
+        // OCTET STRING
+        return Err(KerberosError::ParseError(format!(
+            "Expected OCTET STRING tag 0x04, got 0x{:02x}",
+            tag
+        )));
     }
-    
+
     Ok(data[header_size..header_size + length].to_vec())
 }
 
 /// Parse ASN.1 GeneralString (or any string type)
 fn parse_asn1_general_string(data: &[u8]) -> Result<String> {
     let (tag, length, header_size) = parse_der_tag_length(data)?;
-    
+
     // Accept various string types: GeneralString (0x1B), IA5String (0x16), etc.
     if ![0x1B, 0x16, 0x0C, 0x13].contains(&tag) {
-        return Err(KerberosError::ParseError(
-            format!("Expected string tag, got 0x{:02x}", tag)
-        ));
+        return Err(KerberosError::ParseError(format!(
+            "Expected string tag, got 0x{:02x}",
+            tag
+        )));
     }
-    
+
     let bytes = &data[header_size..header_size + length];
     Ok(String::from_utf8_lossy(bytes).to_string())
 }
@@ -1099,26 +1174,28 @@ fn parse_asn1_general_string(data: &[u8]) -> Result<String> {
 /// Parse ASN.1 BIT STRING (for flags)
 fn parse_asn1_bit_string(data: &[u8]) -> Result<u32> {
     let (tag, length, header_size) = parse_der_tag_length(data)?;
-    if tag != 0x03 {  // BIT STRING
-        return Err(KerberosError::ParseError(
-            format!("Expected BIT STRING tag 0x03, got 0x{:02x}", tag)
-        ));
+    if tag != 0x03 {
+        // BIT STRING
+        return Err(KerberosError::ParseError(format!(
+            "Expected BIT STRING tag 0x03, got 0x{:02x}",
+            tag
+        )));
     }
-    
+
     let bit_data = &data[header_size..header_size + length];
     if bit_data.is_empty() {
         return Ok(0);
     }
-    
+
     // First byte is number of unused bits in last byte
     let _unused_bits = bit_data[0];
-    
+
     // Convert remaining bytes to u32
     let mut value = 0u32;
     for &byte in &bit_data[1..] {
         value = (value << 8) | (byte as u32);
     }
-    
+
     Ok(value)
 }
 
@@ -1128,41 +1205,46 @@ fn parse_principal_name(data: &[u8]) -> Result<Vec<String>> {
     //   name-type[0] INTEGER,
     //   name-string[1] SEQUENCE OF GeneralString
     // }
-    
+
     let (tag, _len, header_size) = parse_der_tag_length(data)?;
-    if tag != 0x30 {  // SEQUENCE
-        return Err(KerberosError::ParseError("Expected SEQUENCE for PrincipalName".to_string()));
+    if tag != 0x30 {
+        // SEQUENCE
+        return Err(KerberosError::ParseError(
+            "Expected SEQUENCE for PrincipalName".to_string(),
+        ));
     }
-    
+
     let content = &data[header_size..];
-    
+
     // Skip name-type[0]
     let (_, remaining) = extract_tagged_field(content, 0xA0)?;
-    
+
     // Parse name-string[1] SEQUENCE OF
     let (name_seq_data, _) = extract_tagged_field(remaining, 0xA1)?;
-    
+
     let (seq_tag, _seq_len, seq_header) = parse_der_tag_length(name_seq_data)?;
     if seq_tag != 0x30 {
-        return Err(KerberosError::ParseError("Expected SEQUENCE OF".to_string()));
+        return Err(KerberosError::ParseError(
+            "Expected SEQUENCE OF".to_string(),
+        ));
     }
-    
+
     // Parse each string in the sequence
     let mut components = Vec::new();
     let mut pos = seq_header;
     let seq_content = name_seq_data;
-    
+
     while pos < seq_content.len() {
         let (tag, length, header) = parse_der_tag_length(&seq_content[pos..])?;
         if ![0x1B, 0x16, 0x0C, 0x13].contains(&tag) {
             break;
         }
-        
+
         let str_bytes = &seq_content[pos + header..pos + header + length];
         components.push(String::from_utf8_lossy(str_bytes).to_string());
         pos += header + length;
     }
-    
+
     Ok(components)
 }
 
@@ -1172,24 +1254,26 @@ fn parse_encryption_key(data: &[u8]) -> Result<SessionKey> {
     //   keytype[0] INTEGER,
     //   keyvalue[1] OCTET STRING
     // }
-    
+
     let (tag, _len, header_size) = parse_der_tag_length(data)?;
     if tag != 0x30 {
-        return Err(KerberosError::ParseError("Expected SEQUENCE for EncryptionKey".to_string()));
+        return Err(KerberosError::ParseError(
+            "Expected SEQUENCE for EncryptionKey".to_string(),
+        ));
     }
-    
+
     let content = &data[header_size..];
-    
+
     // Parse keytype[0]
     let (keytype_data, remaining) = extract_tagged_field(content, 0xA0)?;
     let enctype_val = parse_asn1_integer(keytype_data)?;
     let enctype = EncType::from_i32(enctype_val)
         .ok_or_else(|| KerberosError::ParseError(format!("Unknown enctype: {}", enctype_val)))?;
-    
+
     // Parse keyvalue[1]
     let (keyvalue_data, _) = extract_tagged_field(remaining, 0xA1)?;
     let key = parse_asn1_octet_string(keyvalue_data)?;
-    
+
     Ok(SessionKey { enctype, key })
 }
 
@@ -1212,25 +1296,27 @@ fn parse_encryption_key(data: &[u8]) -> Result<SessionKey> {
 fn parse_kerberos_time(data: &[u8]) -> Result<i64> {
     // KerberosTime is GeneralizedTime: YYYYMMDDHHMMSSz
     let (tag, length, header_size) = parse_der_tag_length(data)?;
-    if tag != 0x18 {  // GeneralizedTime
-        return Err(KerberosError::ParseError(
-            format!("Expected GeneralizedTime tag 0x18, got 0x{:02x}", tag)
-        ));
+    if tag != 0x18 {
+        // GeneralizedTime
+        return Err(KerberosError::ParseError(format!(
+            "Expected GeneralizedTime tag 0x18, got 0x{:02x}",
+            tag
+        )));
     }
 
     let time_bytes = &data[header_size..header_size + length];
-    let time_str = std::str::from_utf8(time_bytes)
-        .map_err(|e| KerberosError::ParseError(
-            format!("Invalid UTF-8 in GeneralizedTime: {}", e)
-        ))?;
+    let time_str = std::str::from_utf8(time_bytes).map_err(|e| {
+        KerberosError::ParseError(format!("Invalid UTF-8 in GeneralizedTime: {}", e))
+    })?;
 
     debug!("   Parsing KerberosTime: {}", time_str);
 
     // Expected format: "YYYYMMDDHHMMSSz" (15 characters)
     if time_str.len() < 15 {
-        return Err(KerberosError::ParseError(
-            format!("GeneralizedTime too short: {} (expected 15 chars)", time_str.len())
-        ));
+        return Err(KerberosError::ParseError(format!(
+            "GeneralizedTime too short: {} (expected 15 chars)",
+            time_str.len()
+        )));
     }
 
     // Parse components
@@ -1244,36 +1330,37 @@ fn parse_kerberos_time(data: &[u8]) -> Result<i64> {
     // Verify UTC indicator
     let tz_indicator = time_str.chars().nth(14).unwrap_or(' ');
     if tz_indicator != 'Z' && tz_indicator != 'z' {
-        return Err(KerberosError::ParseError(
-            format!("Expected UTC indicator 'Z', got '{}'", tz_indicator)
-        ));
+        return Err(KerberosError::ParseError(format!(
+            "Expected UTC indicator 'Z', got '{}'",
+            tz_indicator
+        )));
     }
 
     // Validate ranges
     if month < 1 || month > 12 {
-        return Err(KerberosError::ParseError(
-            format!("Invalid month: {}", month)
-        ));
+        return Err(KerberosError::ParseError(format!(
+            "Invalid month: {}",
+            month
+        )));
     }
     if day < 1 || day > 31 {
-        return Err(KerberosError::ParseError(
-            format!("Invalid day: {}", day)
-        ));
+        return Err(KerberosError::ParseError(format!("Invalid day: {}", day)));
     }
     if hour > 23 {
-        return Err(KerberosError::ParseError(
-            format!("Invalid hour: {}", hour)
-        ));
+        return Err(KerberosError::ParseError(format!("Invalid hour: {}", hour)));
     }
     if minute > 59 {
-        return Err(KerberosError::ParseError(
-            format!("Invalid minute: {}", minute)
-        ));
+        return Err(KerberosError::ParseError(format!(
+            "Invalid minute: {}",
+            minute
+        )));
     }
-    if second > 60 {  // 60 allowed for leap seconds
-        return Err(KerberosError::ParseError(
-            format!("Invalid second: {}", second)
-        ));
+    if second > 60 {
+        // 60 allowed for leap seconds
+        return Err(KerberosError::ParseError(format!(
+            "Invalid second: {}",
+            second
+        )));
     }
 
     // Convert to Unix timestamp
@@ -1281,29 +1368,38 @@ fn parse_kerberos_time(data: &[u8]) -> Result<i64> {
     // a time library, but we avoid dependencies for this critical security code
     let timestamp = calculate_unix_timestamp(year, month, day, hour, minute, second)?;
 
-    debug!("   Parsed timestamp: {} ({}-{:02}-{:02} {:02}:{:02}:{:02} UTC)",
-           timestamp, year, month, day, hour, minute, second);
+    debug!(
+        "   Parsed timestamp: {} ({}-{:02}-{:02} {:02}:{:02}:{:02} UTC)",
+        timestamp, year, month, day, hour, minute, second
+    );
 
     Ok(timestamp)
 }
 
 /// Parse decimal digits from string
 fn parse_digits(s: &str, field_name: &str) -> Result<i32> {
-    s.parse::<i32>()
-        .map_err(|e| KerberosError::ParseError(
-            format!("Failed to parse {}: {} ('{}')", field_name, e, s)
-        ))
+    s.parse::<i32>().map_err(|e| {
+        KerberosError::ParseError(format!("Failed to parse {}: {} ('{}')", field_name, e, s))
+    })
 }
 
 /// Calculate Unix timestamp from date/time components
 ///
 /// Simplified calculation without external dependencies.
 /// Accurate for dates from 1970 onwards.
-fn calculate_unix_timestamp(year: i32, month: i32, day: i32, hour: i32, minute: i32, second: i32) -> Result<i64> {
+fn calculate_unix_timestamp(
+    year: i32,
+    month: i32,
+    day: i32,
+    hour: i32,
+    minute: i32,
+    second: i32,
+) -> Result<i64> {
     if year < 1970 {
-        return Err(KerberosError::ParseError(
-            format!("Year {} is before Unix epoch (1970)", year)
-        ));
+        return Err(KerberosError::ParseError(format!(
+            "Year {} is before Unix epoch (1970)",
+            year
+        )));
     }
 
     // Days in each month (non-leap year)
@@ -1356,7 +1452,7 @@ fn encode_asn1_integer(value: i32) -> Vec<u8> {
 
 /// Encode ASN.1 OCTET STRING
 fn encode_asn1_octet_string(data: &[u8]) -> Vec<u8> {
-    let mut result = vec![0x04];  // OCTET STRING tag
+    let mut result = vec![0x04]; // OCTET STRING tag
     KerberosContext::encode_length(&mut result, data.len());
     result.extend_from_slice(data);
     result
@@ -1381,38 +1477,37 @@ fn encode_kerberos_time(timestamp: i64) -> Vec<u8> {
     // threw the context away when `gss_init_sec_context` rejected the
     // AP-REP, and retried until it gave up with "access denied".
     // Format: YYYYMMDDHHMMSSZ
-    let dt = chrono::DateTime::from_timestamp(timestamp, 0)
-        .unwrap_or_else(chrono::Utc::now);
+    let dt = chrono::DateTime::from_timestamp(timestamp, 0).unwrap_or_else(chrono::Utc::now);
     let time_str = format!("{}Z", dt.format("%Y%m%d%H%M%S"));
-    
-    let mut result = vec![0x18];  // GeneralizedTime tag
+
+    let mut result = vec![0x18]; // GeneralizedTime tag
     result.push(time_str.len() as u8);
     result.extend_from_slice(time_str.as_bytes());
-    
+
     result
 }
 
 /// Encode EncryptionKey
 fn encode_encryption_key(key: &SessionKey) -> Vec<u8> {
     let mut content = Vec::new();
-    
+
     // keytype[0]
     content.push(0xA0);
     let keytype_bytes = encode_asn1_integer(key.enctype as i32);
     KerberosContext::encode_length(&mut content, keytype_bytes.len());
     content.extend_from_slice(&keytype_bytes);
-    
+
     // keyvalue[1]
     content.push(0xA1);
     let keyvalue_bytes = encode_asn1_octet_string(&key.key);
     KerberosContext::encode_length(&mut content, keyvalue_bytes.len());
     content.extend_from_slice(&keyvalue_bytes);
-    
+
     // Wrap in SEQUENCE
     let mut result = vec![0x30];
     KerberosContext::encode_length(&mut result, content.len());
     result.extend_from_slice(&content);
-    
+
     result
 }
 
@@ -1421,7 +1516,7 @@ fn parse_der_length(data: &[u8]) -> Result<(usize, usize)> {
     if data.is_empty() {
         return Err(KerberosError::ParseError("Empty data".to_string()));
     }
-    
+
     if data[0] < 0x80 {
         // Short form
         Ok((data[0] as usize, 1))
@@ -1431,7 +1526,7 @@ fn parse_der_length(data: &[u8]) -> Result<(usize, usize)> {
         if data.len() < 1 + num_octets {
             return Err(KerberosError::ParseError("Incomplete length".to_string()));
         }
-        
+
         let mut length = 0usize;
         for i in 0..num_octets {
             length = (length << 8) | (data[1 + i] as usize);
@@ -1445,10 +1540,10 @@ fn parse_der_tag_length(data: &[u8]) -> Result<(u8, usize, usize)> {
     if data.is_empty() {
         return Err(KerberosError::ParseError("Empty data for tag".to_string()));
     }
-    
+
     let tag = data[0];
     let (length, length_bytes) = parse_der_length(&data[1..])?;
-    
+
     Ok((tag, length, 1 + length_bytes))
 }
 
@@ -1456,20 +1551,23 @@ fn parse_der_tag_length(data: &[u8]) -> Result<(u8, usize, usize)> {
 /// Returns (value_bytes, remaining_bytes)
 fn extract_tagged_field<'a>(data: &'a [u8], expected_tag: u8) -> Result<(&'a [u8], &'a [u8])> {
     let (tag, length, header_size) = parse_der_tag_length(data)?;
-    
+
     if tag != expected_tag {
         return Err(KerberosError::ParseError(format!(
-            "Expected tag 0x{:02x}, found 0x{:02x}", expected_tag, tag
+            "Expected tag 0x{:02x}, found 0x{:02x}",
+            expected_tag, tag
         )));
     }
-    
+
     if data.len() < header_size + length {
-        return Err(KerberosError::ParseError("Incomplete tagged field".to_string()));
+        return Err(KerberosError::ParseError(
+            "Incomplete tagged field".to_string(),
+        ));
     }
-    
+
     let value = &data[header_size..header_size + length];
     let remaining = &data[header_size + length..];
-    
+
     Ok((value, remaining))
 }
 
@@ -1484,11 +1582,8 @@ impl KerberosContext {
     pub fn per_message_tokens(
         &self,
     ) -> Result<crate::token::PerMessageTokens<crate::token::ContextKey>> {
-        let key = crate::token::ContextKey::new(
-            self.base_key_enctype as i32,
-            &self.base_key,
-        )
-        .map_err(|e| KerberosError::DecryptionFailed(e.to_string()))?;
+        let key = crate::token::ContextKey::new(self.base_key_enctype as i32, &self.base_key)
+            .map_err(|e| KerberosError::DecryptionFailed(e.to_string()))?;
         Ok(crate::token::PerMessageTokens::new(
             key,
             crate::token::Role::Acceptor,
@@ -1497,7 +1592,7 @@ impl KerberosContext {
     }
 
     /// Accept a GSS-API Kerberos AP-REQ token with FULL CRYPTOGRAPHY
-    /// 
+    ///
     /// This implements complete Kerberos crypto:
     /// 1. Parse GSS-API wrapper and extract AP-REQ
     /// 2. Decrypt ticket with service key
@@ -1537,34 +1632,44 @@ impl KerberosContext {
         max_skew_secs: i64,
         now: i64,
     ) -> Result<(Self, Vec<u8>)> {
-        info!("🔐 Accepting Kerberos GSS token with FULL CRYPTOGRAPHY: {} bytes", token.len());
-        
+        info!(
+            "🔐 Accepting Kerberos GSS token with FULL CRYPTOGRAPHY: {} bytes",
+            token.len()
+        );
+
         // Parse GSS-API wrapper
         if token.len() < 20 {
             return Err(KerberosError::ParseError("Token too short".to_string()));
         }
-        
+
         // Verify GSS-API APPLICATION tag [0x60]
         if token[0] != 0x60 {
             return Err(KerberosError::ParseError(format!(
-                "Expected GSS APPLICATION tag 0x60, found 0x{:02x}", token[0]
+                "Expected GSS APPLICATION tag 0x60, found 0x{:02x}",
+                token[0]
             )));
         }
-        
+
         // Parse length
         let (_total_len, len_bytes) = parse_der_length(&token[1..])?;
         let gss_content_start = 1 + len_bytes;
-        
+
         // Verify Kerberos OID (1.2.840.113554.1.2.2)
-        let krb5_oid = [0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02];
+        let krb5_oid = [
+            0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02,
+        ];
         if token.len() < gss_content_start + krb5_oid.len() {
-            return Err(KerberosError::ParseError("Token too short for OID".to_string()));
+            return Err(KerberosError::ParseError(
+                "Token too short for OID".to_string(),
+            ));
         }
-        
+
         if &token[gss_content_start..gss_content_start + krb5_oid.len()] != &krb5_oid {
-            return Err(KerberosError::ParseError("Not a Kerberos GSS token".to_string()));
+            return Err(KerberosError::ParseError(
+                "Not a Kerberos GSS token".to_string(),
+            ));
         }
-        
+
         // RFC 4121 §4.1: between the mech OID and the Kerberos message
         // sits a 2-octet TOK_ID — 01 00 for AP-REQ, 02 00 for AP-REP,
         // 03 00 for KRB-ERROR.
@@ -1577,7 +1682,9 @@ impl KerberosContext {
         // with each other and with no other implementation.
         let tok_id_start = gss_content_start + krb5_oid.len();
         if token.len() < tok_id_start + 2 {
-            return Err(KerberosError::ParseError("Token too short for TOK_ID".to_string()));
+            return Err(KerberosError::ParseError(
+                "Token too short for TOK_ID".to_string(),
+            ));
         }
         let tok_id = &token[tok_id_start..tok_id_start + 2];
         if tok_id != TOK_ID_AP_REQ {
@@ -1590,12 +1697,15 @@ impl KerberosContext {
         // Extract AP-REQ (after OID and TOK_ID)
         let ap_req_start = tok_id_start + 2;
         let ap_req_data = &token[ap_req_start..];
-        
-        debug!("   Parsed GSS wrapper: AP-REQ is {} bytes", ap_req_data.len());
-        
+
+        debug!(
+            "   Parsed GSS wrapper: AP-REQ is {} bytes",
+            ap_req_data.len()
+        );
+
         // Parse AP-REQ structure
         let (ticket, enc_authenticator, ap_options) = Self::parse_ap_req(ap_req_data)?;
-        
+
         // Find service key for this ticket
         let service_name = ticket.sname.join("/");
         // Select by the enctype the TICKET declares, not just the name.
@@ -1607,9 +1717,12 @@ impl KerberosContext {
                     service_name, ticket.enc_part.enctype
                 ))
             })?;
-        
-        info!("   Found service key: {}@{}", service_key.principal, service_key.realm);
-        
+
+        info!(
+            "   Found service key: {}@{}",
+            service_key.principal, service_key.realm
+        );
+
         // Decrypt ticket to get session key
         let enc_ticket_part = ticket.decrypt(service_key)?;
 
@@ -1619,15 +1732,20 @@ impl KerberosContext {
 
         let session_key = enc_ticket_part.key;
 
-        info!("   ✅ Ticket decrypted, extracted session key: {} bytes", session_key.key.len());
-        
+        info!(
+            "   ✅ Ticket decrypted, extracted session key: {} bytes",
+            session_key.key.len()
+        );
+
         // Decrypt and validate authenticator
         let authenticator = Authenticator::parse_and_decrypt(&enc_authenticator, &session_key)?;
         authenticator.validate(now, max_skew_secs)?;
-        
-        info!("   ✅ Authenticator validated: time_skew={}s", 
-              current_time() - authenticator.ctime);
-        
+
+        info!(
+            "   ✅ Authenticator validated: time_skew={}s",
+            current_time() - authenticator.ctime
+        );
+
         // Create context
         let client_name = enc_ticket_part.cname.join("/");
         // RFC 4121 §2 base-key selection. This server asserts no acceptor
@@ -1651,7 +1769,7 @@ impl KerberosContext {
             base_key_enctype,
             used_initiator_subkey,
         };
-        
+
         // RFC 4120 §3.2.4: an AP-REP is the answer to MUTUAL-REQUIRED and
         // to nothing else. Sending one unasked breaks the initiator, which
         // is already established and rejects the extra token.
@@ -1665,14 +1783,21 @@ impl KerberosContext {
             debug!("   No MUTUAL-REQUIRED in ap-options — replying with an empty token");
             Vec::new()
         };
-        
-        info!("✅ FULL CRYPTO: Kerberos context established: client={}", context.client_principal);
-        info!("   Session key: {} bytes, enctype={:?}", context.session_key.len(), context.enctype);
+
+        info!(
+            "✅ FULL CRYPTO: Kerberos context established: client={}",
+            context.client_principal
+        );
+        info!(
+            "   Session key: {} bytes, enctype={:?}",
+            context.session_key.len(),
+            context.enctype
+        );
         debug!("   Generated encrypted AP-REP: {} bytes", ap_rep.len());
-        
+
         Ok((context, ap_rep))
     }
-    
+
     /// Parse AP-REQ and extract ticket + encrypted authenticator
     fn parse_ap_req(data: &[u8]) -> Result<(Ticket, Vec<u8>, u32)> {
         // AP-REQ ::= [APPLICATION 14] SEQUENCE {
@@ -1682,41 +1807,49 @@ impl KerberosContext {
         //   ticket[3] Ticket,
         //   authenticator[4] EncryptedData
         // }
-        
+
         let (tag, _ap_req_len, ap_req_header) = parse_der_tag_length(data)?;
-        if tag != 0x6E {  // APPLICATION 14
+        if tag != 0x6E {
+            // APPLICATION 14
             return Err(KerberosError::ParseError(format!(
-                "Expected AP-REQ tag 0x6E, found 0x{:02x}", tag
+                "Expected AP-REQ tag 0x6E, found 0x{:02x}",
+                tag
             )));
         }
-        
+
         let ap_req_content = &data[ap_req_header..];
-        
+
         // Parse inner SEQUENCE
         let (seq_tag, _seq_len, seq_header) = parse_der_tag_length(ap_req_content)?;
         if seq_tag != 0x30 {
-            return Err(KerberosError::ParseError("Expected SEQUENCE in AP-REQ".to_string()));
+            return Err(KerberosError::ParseError(
+                "Expected SEQUENCE in AP-REQ".to_string(),
+            ));
         }
-        
+
         let content = &ap_req_content[seq_header..];
-        
+
         // Parse pvno[0]
         let (vno_data, mut remaining) = extract_tagged_field(content, 0xA0)?;
         let vno = parse_asn1_integer(vno_data)?;
         if vno != 5 {
-            return Err(KerberosError::ParseError(format!("Expected pvno=5, got {}", vno)));
+            return Err(KerberosError::ParseError(format!(
+                "Expected pvno=5, got {}",
+                vno
+            )));
         }
-        
+
         // Parse msg-type[1]
         let (msg_type_data, rest) = extract_tagged_field(remaining, 0xA1)?;
         let msg_type = parse_asn1_integer(msg_type_data)?;
         if msg_type != 14 {
-            return Err(KerberosError::ParseError(
-                format!("Expected msg-type=14 (AP-REQ), got {}", msg_type)
-            ));
+            return Err(KerberosError::ParseError(format!(
+                "Expected msg-type=14 (AP-REQ), got {}",
+                msg_type
+            )));
         }
         remaining = rest;
-        
+
         // ap-options[2] — NOT skippable.
         //
         // RFC 4120 §3.2.4: the AP-REP is sent ONLY when MUTUAL-REQUIRED is
@@ -1730,93 +1863,103 @@ impl KerberosContext {
         let (opts_data, rest) = extract_tagged_field(remaining, 0xA2)?;
         let ap_options = parse_asn1_bit_string(opts_data)?;
         remaining = rest;
-        
+
         // Parse ticket[3]
         let (ticket_data, rest) = extract_tagged_field(remaining, 0xA3)?;
         let ticket = Ticket::parse(ticket_data)?;
         remaining = rest;
-        
-        debug!("   Parsed ticket: realm={}, sname={}", ticket.realm, ticket.sname.join("/"));
-        
+
+        debug!(
+            "   Parsed ticket: realm={}, sname={}",
+            ticket.realm,
+            ticket.sname.join("/")
+        );
+
         // Parse authenticator[4] (EncryptedData)
         let (auth_data, _) = extract_tagged_field(remaining, 0xA4)?;
         let enc_auth = EncryptedData::parse(auth_data)?;
-        
+
         debug!(
             "   Parsed encrypted authenticator: {} bytes, ap_options=0x{:08x}{}",
             enc_auth.cipher.len(),
             ap_options,
-            if ap_options & AP_OPTS_MUTUAL_REQUIRED != 0 { " (MUTUAL-REQUIRED)" } else { "" }
+            if ap_options & AP_OPTS_MUTUAL_REQUIRED != 0 {
+                " (MUTUAL-REQUIRED)"
+            } else {
+                ""
+            }
         );
-        
+
         Ok((ticket, enc_auth.cipher, ap_options))
     }
-    
+
     /// Generate properly encrypted AP-REP with real cryptography
     fn generate_ap_rep_with_crypto(
         session_key: &SessionKey,
         ctime: i64,
-        cusec: u32
+        cusec: u32,
     ) -> Result<Vec<u8>> {
         debug!("   Generating AP-REP with encryption");
-        
+
         // Create encrypted AP-REP part
         let enc_part = EncAPRepPart::create(ctime, cusec, None);
         let encrypted = enc_part.encrypt(session_key)?;
-        
+
         // Build AP-REP: [APPLICATION 15] SEQUENCE {
         //   pvno[0] INTEGER (5),
         //   msg-type[1] INTEGER (15),
         //   enc-part[2] EncryptedData
         // }
         let mut ap_rep_content = Vec::new();
-        
+
         // pvno[0] = 5
         ap_rep_content.push(0xA0);
         ap_rep_content.push(0x03);
         ap_rep_content.push(0x02);
         ap_rep_content.push(0x01);
         ap_rep_content.push(0x05);
-        
+
         // msg-type[1] = 15
         ap_rep_content.push(0xA1);
         ap_rep_content.push(0x03);
         ap_rep_content.push(0x02);
         ap_rep_content.push(0x01);
         ap_rep_content.push(0x0F);
-        
+
         // enc-part[2]
         ap_rep_content.push(0xA2);
         Self::encode_length(&mut ap_rep_content, encrypted.len());
         ap_rep_content.extend_from_slice(&encrypted);
-        
+
         // Wrap in SEQUENCE
         let mut ap_rep_seq = vec![0x30];
         Self::encode_length(&mut ap_rep_seq, ap_rep_content.len());
         ap_rep_seq.extend_from_slice(&ap_rep_content);
-        
+
         // Wrap in APPLICATION 15
         let mut ap_rep = vec![0x6F];
         Self::encode_length(&mut ap_rep, ap_rep_seq.len());
         ap_rep.extend_from_slice(&ap_rep_seq);
-        
+
         // Wrap in GSS-API. The TOK_ID (RFC 4121 §4.1) is NOT optional —
         // an initiator reading this reply expects 02 00 before the
         // AP-REP, and the emitter omitted it for the same reason the
         // parser ignored it on the way in.
-        let krb5_oid = [0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02];
+        let krb5_oid = [
+            0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02,
+        ];
         let gss_content_len = krb5_oid.len() + TOK_ID_AP_REP.len() + ap_rep.len();
 
-        let mut token = vec![0x60];  // APPLICATION 0
+        let mut token = vec![0x60]; // APPLICATION 0
         Self::encode_length(&mut token, gss_content_len);
         token.extend_from_slice(&krb5_oid);
         token.extend_from_slice(TOK_ID_AP_REP);
         token.extend_from_slice(&ap_rep);
-        
+
         debug!("   Generated AP-REP: {} bytes (encrypted)", token.len());
         Ok(token)
     }
-    
+
     /// Generate a minimal valid AP-REP token wrapped in GSS-API framing
     ///
     /// Structure:
@@ -1826,10 +1969,12 @@ impl KerberosContext {
     #[allow(dead_code)]
     fn generate_ap_rep_token() -> Result<Vec<u8>> {
         let mut token = Vec::new();
-        
+
         // Kerberos OID: 1.2.840.113554.1.2.2 (RFC 1964)
-        let krb5_oid = vec![0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02];
-        
+        let krb5_oid = vec![
+            0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02,
+        ];
+
         // Generate minimal AP-REP (Application tag 15)
         // AP-REP ::= [APPLICATION 15] SEQUENCE {
         //   pvno[0] INTEGER (5),
@@ -1837,13 +1982,13 @@ impl KerberosContext {
         //   enc-part[2] EncryptedData  -- minimal placeholder
         // }
         let ap_rep_inner = Self::encode_ap_rep_inner();
-        
+
         // Wrap in APPLICATION 15 tag
         let mut ap_rep = Vec::new();
-        ap_rep.push(0x6F);  // APPLICATION 15
+        ap_rep.push(0x6F); // APPLICATION 15
         Self::encode_length(&mut ap_rep, ap_rep_inner.len());
         ap_rep.extend_from_slice(&ap_rep_inner);
-        
+
         // Calculate total length for GSS wrapper
         let gss_content_len = krb5_oid.len() + TOK_ID_AP_REP.len() + ap_rep.len();
 
@@ -1853,7 +1998,7 @@ impl KerberosContext {
         token.extend_from_slice(&krb5_oid);
         token.extend_from_slice(TOK_ID_AP_REP);
         token.extend_from_slice(&ap_rep);
-        
+
         debug!("Generated GSS-wrapped AP-REP: {} bytes", token.len());
         Ok(token)
     }
@@ -1862,24 +2007,24 @@ impl KerberosContext {
     #[allow(dead_code)]
     fn encode_ap_rep_inner() -> Vec<u8> {
         let mut inner = Vec::new();
-        
+
         // SEQUENCE
         let mut seq = Vec::new();
-        
+
         // pvno[0] INTEGER (5)
-        seq.push(0xA0);  // Context tag 0
-        seq.push(0x03);  // Length
-        seq.push(0x02);  // INTEGER
-        seq.push(0x01);  // Length 1
-        seq.push(0x05);  // Value: 5
-        
+        seq.push(0xA0); // Context tag 0
+        seq.push(0x03); // Length
+        seq.push(0x02); // INTEGER
+        seq.push(0x01); // Length 1
+        seq.push(0x05); // Value: 5
+
         // msg-type[1] INTEGER (15 = AP-REP)
-        seq.push(0xA1);  // Context tag 1
-        seq.push(0x03);  // Length
-        seq.push(0x02);  // INTEGER
-        seq.push(0x01);  // Length 1
-        seq.push(0x0F);  // Value: 15
-        
+        seq.push(0xA1); // Context tag 1
+        seq.push(0x03); // Length
+        seq.push(0x02); // INTEGER
+        seq.push(0x01); // Length 1
+        seq.push(0x0F); // Value: 15
+
         // enc-part[2] EncryptedData (minimal placeholder)
         // EncryptedData ::= SEQUENCE {
         //   etype[0] INTEGER,
@@ -1887,49 +2032,49 @@ impl KerberosContext {
         //   cipher[2] OCTET STRING
         // }
         let mut enc_part = Vec::new();
-        
+
         // etype[0] = 18 (AES256-CTS-HMAC-SHA1-96)
-        enc_part.push(0xA0);  // Context tag 0
-        enc_part.push(0x03);  // Length
-        enc_part.push(0x02);  // INTEGER
-        enc_part.push(0x01);  // Length 1
-        enc_part.push(0x12);  // Value: 18
-        
+        enc_part.push(0xA0); // Context tag 0
+        enc_part.push(0x03); // Length
+        enc_part.push(0x02); // INTEGER
+        enc_part.push(0x01); // Length 1
+        enc_part.push(0x12); // Value: 18
+
         // cipher[2] = empty octet string (placeholder - would be encrypted in production)
-        enc_part.push(0xA2);  // Context tag 2
-        enc_part.push(0x11);  // Length (17 bytes for the OCTET STRING structure + 15 bytes data)
-        enc_part.push(0x04);  // OCTET STRING
-        enc_part.push(0x0F);  // Length (15 bytes of dummy encrypted data)
-        enc_part.extend_from_slice(&[0u8; 15]);  // Placeholder encrypted data
-        
+        enc_part.push(0xA2); // Context tag 2
+        enc_part.push(0x11); // Length (17 bytes for the OCTET STRING structure + 15 bytes data)
+        enc_part.push(0x04); // OCTET STRING
+        enc_part.push(0x0F); // Length (15 bytes of dummy encrypted data)
+        enc_part.extend_from_slice(&[0u8; 15]); // Placeholder encrypted data
+
         // Wrap enc_part in SEQUENCE
         let mut enc_part_seq = Vec::new();
-        enc_part_seq.push(0x30);  // SEQUENCE
+        enc_part_seq.push(0x30); // SEQUENCE
         Self::encode_length(&mut enc_part_seq, enc_part.len());
         enc_part_seq.extend_from_slice(&enc_part);
-        
+
         // Add enc-part to main sequence with context tag 2
-        seq.push(0xA2);  // Context tag 2
+        seq.push(0xA2); // Context tag 2
         Self::encode_length(&mut seq, enc_part_seq.len());
         seq.extend_from_slice(&enc_part_seq);
-        
+
         // Wrap everything in SEQUENCE
-        inner.push(0x30);  // SEQUENCE
+        inner.push(0x30); // SEQUENCE
         Self::encode_length(&mut inner, seq.len());
         inner.extend_from_slice(&seq);
-        
+
         inner
     }
-    
+
     /// Encode ASN.1 DER length
     fn encode_length(output: &mut Vec<u8>, length: usize) {
         if length < 128 {
             output.push(length as u8);
         } else if length < 256 {
-            output.push(0x81);  // Long form, 1 byte
+            output.push(0x81); // Long form, 1 byte
             output.push(length as u8);
         } else {
-            output.push(0x82);  // Long form, 2 bytes
+            output.push(0x82); // Long form, 2 bytes
             output.push((length >> 8) as u8);
             output.push((length & 0xFF) as u8);
         }
@@ -1939,7 +2084,7 @@ impl KerberosContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_enctype_conversion() {
         assert_eq!(EncType::from_i32(17), Some(EncType::AES128CtsHmacSha196));
@@ -1948,57 +2093,63 @@ mod tests {
         assert_eq!(EncType::from_i32(20), Some(EncType::AES256CtsHmacSha384192));
         assert_eq!(EncType::from_i32(999), None);
     }
-    
+
     #[test]
     fn test_encode_length_short() {
         let mut output = Vec::new();
         KerberosContext::encode_length(&mut output, 42);
         assert_eq!(output, vec![42]);
     }
-    
+
     #[test]
     fn test_encode_length_long_1byte() {
         let mut output = Vec::new();
         KerberosContext::encode_length(&mut output, 200);
         assert_eq!(output, vec![0x81, 200]);
     }
-    
+
     #[test]
     fn test_encode_length_long_2bytes() {
         let mut output = Vec::new();
         KerberosContext::encode_length(&mut output, 300);
-        assert_eq!(output, vec![0x82, 0x01, 0x2C]);  // 0x012C = 300
+        assert_eq!(output, vec![0x82, 0x01, 0x2C]); // 0x012C = 300
     }
-    
+
     #[test]
     fn test_ap_rep_structure() {
         // Test that AP-REP generation doesn't panic
         let result = KerberosContext::generate_ap_rep_token();
         assert!(result.is_ok());
-        
+
         let token = result.unwrap();
-        
+
         // Verify it's not empty
         assert!(token.len() > 20, "AP-REP token should be substantial");
-        
+
         // Verify GSS-API wrapper (APPLICATION 0)
         assert_eq!(token[0], 0x60, "Should start with GSS APPLICATION tag");
-        
+
         // Token should contain Kerberos OID
         assert!(token.len() > 15, "Should have room for OID and AP-REP");
     }
-    
+
     #[test]
     fn test_ap_rep_contains_krb5_oid() {
         let token = KerberosContext::generate_ap_rep_token().unwrap();
 
         // Kerberos OID: 1.2.840.113554.1.2.2
         // In DER: 06 09 2a 86 48 86 f7 12 01 02 02
-        let krb5_oid = vec![0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02];
+        let krb5_oid = vec![
+            0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02,
+        ];
 
         // Check if the OID appears in the token
-        assert!(token.windows(krb5_oid.len()).any(|window| window == krb5_oid.as_slice()),
-                "AP-REP should contain Kerberos OID");
+        assert!(
+            token
+                .windows(krb5_oid.len())
+                .any(|window| window == krb5_oid.as_slice()),
+            "AP-REP should contain Kerberos OID"
+        );
     }
 
     #[test]
@@ -2147,25 +2298,28 @@ mod tests {
 
         assert!(parse_kerberos_time(&data).is_ok());
     }
-    
+
     #[test]
     fn test_ap_rep_has_application_tag() {
         let token = KerberosContext::generate_ap_rep_token().unwrap();
-        
+
         // Find the AP-REP application tag (0x6F = APPLICATION 15)
-        assert!(token.contains(&0x6F), "Should contain APPLICATION 15 tag for AP-REP");
+        assert!(
+            token.contains(&0x6F),
+            "Should contain APPLICATION 15 tag for AP-REP"
+        );
     }
-    
+
     #[test]
     fn test_keytab_invalid_version() {
         // Keytab with invalid version
-        let data = vec![0x05, 0x01];  // Version 0x0501 (invalid)
+        let data = vec![0x05, 0x01]; // Version 0x0501 (invalid)
         let result = Keytab::parse(&data);
         assert!(result.is_err());
         let err = result.err().unwrap();
         assert!(err.to_string().contains("Unsupported keytab version"));
     }
-    
+
     #[test]
     fn test_keytab_empty() {
         let data = vec![];
@@ -2174,17 +2328,17 @@ mod tests {
         let err = result.err().unwrap();
         assert!(err.to_string().contains("too short"));
     }
-    
+
     #[test]
     fn test_keytab_correct_version() {
         // Minimal keytab with correct version but no entries
-        let data = vec![0x05, 0x02];  // Version 0x0502 (correct)
+        let data = vec![0x05, 0x02]; // Version 0x0502 (correct)
         let result = Keytab::parse(&data);
         assert!(result.is_ok());
         let keytab = result.unwrap();
         assert_eq!(keytab.keys().len(), 0);
     }
-    
+
     #[test]
     fn a_multi_enctype_keytab_selects_by_the_tickets_enctype() {
         // THE ORDINARY SHAPE OF A REAL KEYTAB: `ktadd` writes one key per
@@ -2239,10 +2393,13 @@ mod tests {
 
         // An enctype the keytab does not carry is None, not a wrong key —
         // the failure mode that produced the HMAC mismatch.
-        let one = Keytab { keys: vec![mk(EncType::AES256CtsHmacSha196, 2, 0xBB)] };
-        assert!(one
-            .find_key_for("nfs/srv", EncType::AES128CtsHmacSha196, None)
-            .is_none());
+        let one = Keytab {
+            keys: vec![mk(EncType::AES256CtsHmacSha196, 2, 0xBB)],
+        };
+        assert!(
+            one.find_key_for("nfs/srv", EncType::AES128CtsHmacSha196, None)
+                .is_none()
+        );
 
         // kvno picks among same-enctype keys when it matches, and is not
         // fatal when it does not (a keytab mid-rotation carries the old one).
@@ -2253,12 +2410,15 @@ mod tests {
             ],
         };
         assert_eq!(
-            rot.find_key_for("nfs/srv", EncType::AES256CtsHmacSha196, Some(4)).unwrap().key[0],
+            rot.find_key_for("nfs/srv", EncType::AES256CtsHmacSha196, Some(4))
+                .unwrap()
+                .key[0],
             0x22
         );
-        assert!(rot
-            .find_key_for("nfs/srv", EncType::AES256CtsHmacSha196, Some(99))
-            .is_some());
+        assert!(
+            rot.find_key_for("nfs/srv", EncType::AES256CtsHmacSha196, Some(99))
+                .is_some()
+        );
     }
 
     #[test]
@@ -2270,7 +2430,7 @@ mod tests {
             enctype: EncType::AES256CtsHmacSha196,
             key: vec![1, 2, 3, 4],
         };
-        
+
         let key2 = ServiceKey {
             principal: "host/server".to_string(),
             realm: "EXAMPLE.COM".to_string(),
@@ -2278,54 +2438,61 @@ mod tests {
             enctype: EncType::AES128CtsHmacSha196,
             key: vec![5, 6, 7, 8],
         };
-        
+
         let keytab = Keytab {
             keys: vec![key1, key2],
         };
-        
+
         // Test exact match
         assert!(keytab.find_key("nfs/server").is_some());
         assert!(keytab.find_key("host/server").is_some());
-        
+
         // Test full principal with realm
         assert!(keytab.find_key("nfs/server@EXAMPLE.COM").is_some());
-        
+
         // Test not found
         assert!(keytab.find_key("http/server").is_none());
     }
-    
+
     #[test]
     fn test_kerberos_context_accept_token() {
         // Test with minimal keytab
         let keytab = Keytab { keys: Vec::new() };
-        
+
         // Test with a minimal token (not a real AP-REQ)
-        let token = vec![0x60, 0x10, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02];
-        
+        let token = vec![
+            0x60, 0x10, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02,
+        ];
+
         let result = KerberosContext::accept_token(&keytab, &token);
-        
+
         // Should fail because it's not a valid AP-REQ with full crypto parsing
         assert!(result.is_err(), "Should fail on invalid token");
         // Error could be parsing error or incomplete data
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("Parse") || err_msg.contains("too short") || err_msg.contains("Incomplete"),
-                "Expected parsing error, got: {}", err_msg);
+        assert!(
+            err_msg.contains("Parse")
+                || err_msg.contains("too short")
+                || err_msg.contains("Incomplete"),
+            "Expected parsing error, got: {}",
+            err_msg
+        );
     }
-    
+
     #[test]
     fn test_kerberos_context_reject_short_token() {
         let keytab = Keytab { keys: Vec::new() };
-        let token = vec![0x60];  // Too short
-        
+        let token = vec![0x60]; // Too short
+
         let result = KerberosContext::accept_token(&keytab, &token);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("too short"));
     }
-    
+
     //==========================================================================
     // PHASE 8: COMPREHENSIVE CRYPTO TESTS
     //==========================================================================
-    
+
     #[test]
     fn test_parse_asn1_integer() {
         // INTEGER 42 = 02 01 2A
@@ -2333,7 +2500,7 @@ mod tests {
         let result = parse_asn1_integer(&data).unwrap();
         assert_eq!(result, 42);
     }
-    
+
     #[test]
     fn test_parse_asn1_octet_string() {
         // OCTET STRING "hello" = 04 05 68 65 6C 6C 6F
@@ -2341,7 +2508,7 @@ mod tests {
         let result = parse_asn1_octet_string(&data).unwrap();
         assert_eq!(result, b"hello");
     }
-    
+
     #[test]
     fn test_parse_asn1_general_string() {
         // GeneralString "test" = 1B 04 74 65 73 74
@@ -2349,15 +2516,20 @@ mod tests {
         let result = parse_asn1_general_string(&data).unwrap();
         assert_eq!(result, "test");
     }
-    
+
     #[test]
     fn integers_whose_top_bit_is_set_keep_their_zero_octet() {
         assert_eq!(encode_asn1_integer(200), [0x02, 0x02, 0x00, 0xC8]);
         assert_eq!(encode_asn1_integer(40_000), [0x02, 0x03, 0x00, 0x9C, 0x40]);
         assert_eq!(encode_asn1_integer(127), [0x02, 0x01, 0x7F]);
         assert_eq!(encode_asn1_integer(0), [0x02, 0x01, 0x00]);
-        for cusec in [0, 127, 128, 200, 255, 256, 32_767, 32_768, 40_000, 65_535, 999_999] {
-            assert_eq!(parse_asn1_integer(&encode_asn1_integer(cusec)).unwrap(), cusec);
+        for cusec in [
+            0, 127, 128, 200, 255, 256, 32_767, 32_768, 40_000, 65_535, 999_999,
+        ] {
+            assert_eq!(
+                parse_asn1_integer(&encode_asn1_integer(cusec)).unwrap(),
+                cusec
+            );
         }
     }
 
@@ -2376,19 +2548,19 @@ mod tests {
     fn test_encode_asn1_integer() {
         let encoded = encode_asn1_integer(42);
         // Should be: 02 01 2A
-        assert_eq!(encoded[0], 0x02);  // INTEGER tag
-        assert_eq!(encoded[1], 0x01);  // Length 1
-        assert_eq!(encoded[2], 0x2A);  // Value 42
+        assert_eq!(encoded[0], 0x02); // INTEGER tag
+        assert_eq!(encoded[1], 0x01); // Length 1
+        assert_eq!(encoded[2], 0x2A); // Value 42
     }
-    
+
     #[test]
     fn test_encode_asn1_octet_string() {
         let encoded = encode_asn1_octet_string(b"hello");
-        assert_eq!(encoded[0], 0x04);  // OCTET STRING tag
-        assert_eq!(encoded[1], 0x05);  // Length 5
+        assert_eq!(encoded[0], 0x04); // OCTET STRING tag
+        assert_eq!(encoded[1], 0x05); // Length 5
         assert_eq!(&encoded[2..], b"hello");
     }
-    
+
     #[test]
     fn test_encrypted_data_parse_encode() {
         let original = EncryptedData {
@@ -2396,46 +2568,49 @@ mod tests {
             kvno: Some(1),
             cipher: vec![1, 2, 3, 4, 5],
         };
-        
+
         let encoded = original.encode();
         let parsed = EncryptedData::parse(&encoded).unwrap();
-        
+
         assert_eq!(parsed.enctype as i32, original.enctype as i32);
         assert_eq!(parsed.kvno, original.kvno);
         assert_eq!(parsed.cipher, original.cipher);
     }
-    
+
     #[test]
     fn test_session_key_parse_encode() {
         let original = SessionKey {
             enctype: EncType::AES256CtsHmacSha196,
             key: vec![1, 2, 3, 4, 5, 6, 7, 8],
         };
-        
+
         let encoded = encode_encryption_key(&original);
         let parsed = parse_encryption_key(&encoded).unwrap();
-        
+
         assert_eq!(parsed.enctype as i32, original.enctype as i32);
         assert_eq!(parsed.key, original.key);
     }
-    
+
     #[test]
     fn test_enc_ap_rep_part_create() {
         let enc_part = EncAPRepPart::create(12345, 67890, None);
-        
+
         assert_eq!(enc_part.ctime, 12345);
         assert_eq!(enc_part.cusec, 67890);
         assert!(enc_part.subkey.is_none());
         assert_eq!(enc_part.seq_number, Some(0));
     }
-    
+
     /// A ticket whose validity interval is under test directly -- the
     /// recorded interop fixtures can only exercise `endtime`, since their
     /// flags and starttime are whatever MIT chose on the day.
     fn ticket_at(flags: u32, starttime: Option<i64>, endtime: i64) -> EncTicketPart {
         EncTicketPart {
             flags,
-            key: SessionKey { enctype: EncType::AES256CtsHmacSha196, key: vec![0u8; 32] },
+            key: SessionKey {
+                enctype: EncType::AES256CtsHmacSha196,
+                key: vec![0u8; 32],
+            },
             crealm: "FLINT.TEST".to_string(),
             cname: vec!["testuser".to_string()],
             authtime: 1_000,
@@ -2446,7 +2621,11 @@ mod tests {
 
     #[test]
     fn a_ticket_inside_its_window_validates() {
-        assert!(ticket_at(0, Some(1_000), 2_000).validate_validity(1_500, 300).is_ok());
+        assert!(
+            ticket_at(0, Some(1_000), 2_000)
+                .validate_validity(1_500, 300)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -2508,39 +2687,49 @@ mod tests {
             subkey: None,
             seq_number: None,
         };
-        
+
         let result = auth.validate(current_time(), 300);
         assert!(result.is_ok());
     }
-    
+
     #[test]
     fn test_authenticator_validate_time_skew() {
         let auth = Authenticator {
             crealm: "TEST.REALM".to_string(),
             cname: vec!["user".to_string()],
             cusec: 0,
-            ctime: current_time() - 400,  // 400 seconds ago
+            ctime: current_time() - 400, // 400 seconds ago
             subkey: None,
             seq_number: None,
         };
-        
-        let result = auth.validate(current_time(), 300);  // 5 minute tolerance
+
+        let result = auth.validate(current_time(), 300); // 5 minute tolerance
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Time skew"));
     }
-    
+
     #[test]
     fn the_initiator_subkey_becomes_the_per_message_base_key() {
         // RFC 4121 §2. The subkey was parsed and discarded, so every
         // per-message token was keyed on the session key even when the
         // client had asked for a subkey — bytes a real peer rejects,
         // with nothing on this side reporting an error.
-        let session = SessionKey { enctype: EncType::AES256CtsHmacSha196, key: vec![0xAA; 32] };
-        let subkey = SessionKey { enctype: EncType::AES128CtsHmacSha196, key: vec![0xBB; 16] };
+        let session = SessionKey {
+            enctype: EncType::AES256CtsHmacSha196,
+            key: vec![0xAA; 32],
+        };
+        let subkey = SessionKey {
+            enctype: EncType::AES128CtsHmacSha196,
+            key: vec![0xBB; 16],
+        };
 
         let (k, e, used) = select_base_key(&session, Some(&subkey));
         assert_eq!(k, subkey.key, "the subkey must win");
-        assert_eq!(e, EncType::AES128CtsHmacSha196, "and it carries its OWN enctype");
+        assert_eq!(
+            e,
+            EncType::AES128CtsHmacSha196,
+            "and it carries its OWN enctype"
+        );
         assert!(used);
 
         // Control: with no subkey the session key is still chosen, so the
@@ -2585,7 +2774,7 @@ mod tests {
         // And the naming records the truth: enctype 20 is SHA-384-192.
         assert_eq!(EncType::AES256CtsHmacSha384192.etype(), 20);
     }
-    
+
     #[test]
     fn test_current_time_reasonable() {
         let time = current_time();
@@ -2594,26 +2783,25 @@ mod tests {
         // Should be before year 2100
         assert!(time < 4102444800);
     }
-    
+
     #[test]
     fn test_extract_tagged_field_success() {
         // Create test data: [A0] 03 02 01 05 (context tag 0 containing INTEGER 5)
         let data = vec![0xA0, 0x03, 0x02, 0x01, 0x05, 0xFF, 0xFF];
-        
+
         let (value, remaining) = extract_tagged_field(&data, 0xA0).unwrap();
         assert_eq!(value.len(), 3);
-        assert_eq!(value[0], 0x02);  // INTEGER tag
+        assert_eq!(value[0], 0x02); // INTEGER tag
         assert_eq!(remaining.len(), 2);
         assert_eq!(remaining[0], 0xFF);
     }
-    
+
     #[test]
     fn test_extract_tagged_field_wrong_tag() {
         let data = vec![0xA0, 0x03, 0x02, 0x01, 0x05];
-        
+
         let result = extract_tagged_field(&data, 0xA1);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Expected tag"));
     }
 }
-

@@ -106,7 +106,10 @@ pub fn general_string(s: &str) -> Vec<u8> {
 /// (RFC 4120 §5.2.3).
 pub fn time(unix: i64) -> Vec<u8> {
     let dt = chrono::DateTime::from_timestamp(unix, 0).unwrap_or_default();
-    tlv(GENERALIZED_TIME, dt.format("%Y%m%d%H%M%SZ").to_string().as_bytes())
+    tlv(
+        GENERALIZED_TIME,
+        dt.format("%Y%m%d%H%M%SZ").to_string().as_bytes(),
+    )
 }
 
 /// The 32-bit flag BIT STRINGs (KDCOptions, APOptions, TicketFlags):
@@ -152,12 +155,17 @@ impl<'a> Reader<'a> {
                 if k > 4 || d.len() < 2 + k {
                     return err("bad long-form length");
                 }
-                let len = d[2..2 + k].iter().fold(0usize, |a, &b| (a << 8) | b as usize);
+                let len = d[2..2 + k]
+                    .iter()
+                    .fold(0usize, |a, &b| (a << 8) | b as usize);
                 (len, 2 + k)
             }
         };
         if d.len() - hdr < len {
-            return err(format!("tag {tag:#04x}: length {len} overruns {} octets", d.len() - hdr));
+            return err(format!(
+                "tag {tag:#04x}: length {len} overruns {} octets",
+                d.len() - hdr
+            ));
         }
         self.data = &d[hdr + len..];
         Ok((tag, &d[hdr..hdr + len]))
@@ -265,7 +273,9 @@ impl<'a> Fields<'a> {
     /// Unwrap `tag` (a SEQUENCE or APPLICATION tag), then parse the fields.
     pub fn parse_tagged(what: &'static str, tag: u8, data: &'a [u8]) -> Result<Self> {
         let mut r = Reader::new(data);
-        let c = r.expect(tag).map_err(|e| DerError(format!("{what}: {}", e.0)))?;
+        let c = r
+            .expect(tag)
+            .map_err(|e| DerError(format!("{what}: {}", e.0)))?;
         if tag & 0xE0 == 0x60 {
             Fields::parse(what, Reader::new(c).expect(SEQUENCE)?)
         } else {
@@ -285,7 +295,8 @@ impl<'a> Fields<'a> {
 
     /// The raw TLV inside field `n` (e.g. a Ticket to be re-sent verbatim).
     pub fn raw(&self, n: u8) -> Result<&'a [u8]> {
-        self.slots[n as usize].ok_or_else(|| DerError(format!("{}: missing field [{n}]", self.what)))
+        self.slots[n as usize]
+            .ok_or_else(|| DerError(format!("{}: missing field [{n}]", self.what)))
     }
 }
 
@@ -327,7 +338,18 @@ mod tests {
 
     #[test]
     fn integers_round_trip() {
-        for v in [0, 1, -1, 127, 128, -128, -129, 65535, i32::MIN as i64, u32::MAX as i64] {
+        for v in [
+            0,
+            1,
+            -1,
+            127,
+            128,
+            -128,
+            -129,
+            65535,
+            i32::MIN as i64,
+            u32::MAX as i64,
+        ] {
             assert_eq!(Reader::new(&int(v)).int().unwrap(), v);
         }
     }

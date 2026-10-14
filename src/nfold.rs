@@ -69,7 +69,10 @@ pub fn n_fold(input: &[u8], out_bits: usize) -> Vec<u8> {
         out_bits > 0 && out_bits % 8 == 0,
         "n-fold output length must be a positive multiple of 8 bits, got {out_bits}"
     );
-    assert!(!input.is_empty(), "n-fold of an empty octet string is undefined");
+    assert!(
+        !input.is_empty(),
+        "n-fold of an empty octet string is undefined"
+    );
 
     let out_len = out_bits / 8;
     let in_len = input.len();
@@ -409,7 +412,11 @@ mod tests {
         // of the input length." This holds only because copy 0 is UNROTATED,
         // so it is the cheapest check for the rotate-everything-including-the-
         // first-copy bug.
-        for input in [b"kerberos".as_slice(), b"01234567".as_slice(), b"Q".as_slice()] {
+        for input in [
+            b"kerberos".as_slice(),
+            b"01234567".as_slice(),
+            b"Q".as_slice(),
+        ] {
             for multiple in 1..=4 {
                 let out = n_fold(input, input.len() * 8 * multiple);
                 assert_eq!(
@@ -486,7 +493,9 @@ mod tests {
     #[test]
     fn production_rotation_agrees_with_an_independent_bitwise_rotation() {
         for len in 1..=40usize {
-            let input: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(37).wrapping_add(11)).collect();
+            let input: Vec<u8> = (0..len)
+                .map(|i| (i as u8).wrapping_mul(37).wrapping_add(11))
+                .collect();
             assert_eq!(
                 rotate_right_13(&input),
                 rot_bits(&input, 13, false),
@@ -549,11 +558,7 @@ mod tests {
         vec![
             (b"012345", 64, "be072631276b1955"),
             (b"password", 56, "78a07b6caf85fa"),
-            (
-                b"Rough Consensus, and Running Code",
-                64,
-                "bb6ed30870b7f0e0",
-            ),
+            (b"Rough Consensus, and Running Code", 64, "bb6ed30870b7f0e0"),
             (
                 b"password",
                 168,

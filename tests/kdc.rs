@@ -8,7 +8,9 @@
 //! decrypts our PA-ENC-TIMESTAMP, verifies our TGS-REQ authenticator and
 //! its checksum over the request body, and we decrypt what it sends back.
 
-use krb5::client::{KDC_ERR_C_PRINCIPAL_UNKNOWN, KDC_ERR_PREAUTH_FAILED, KDC_ERR_S_PRINCIPAL_UNKNOWN};
+use krb5::client::{
+    KDC_ERR_C_PRINCIPAL_UNKNOWN, KDC_ERR_PREAUTH_FAILED, KDC_ERR_S_PRINCIPAL_UNKNOWN,
+};
 use krb5::initiator::{GSS_C_CONF_FLAG, GSS_C_INTEG_FLAG, GSS_C_MUTUAL_FLAG};
 use krb5::{Credentials, InitiatorContext, KdcClient, KerberosContext, Keytab, Principal};
 
@@ -22,7 +24,11 @@ fn env() -> Option<Env> {
     let kdc = std::env::var("KRB5_TEST_KDC").ok()?;
     let realm = std::env::var("KRB5_TEST_REALM").unwrap_or_else(|_| "KRB5.TEST".into());
     let dir = std::env::var("KRB5_TEST_DIR").expect("KRB5_TEST_DIR");
-    Some(Env { client: KdcClient::new(realm.clone(), [kdc]), realm, dir })
+    Some(Env {
+        client: KdcClient::new(realm.clone(), [kdc]),
+        realm,
+        dir,
+    })
 }
 
 macro_rules! live {
@@ -57,7 +63,10 @@ fn establish(e: &Env, svc: &Credentials) {
     ini.step(&ap_rep).unwrap();
     assert!(ini.is_established());
 
-    let (ti, ta) = (ini.per_message_tokens().unwrap(), acc.per_message_tokens().unwrap());
+    let (ti, ta) = (
+        ini.per_message_tokens().unwrap(),
+        acc.per_message_tokens().unwrap(),
+    );
     let wrap = ti.emit_wrap(ini.send_seq(), b"to the server").unwrap();
     assert_eq!(ta.unwrap(&wrap).unwrap().message, b"to the server");
     let mic = ta.emit_mic(1, b"to the client").unwrap();
@@ -67,12 +76,18 @@ fn establish(e: &Env, svc: &Credentials) {
 #[test]
 fn password_login_with_preauth_then_a_service_ticket() {
     let e = live!();
-    let tgt = e.client.login_with_password(&e.p("alice"), "alicepw").unwrap();
+    let tgt = e
+        .client
+        .login_with_password(&e.p("alice"), "alicepw")
+        .unwrap();
     assert_eq!(tgt.client, e.p("alice"));
     assert_eq!(tgt.server, Principal::krbtgt(&e.realm));
     assert!(tgt.endtime > tgt.authtime);
 
-    let svc = e.client.service_ticket(&tgt, &e.p("host/svc.krb5.test")).unwrap();
+    let svc = e
+        .client
+        .service_ticket(&tgt, &e.p("host/svc.krb5.test"))
+        .unwrap();
     assert_eq!(svc.server.components, ["host", "svc.krb5.test"]);
     assert_eq!(svc.client, tgt.client);
     establish(&e, &svc);
@@ -118,26 +133,44 @@ fn each_requested_session_enctype_is_honoured() {
 #[test]
 fn keytab_login() {
     let e = live!();
-    let tgt = e.client.login_with_keytab(&e.p("robot"), &e.keytab("robot.keytab")).unwrap();
+    let tgt = e
+        .client
+        .login_with_keytab(&e.p("robot"), &e.keytab("robot.keytab"))
+        .unwrap();
     assert_eq!(tgt.client, e.p("robot"));
-    let svc = e.client.service_ticket(&tgt, &e.p("host/svc.krb5.test")).unwrap();
+    let svc = e
+        .client
+        .service_ticket(&tgt, &e.p("host/svc.krb5.test"))
+        .unwrap();
     establish(&e, &svc);
 }
 
 #[test]
 fn a_wrong_password_is_a_preauth_failure() {
     let e = live!();
-    let err = e.client.login_with_password(&e.p("alice"), "nope").unwrap_err();
+    let err = e
+        .client
+        .login_with_password(&e.p("alice"), "nope")
+        .unwrap_err();
     assert_eq!(err.kdc_code(), Some(KDC_ERR_PREAUTH_FAILED), "{err}");
 }
 
 #[test]
 fn unknown_principals_are_reported_by_code() {
     let e = live!();
-    let err = e.client.login_with_password(&e.p("nobody"), "x").unwrap_err();
+    let err = e
+        .client
+        .login_with_password(&e.p("nobody"), "x")
+        .unwrap_err();
     assert_eq!(err.kdc_code(), Some(KDC_ERR_C_PRINCIPAL_UNKNOWN), "{err}");
 
-    let tgt = e.client.login_with_password(&e.p("alice"), "alicepw").unwrap();
-    let err = e.client.service_ticket(&tgt, &e.p("host/missing.krb5.test")).unwrap_err();
+    let tgt = e
+        .client
+        .login_with_password(&e.p("alice"), "alicepw")
+        .unwrap();
+    let err = e
+        .client
+        .service_ticket(&tgt, &e.p("host/missing.krb5.test"))
+        .unwrap_err();
     assert_eq!(err.kdc_code(), Some(KDC_ERR_S_PRINCIPAL_UNKNOWN), "{err}");
 }

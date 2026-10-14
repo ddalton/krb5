@@ -65,7 +65,7 @@
 //! Appendix B *does* pin, as "Next IV") but deliberately do not build a
 //! stateful encrypt API on top of unverifiable ground.
 
-use aes::cipher::{generic_array::GenericArray, BlockDecrypt, BlockEncrypt, KeyInit};
+use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit, generic_array::GenericArray};
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use sha1::Sha1;
@@ -868,7 +868,11 @@ mod tests {
     /// take-from-the-end implementation gets wrong.
     #[test]
     fn rfc2202_tc5_hmac_sha1_96_is_the_leading_12_octets() {
-        let mac = hmac(Hash::Sha1, &h("0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c"), &[b"Test With Truncation"]);
+        let mac = hmac(
+            Hash::Sha1,
+            &h("0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c"),
+            &[b"Test With Truncation"],
+        );
         assert_eq!(hx(&mac), "4c1a03424b55e07fe7f27be1d58bb9324a9a5a04");
         assert_eq!(hx(&mac[..12]), "4c1a03424b55e07fe7f27be1");
     }
@@ -1125,8 +1129,8 @@ mod tests {
         let conf = h("7bca285e2fd4130fb55b1a5c83bc5b24");
         let pt = h("000102030405");
 
-        let ct = encrypt_with_confounder(Enctype::Aes128CtsHmacSha196, &ke, &ki, &conf, &pt)
-            .unwrap();
+        let ct =
+            encrypt_with_confounder(Enctype::Aes128CtsHmacSha196, &ke, &ki, &conf, &pt).unwrap();
         let tag = &ct[ct.len() - 12..];
         let c1 = &ct[..ct.len() - 12];
 
@@ -1149,7 +1153,10 @@ mod tests {
             let pt = vec![0xa5u8; len];
             let ct = encrypt(Enctype::Aes256CtsHmacSha196, &ke, &ki, &pt).unwrap();
             assert_eq!(ct.len(), len + 28, "length for plaintext of {len}");
-            assert_eq!(decrypt(Enctype::Aes256CtsHmacSha196, &ke, &ki, &ct).unwrap(), pt);
+            assert_eq!(
+                decrypt(Enctype::Aes256CtsHmacSha196, &ke, &ki, &ct).unwrap(),
+                pt
+            );
         }
     }
 
@@ -1490,8 +1497,14 @@ mod tests {
         let a = encrypt(Enctype::Aes128CtsHmacSha256128, &ke, &ki, pt).unwrap();
         let b = encrypt(Enctype::Aes128CtsHmacSha256128, &ke, &ki, pt).unwrap();
         assert_ne!(a, b, "identical ciphertexts mean no confounder");
-        assert_eq!(decrypt(Enctype::Aes128CtsHmacSha256128, &ke, &ki, &a).unwrap(), pt);
-        assert_eq!(decrypt(Enctype::Aes128CtsHmacSha256128, &ke, &ki, &b).unwrap(), pt);
+        assert_eq!(
+            decrypt(Enctype::Aes128CtsHmacSha256128, &ke, &ki, &a).unwrap(),
+            pt
+        );
+        assert_eq!(
+            decrypt(Enctype::Aes128CtsHmacSha256128, &ke, &ki, &b).unwrap(),
+            pt
+        );
     }
 
     // -- Negative paths ----------------------------------------------------

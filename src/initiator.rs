@@ -13,10 +13,10 @@
 //! that the per-message key and sets the AcceptorSubkey token flag.
 
 use crate::client::{
-    decode_encrypted_data, decode_key, encode_ap_req, encode_authenticator, ClientError, Credentials,
-    KrbError, Result,
+    ClientError, Credentials, KrbError, Result, decode_encrypted_data, decode_key, encode_ap_req,
+    encode_authenticator,
 };
-use crate::der::{self, app, Fields};
+use crate::der::{self, Fields, app};
 use crate::key::Key;
 use crate::token::{ContextKey, PerMessageTokens, Role};
 use rand::RngCore;
@@ -31,7 +31,9 @@ pub const GSS_C_CONF_FLAG: u32 = 16;
 pub const GSS_C_INTEG_FLAG: u32 = 32;
 
 /// DER of the Kerberos 5 mechanism OID 1.2.840.113554.1.2.2.
-const KRB5_MECH_OID: [u8; 11] = [0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x12, 0x01, 0x02, 0x02];
+const KRB5_MECH_OID: [u8; 11] = [
+    0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x12, 0x01, 0x02, 0x02,
+];
 
 const TOK_AP_REQ: [u8; 2] = [0x01, 0x00];
 const TOK_AP_REP: [u8; 2] = [0x02, 0x00];
@@ -68,7 +70,9 @@ impl InitiatorContext {
     /// ignored. Returns the context and the token to send to the acceptor.
     pub fn new(creds: &Credentials, flags: u32) -> Result<(Self, Vec<u8>)> {
         let flags = flags & !GSS_C_DELEG_FLAG;
-        let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+        let d = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
         let (ctime, cusec) = (d.as_secs() as i64, d.subsec_micros());
         let subkey = Key::random(creds.session_key.enctype())?;
         // MIT keeps the initial sequence number below 2^30 so wraparound
@@ -86,7 +90,12 @@ impl InitiatorContext {
         let enc_auth = creds.session_key.encrypt(KU_AP_REQ_AUTH, &authenticator)?;
         let mutual = flags & GSS_C_MUTUAL_FLAG != 0;
         let ap_options = if mutual { AP_OPTS_MUTUAL_REQUIRED } else { 0 };
-        let ap_req = encode_ap_req(ap_options, &creds.ticket, creds.session_key.enctype(), &enc_auth);
+        let ap_req = encode_ap_req(
+            ap_options,
+            &creds.ticket,
+            creds.session_key.enctype(),
+            &enc_auth,
+        );
 
         let ctx = InitiatorContext {
             session_key: creds.session_key.clone(),
@@ -106,18 +115,26 @@ impl InitiatorContext {
     /// authentication was requested).
     pub fn step(&mut self, token: &[u8]) -> Result<()> {
         if self.established {
-            return Err(ClientError::Protocol("context is already established".into()));
+            return Err(ClientError::Protocol(
+                "context is already established".into(),
+            ));
         }
         let (tok_id, inner) = unframe(token)?;
         match tok_id {
             TOK_AP_REP => {}
             TOK_ERROR => return Err(KrbError::parse(inner)?.into_error()),
-            other => return Err(ClientError::Protocol(format!("unexpected GSS token id {other:02x?}"))),
+            other => {
+                return Err(ClientError::Protocol(format!(
+                    "unexpected GSS token id {other:02x?}"
+                )));
+            }
         }
 
         let f = Fields::parse_tagged("AP-REP", app(15), inner)?;
         if f.get(0)?.int()? != 5 || f.get(1)?.int()? != 15 {
-            return Err(ClientError::Protocol("AP-REP pvno/msg-type mismatch".into()));
+            return Err(ClientError::Protocol(
+                "AP-REP pvno/msg-type mismatch".into(),
+            ));
         }
         let (_, cipher) = decode_encrypted_data(f.get(2)?)?;
         // RFC 4120 §5.5.2: the AP-REP is sealed with the ticket session
@@ -175,7 +192,8 @@ impl InitiatorContext {
             Some(k) => (k, true),
             None => (&self.subkey, false),
         };
-        let ck = ContextKey::new(key.enctype(), key.bytes()).map_err(|e| ClientError::Protocol(e.to_string()))?;
+        let ck = ContextKey::new(key.enctype(), key.bytes())
+            .map_err(|e| ClientError::Protocol(e.to_string()))?;
         Ok(PerMessageTokens::new(ck, Role::Initiator, acceptor_subkey))
     }
 }
@@ -215,28 +233,45 @@ fn unframe(token: &[u8]) -> Result<([u8; 2], &[u8])> {
 mod tests {
     use super::*;
     use crate::acceptor::{EncType, KerberosContext, Keytab, ServiceKey};
-    use crate::client::{encode_encrypted_data, encode_key, Principal};
+    use crate::client::{Principal, encode_encrypted_data, encode_key};
 
     /// Mint a service ticket as a KDC would: EncTicketPart sealed in the
     /// service key with usage 2.
-    fn mint(service_key: &Key, session_key: &Key, client: &Principal, service: &Principal) -> Credentials {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-        let enc_ticket_part = der::cons(app(3), &[der::seq(&[
-            der::field(0, der::flags32(0)),
-            der::field(1, encode_key(session_key)),
-            der::field(2, der::general_string(&client.realm)),
-            der::field(3, client.encode_name()),
-            der::field(4, der::seq(&[der::field(0, der::int(1)), der::field(1, der::octets(b""))])),
-            der::field(5, der::time(now)),
-            der::field(7, der::time(now + 3600)),
-        ])]);
+    fn mint(
+        service_key: &Key,
+        session_key: &Key,
+        client: &Principal,
+        service: &Principal,
+    ) -> Credentials {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let enc_ticket_part = der::cons(
+            app(3),
+            &[der::seq(&[
+                der::field(0, der::flags32(0)),
+                der::field(1, encode_key(session_key)),
+                der::field(2, der::general_string(&client.realm)),
+                der::field(3, client.encode_name()),
+                der::field(
+                    4,
+                    der::seq(&[der::field(0, der::int(1)), der::field(1, der::octets(b""))]),
+                ),
+                der::field(5, der::time(now)),
+                der::field(7, der::time(now + 3600)),
+            ])],
+        );
         let cipher = service_key.encrypt(2, &enc_ticket_part).unwrap();
-        let ticket = der::cons(app(1), &[der::seq(&[
-            der::field(0, der::int(5)),
-            der::field(1, der::general_string(&service.realm)),
-            der::field(2, service.encode_name()),
-            der::field(3, encode_encrypted_data(service_key.enctype(), &cipher)),
-        ])]);
+        let ticket = der::cons(
+            app(1),
+            &[der::seq(&[
+                der::field(0, der::int(5)),
+                der::field(1, der::general_string(&service.realm)),
+                der::field(2, service.encode_name()),
+                der::field(3, encode_encrypted_data(service_key.enctype(), &cipher)),
+            ])],
+        );
         Credentials {
             client: client.clone(),
             server: service.clone(),
@@ -292,7 +327,8 @@ mod tests {
                 let creds = mint(&service_key, &Key::random(et).unwrap(), &client, &service);
                 let kt = keytab_with(&service, &service_key);
 
-                let flags = GSS_C_INTEG_FLAG | GSS_C_CONF_FLAG | if mutual { GSS_C_MUTUAL_FLAG } else { 0 };
+                let flags =
+                    GSS_C_INTEG_FLAG | GSS_C_CONF_FLAG | if mutual { GSS_C_MUTUAL_FLAG } else { 0 };
                 let (mut ini, token) = InitiatorContext::new(&creds, flags).unwrap();
                 assert_eq!(ini.is_established(), !mutual);
 
@@ -309,7 +345,10 @@ mod tests {
                 let ini_t = ini.per_message_tokens().unwrap();
                 let acc_t = acc.per_message_tokens().unwrap();
                 let mic = ini_t.emit_mic(ini.send_seq(), b"hello").unwrap();
-                assert_eq!(acc_t.verify_mic(&mic, b"hello").unwrap().seq, ini.send_seq());
+                assert_eq!(
+                    acc_t.verify_mic(&mic, b"hello").unwrap().seq,
+                    ini.send_seq()
+                );
                 let wrap = acc_t.emit_wrap(7, b"secret").unwrap();
                 assert_eq!(ini_t.unwrap(&wrap).unwrap().message, b"secret");
             }
@@ -325,15 +364,24 @@ mod tests {
         let creds = mint(&sk, &session, &client, &service);
         let (mut ini, _) = InitiatorContext::new(&creds, GSS_C_MUTUAL_FLAG).unwrap();
 
-        let enc_part = der::cons(app(27), &[der::seq(&[
-            der::field(0, der::time(ini.ctime - 1)),
-            der::field(1, der::int(ini.cusec as i64)),
-        ])]);
-        let ap_rep = der::cons(app(15), &[der::seq(&[
-            der::field(0, der::int(5)),
-            der::field(1, der::int(15)),
-            der::field(2, encode_encrypted_data(18, &session.encrypt(12, &enc_part).unwrap())),
-        ])]);
+        let enc_part = der::cons(
+            app(27),
+            &[der::seq(&[
+                der::field(0, der::time(ini.ctime - 1)),
+                der::field(1, der::int(ini.cusec as i64)),
+            ])],
+        );
+        let ap_rep = der::cons(
+            app(15),
+            &[der::seq(&[
+                der::field(0, der::int(5)),
+                der::field(1, der::int(15)),
+                der::field(
+                    2,
+                    encode_encrypted_data(18, &session.encrypt(12, &enc_part).unwrap()),
+                ),
+            ])],
+        );
         let err = ini.step(&frame(TOK_AP_REP, &ap_rep)).unwrap_err();
         assert!(err.to_string().contains("MUT_FAIL"), "{err}");
         assert!(!ini.is_established());
@@ -348,17 +396,26 @@ mod tests {
         let (mut ini, _) = InitiatorContext::new(&creds, GSS_C_MUTUAL_FLAG).unwrap();
 
         let acc_sub = Key::random(20).unwrap();
-        let enc_part = der::cons(app(27), &[der::seq(&[
-            der::field(0, der::time(ini.ctime)),
-            der::field(1, der::int(ini.cusec as i64)),
-            der::field(2, encode_key(&acc_sub)),
-            der::field(3, der::int(12345)),
-        ])]);
-        let ap_rep = der::cons(app(15), &[der::seq(&[
-            der::field(0, der::int(5)),
-            der::field(1, der::int(15)),
-            der::field(2, encode_encrypted_data(20, &session.encrypt(12, &enc_part).unwrap())),
-        ])]);
+        let enc_part = der::cons(
+            app(27),
+            &[der::seq(&[
+                der::field(0, der::time(ini.ctime)),
+                der::field(1, der::int(ini.cusec as i64)),
+                der::field(2, encode_key(&acc_sub)),
+                der::field(3, der::int(12345)),
+            ])],
+        );
+        let ap_rep = der::cons(
+            app(15),
+            &[der::seq(&[
+                der::field(0, der::int(5)),
+                der::field(1, der::int(15)),
+                der::field(
+                    2,
+                    encode_encrypted_data(20, &session.encrypt(12, &enc_part).unwrap()),
+                ),
+            ])],
+        );
         ini.step(&frame(TOK_AP_REP, &ap_rep)).unwrap();
         assert!(ini.has_acceptor_subkey());
         assert_eq!(ini.recv_seq(), Some(12345));
@@ -367,6 +424,13 @@ mod tests {
         let ck = ContextKey::new(20, acc_sub.bytes()).unwrap();
         let acc_t = PerMessageTokens::new(ck, Role::Acceptor, true);
         let wrap = acc_t.emit_wrap(12345, b"via subkey").unwrap();
-        assert_eq!(ini.per_message_tokens().unwrap().unwrap(&wrap).unwrap().message, b"via subkey");
+        assert_eq!(
+            ini.per_message_tokens()
+                .unwrap()
+                .unwrap(&wrap)
+                .unwrap()
+                .message,
+            b"via subkey"
+        );
     }
 }

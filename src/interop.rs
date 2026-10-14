@@ -17,7 +17,7 @@
 //! in the session record — realm FLINT.TEST, one service principal per
 //! enctype so each ticket path is exercised.
 
-use crate::acceptor::{Keytab, KerberosContext};
+use crate::acceptor::{KerberosContext, Keytab};
 
 /// The fixtures are RECORDED, so their authenticators are as old as the
 /// file. Production uses the 5-minute default; replaying a capture needs
@@ -93,8 +93,12 @@ fn a_real_mic_from_mit_verifies() {
     let kt = keytab();
     let f = fixtures();
     for (label, e) in f.as_object().unwrap() {
-        let (ctx, _) = KerberosContext::accept_token_with_skew(&kt, &unhex(e["ap_req"].as_str().unwrap()), SKEW)
-            .unwrap_or_else(|err| panic!("etype {label}: {err}"));
+        let (ctx, _) = KerberosContext::accept_token_with_skew(
+            &kt,
+            &unhex(e["ap_req"].as_str().unwrap()),
+            SKEW,
+        )
+        .unwrap_or_else(|err| panic!("etype {label}: {err}"));
         let tokens = ctx
             .per_message_tokens()
             .unwrap_or_else(|err| panic!("etype {label}: {err}"));
@@ -121,8 +125,12 @@ fn a_real_wrap_token_from_mit_unwraps() {
     let kt = keytab();
     let f = fixtures();
     for (label, e) in f.as_object().unwrap() {
-        let (ctx, _) = KerberosContext::accept_token_with_skew(&kt, &unhex(e["ap_req"].as_str().unwrap()), SKEW)
-            .unwrap_or_else(|err| panic!("etype {label}: {err}"));
+        let (ctx, _) = KerberosContext::accept_token_with_skew(
+            &kt,
+            &unhex(e["ap_req"].as_str().unwrap()),
+            SKEW,
+        )
+        .unwrap_or_else(|err| panic!("etype {label}: {err}"));
         let tokens = ctx.per_message_tokens().unwrap();
         let msg = unhex(e["message"].as_str().unwrap());
 
@@ -160,9 +168,12 @@ fn an_ap_rep_is_sent_only_when_mutual_auth_is_requested() {
     let m = fixtures_mutual();
     let mut with = 0;
     for (label, e) in m.as_object().unwrap() {
-        let (_ctx, ap_rep) =
-            KerberosContext::accept_token_with_skew(&kt, &unhex(e["ap_req"].as_str().unwrap()), SKEW)
-                .unwrap_or_else(|err| panic!("etype {label}: {err}"));
+        let (_ctx, ap_rep) = KerberosContext::accept_token_with_skew(
+            &kt,
+            &unhex(e["ap_req"].as_str().unwrap()),
+            SKEW,
+        )
+        .unwrap_or_else(|err| panic!("etype {label}: {err}"));
         assert!(
             !ap_rep.is_empty(),
             "etype {label}: MUTUAL-REQUIRED was set and no AP-REP came back"
@@ -174,9 +185,12 @@ fn an_ap_rep_is_sent_only_when_mutual_auth_is_requested() {
     let n = fixtures();
     let mut without = 0;
     for (label, e) in n.as_object().unwrap() {
-        let (_ctx, ap_rep) =
-            KerberosContext::accept_token_with_skew(&kt, &unhex(e["ap_req"].as_str().unwrap()), SKEW)
-                .unwrap_or_else(|err| panic!("etype {label}: {err}"));
+        let (_ctx, ap_rep) = KerberosContext::accept_token_with_skew(
+            &kt,
+            &unhex(e["ap_req"].as_str().unwrap()),
+            SKEW,
+        )
+        .unwrap_or_else(|err| panic!("etype {label}: {err}"));
         assert!(
             ap_rep.is_empty(),
             "etype {label}: an AP-REP was sent unasked — the shipped bug"

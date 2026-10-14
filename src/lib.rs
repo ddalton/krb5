@@ -78,18 +78,17 @@ pub mod acceptor;
 pub mod client;
 mod der;
 pub mod initiator;
-pub mod kdf;     // RFC 3961 §5.1 DR/DK, RFC 3962 §4, RFC 8009 §3
+pub mod kdf; // RFC 3961 §5.1 DR/DK, RFC 3962 §4, RFC 8009 §3
 pub mod key;
-pub mod nfold;   // RFC 3961 §5.1 n-fold
+pub mod nfold; // RFC 3961 §5.1 n-fold
 pub mod profile; // RFC 3961 §5.3 simplified profile (confounder + HMAC)
-pub mod token;   // RFC 4121 §4.2 per-message Wrap and MIC tokens
+pub mod token; // RFC 4121 §4.2 per-message Wrap and MIC tokens
 
 #[cfg(test)]
 mod interop; // MIT krb5 interop fixtures — the gate vectors cannot close
 
 pub use acceptor::{
-    EncType, KerberosContext, KerberosError, Keytab, Result, ServiceKey,
-    DEFAULT_CLOCK_SKEW_SECS,
+    DEFAULT_CLOCK_SKEW_SECS, EncType, KerberosContext, KerberosError, Keytab, Result, ServiceKey,
 };
 pub use client::{ClientError, Credentials, KdcClient, Principal};
 pub use initiator::InitiatorContext;

@@ -79,7 +79,8 @@ impl Key {
     }
 
     fn derived(&self, usage: u32, which: KeyUse) -> Result<Vec<u8>, KeyError> {
-        kdf::derive_key(self.enctype, &self.bytes, usage, which).map_err(|e| KeyError(e.to_string()))
+        kdf::derive_key(self.enctype, &self.bytes, usage, which)
+            .map_err(|e| KeyError(e.to_string()))
     }
 
     fn profile(&self) -> profile::Enctype {
@@ -120,9 +121,15 @@ impl Key {
     }
 
     /// Constant-time `verify_mic`.
-    pub fn verify_checksum(&self, usage: u32, message: &[u8], tag: &[u8]) -> Result<bool, KeyError> {
+    pub fn verify_checksum(
+        &self,
+        usage: u32,
+        message: &[u8],
+        tag: &[u8],
+    ) -> Result<bool, KeyError> {
         let kc = self.derived(usage, KeyUse::Checksum)?;
-        profile::verify_checksum(self.profile(), &kc, message, tag).map_err(|e| KeyError(e.to_string()))
+        profile::verify_checksum(self.profile(), &kc, message, tag)
+            .map_err(|e| KeyError(e.to_string()))
     }
 }
 
@@ -131,14 +138,22 @@ mod tests {
     use super::*;
 
     fn hex(s: &str) -> Vec<u8> {
-        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
     }
 
     #[test]
     fn rfc3962_password_key_matches_the_published_vector() {
         // RFC 3962 Appendix B, iteration count 1200, 256-bit key.
-        let k = Key::from_password(18, "password", b"ATHENA.MIT.EDUraeburn", Some(1200u32.to_be_bytes()))
-            .unwrap();
+        let k = Key::from_password(
+            18,
+            "password",
+            b"ATHENA.MIT.EDUraeburn",
+            Some(1200u32.to_be_bytes()),
+        )
+        .unwrap();
         assert_eq!(
             k.bytes(),
             hex("55a6ac740ad17b4846941051e1e8b0a7548d93b0ab30a8bc3ff16280382b8c2a")
