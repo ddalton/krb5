@@ -7,6 +7,23 @@ may break the API).
 
 ## [Unreleased]
 
+### Added
+
+- KDC discovery through DNS, as MIT's `locate_kdc.c` does when
+  `[realms] REALM kdc` lists nothing and `dns_lookup_kdc` allows it:
+  URI records at `_kerberos.REALM` (`krb5srv:...:tcp:host`), then SRV
+  records at `_kerberos._tcp.REALM`, ordered by priority. Because the
+  client is TCP-only, `udp` URI entries and `_kerberos._udp` SRV records
+  are used over TCP when nothing else is published (ATHENA.MIT.EDU
+  publishes only `_udp`). `KdcClient::from_config` and `discover` use
+  it; `from_config_with_resolver` takes a resolver of the caller's.
+- `dns::Resolver`, a small stub resolver (no new dependencies): the
+  nameservers, `timeout:` and `attempts:` of `/etc/resolv.conf`, UDP
+  with TCP retry on truncation, replies matched by ID, question and
+  source.
+- `KdcClient::kdcs`.
+- `ConfigError::NoKdcFound` and `ConfigError::Dns`.
+
 ## [0.4.0] - 2026-10-14
 
 ### Added

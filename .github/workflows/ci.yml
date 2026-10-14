@@ -49,6 +49,9 @@ jobs:
       - run: scripts/test-kdc.sh "$RUNNER_TEMP/krb5test"
       - run: cat "$RUNNER_TEMP/krb5test/test.env" >> "$GITHUB_ENV"
       - run: cargo test --test kdc -- --nocapture
+        env:
+          # Also compare the DNS resolver with dig on public realms' records.
+          KRB5_TEST_DNS: "1"
       - run: cargo build --example gss_client
       - run: KRB5_CONFIG="$KRB5_TEST_DIR/krb5.conf" scripts/mit-acceptor.py "$KRB5_TEST_DIR" target/debug/examples/gss_client
       # KCM caches against sssd-kcm, the Fedora/RHEL default, with MIT's

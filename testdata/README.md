@@ -80,3 +80,17 @@ Regenerate against a realm from `scripts/test-kdc.sh`:
 ```sh
 scripts/make-ccache-fixtures.sh /tmp/krb5test testdata/ccache
 ```
+
+## `dns/` — DNS replies recorded from a real resolver
+
+Raw replies to SRV and URI queries for public realms' Kerberos records
+(ATHENA.MIT.EDU, FEDORAPROJECT.ORG, DEMO1.FREEIPA.ORG) and an NXDOMAIN,
+each beginning with its query ID. Consumed by `src/dns.rs`, whose tests
+parse them and replay them through a fake nameserver. Recorded with:
+
+```sh
+scripts/record-dns-fixtures.py testdata/dns [nameserver]
+```
+
+The script builds its queries itself, so the fixtures do not depend on the
+Rust encoder they are used to test.

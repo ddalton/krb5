@@ -16,8 +16,8 @@ tickets without shelling out to `kinit`.
   subkey, and build the AP-REP for mutual authentication.
 - **KDC client** — AS exchange with a password or keytab, including
   PA-ENC-TIMESTAMP pre-authentication and ETYPE-INFO2 salts; TGS exchange
-  for service tickets; TCP transport. KDCs come from `krb5.conf` or are
-  passed in directly.
+  for service tickets; TCP transport. KDCs come from `krb5.conf`, from DNS
+  (URI and SRV records, as MIT looks them up), or are passed in directly.
 - **Credential caches** — MIT's `FILE:` format (versions 1-4), `DIR:`
   collections, and `KCM:` (sssd-kcm, the Fedora/RHEL default, or
   Heimdal's `kcm`, over its Unix socket), so tickets move both ways between this crate and
@@ -34,8 +34,7 @@ tickets without shelling out to `kinit`.
   (`aes128-cts-hmac-sha256-128`, `aes256-cts-hmac-sha384-192`).
 - **Per-message tokens** — RFC 4121 §4.2 Wrap and MIC.
 
-Not implemented: a KDC, UDP, KDC discovery through DNS SRV records,
-cross-realm referrals, FAST, PKINIT, delegation, `KEYRING:` and `API:`
+Not implemented: a KDC, UDP, cross-realm referrals, FAST, PKINIT, delegation, `KEYRING:` and `API:`
 caches, and macOS's KCM, which is reached over Mach IPC rather than a
 socket (point `KRB5CCNAME` at a `FILE:` cache there).
 
@@ -61,7 +60,8 @@ use `accept_token_with_skew` to apply your own policy.
 use krb5::initiator::{GSS_C_INTEG_FLAG, GSS_C_MUTUAL_FLAG};
 use krb5::{InitiatorContext, KdcClient, Keytab, Principal};
 
-// KDCs from KRB5_CONFIG or /etc/krb5.conf ([realms] EXAMPLE.COM kdc = ...)
+// KDCs from KRB5_CONFIG or /etc/krb5.conf ([realms] EXAMPLE.COM kdc = ...),
+// else DNS (_kerberos URI, then _kerberos._tcp SRV records)
 let kdc = KdcClient::discover("EXAMPLE.COM")?;
 // or name them: KdcClient::new("EXAMPLE.COM", ["kdc1.example.com", "kdc2.example.com:88"])
 

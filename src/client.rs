@@ -12,8 +12,9 @@
 
 use crate::acceptor::Keytab;
 use crate::ccache::{CacheError, CacheName};
-use crate::config::{self, Krb5Conf};
+use crate::config::{self, ConfigError, Krb5Conf};
 use crate::der::{self, Fields, Reader, app};
+use crate::dns::{self, Resolver};
 use crate::key::{Key, KeyError};
 use rand::RngCore;
 use std::fmt;
@@ -299,15 +300,61 @@ impl KdcClient {
         }
     }
 
-    /// A client for `realm` using the KDCs listed for it in `conf`
-    /// (`[realms] REALM kdc`), in order.
+    /// A client for `realm`, finding its KDCs as MIT does: the `kdc`
+    /// entries in `conf` (`[realms] REALM kdc`), else, if `dns_lookup_kdc`
+    /// allows, DNS URI and SRV records through the system resolver (see
+    /// [`crate::dns`]).
     pub fn from_config(conf: &Krb5Conf, realm: &str) -> config::Result<Self> {
-        Ok(KdcClient::new(realm, conf.kdcs(realm)?))
+        Self::locate(conf, realm, None)
+    }
+
+    /// [`KdcClient::from_config`] with DNS queries sent to `resolver`
+    /// instead of the servers in `/etc/resolv.conf`.
+    pub fn from_config_with_resolver(
+        conf: &Krb5Conf,
+        realm: &str,
+        resolver: &Resolver,
+    ) -> config::Result<Self> {
+        Self::locate(conf, realm, Some(resolver))
+    }
+
+    fn locate(conf: &Krb5Conf, realm: &str, resolver: Option<&Resolver>) -> config::Result<Self> {
+        match conf.kdcs(realm) {
+            Ok(kdcs) => return Ok(KdcClient::new(realm, kdcs)),
+            // Entries this crate cannot use are not "none": MIT would use
+            // them and not ask DNS, so neither do we.
+            Err(ConfigError::NoKdcs { skipped, .. }) if skipped.is_empty() => {}
+            Err(e) => return Err(e),
+        }
+        let dns = dns::dns_lookup_kdc(conf);
+        if dns {
+            let dns_err = |source| ConfigError::Dns {
+                realm: realm.to_string(),
+                source,
+            };
+            let system;
+            let resolver = match resolver {
+                Some(r) => r,
+                None => {
+                    system = Resolver::system().map_err(dns_err)?;
+                    &system
+                }
+            };
+            let kdcs =
+                dns::locate_kdcs(resolver, realm, dns::dns_uri_lookup(conf)).map_err(dns_err)?;
+            if !kdcs.is_empty() {
+                debug!("{realm}: KDCs from DNS: {kdcs:?}");
+                return Ok(KdcClient::new(realm, kdcs));
+            }
+        }
+        Err(ConfigError::NoKdcFound {
+            realm: realm.to_string(),
+            dns,
+        })
     }
 
     /// A client for `realm` from the system configuration: the
-    /// `KRB5_CONFIG` files, else `/etc/krb5.conf`. DNS SRV lookup is not
-    /// implemented, so the realm must have `kdc` entries there.
+    /// `KRB5_CONFIG` files (else `/etc/krb5.conf`), then DNS.
     pub fn discover(realm: &str) -> config::Result<Self> {
         Self::from_config(&Krb5Conf::load_default()?, realm)
     }
@@ -337,6 +384,11 @@ impl KdcClient {
 
     pub fn realm(&self) -> &str {
         &self.realm
+    }
+
+    /// The KDC addresses this client tries, in order.
+    pub fn kdcs(&self) -> &[String] {
+        &self.kdcs
     }
 
     /// AS exchange with a password-derived key: `kinit`.

@@ -432,3 +432,131 @@ fn kcm_we_use_a_cache_mit_wrote() {
     );
     let _ = mit(&e, &name, "kdestroy", &[], None);
 }
+
+// ------------------------------------------------------------ DNS discovery
+
+/// A one-record DNS server: SRV `_kerberos._tcp.<realm>.` -> `localhost.`
+/// on `port`, NXDOMAIN for anything else. Built by hand here so it shares
+/// no code with the resolver it is testing.
+fn srv_server(realm: &str, port: u16) -> std::net::SocketAddr {
+    let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let addr = sock.local_addr().unwrap();
+    let want = format!("_kerberos._tcp.{}.", realm.to_ascii_lowercase());
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 512];
+        while let Ok((n, from)) = sock.recv_from(&mut buf) {
+            let q = &buf[..n];
+            // Question name, as dotted lower case, and where it ends.
+            let (mut at, mut name) = (12, String::new());
+            while q[at] != 0 {
+                let l = q[at] as usize;
+                name.push_str(
+                    &String::from_utf8_lossy(&q[at + 1..at + 1 + l]).to_ascii_lowercase(),
+                );
+                name.push('.');
+                at += 1 + l;
+            }
+            let qend = at + 5;
+            let qtype = u16::from_be_bytes([q[at + 1], q[at + 2]]);
+            let mut r = q[..qend].to_vec();
+            r[2] = 0x81;
+            if name == want && qtype == 33 {
+                r[3] = 0x80;
+                r[7] = 1; // one answer
+                r.extend_from_slice(&[0xC0, 12, 0, 33, 0, 1, 0, 0, 0, 60]);
+                let mut rdata = vec![0, 0, 0, 0];
+                rdata.extend_from_slice(&port.to_be_bytes());
+                rdata.extend_from_slice(b"\x09localhost\x00");
+                r.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+                r.extend_from_slice(&rdata);
+            } else {
+                r[3] = 0x83; // NXDOMAIN
+            }
+            sock.send_to(&r, from).unwrap();
+        }
+    });
+    addr
+}
+
+/// No kdc in krb5.conf: the client finds the KDC through an SRV record,
+/// and the login works.
+#[test]
+fn a_kdc_found_through_dns_srv() {
+    let e = live!();
+    let port: u16 = std::env::var("KRB5_TEST_KDC")
+        .unwrap()
+        .rsplit(':')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let resolver = krb5::dns::Resolver::new(vec![srv_server(&e.realm, port)]);
+    let kdc = KdcClient::from_config_with_resolver(&krb5::Krb5Conf::empty(), &e.realm, &resolver)
+        .unwrap();
+    assert_eq!(kdc.kdcs(), [format!("localhost.:{port}")]);
+    let tgt = kdc.login_with_password(&e.p("alice"), "alicepw").unwrap();
+    assert_eq!(tgt.server, Principal::krbtgt(&e.realm));
+}
+
+/// Our resolver, through the system's nameservers, against dig, for
+/// public realms' real records. Needs the network: KRB5_TEST_DNS=1.
+#[test]
+fn dns_answers_agree_with_dig() {
+    use krb5::dns::{Record, Resolver};
+    if std::env::var_os("KRB5_TEST_DNS").is_none() {
+        eprintln!("KRB5_TEST_DNS not set; skipping");
+        return;
+    }
+    let r = Resolver::system().unwrap();
+    let cases = [
+        ("_kerberos._udp.athena.mit.edu.", 33u16, "SRV"),
+        ("_kerberos._tcp.fedoraproject.org.", 33, "SRV"),
+        ("_kerberos.fedoraproject.org.", 256, "URI"),
+        ("_kerberos.demo1.freeipa.org.", 256, "URI"),
+    ];
+    let mut compared = 0;
+    for (name, qtype, kind) in cases {
+        let dig = std::process::Command::new("dig")
+            .args(["+short", kind, name])
+            .output()
+            .expect("dig");
+        let mut want: Vec<String> = String::from_utf8(dig.stdout)
+            .unwrap()
+            .lines()
+            .map(|l| l.trim().to_ascii_lowercase())
+            .filter(|l| !l.is_empty())
+            .collect();
+        let mut got: Vec<String> = r
+            .query(name, qtype)
+            .unwrap()
+            .into_iter()
+            .map(|rec| match rec {
+                Record::Srv {
+                    priority,
+                    weight,
+                    port,
+                    target,
+                } => format!("{priority} {weight} {port} {target}"),
+                Record::Uri {
+                    priority,
+                    weight,
+                    target,
+                } => format!("{priority} {weight} \"{target}\"").to_ascii_lowercase(),
+            })
+            .collect();
+        want.sort();
+        got.sort();
+        assert_eq!(got, want, "{kind} {name}");
+        if want.is_empty() {
+            // Some resolver chains drop types they do not know (systemd-
+            // resolved behind Lima's DNS returns no URI records at all).
+            eprintln!("no {kind} for {name} through this resolver; nothing to compare");
+        } else {
+            compared += 1;
+        }
+    }
+    assert!(
+        compared > 0,
+        "no case had records; the test's names are stale"
+    );
+}

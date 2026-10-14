@@ -54,6 +54,16 @@ pub enum ConfigError {
     NoKdcs { realm: String, skipped: Vec<String> },
     #[error("[realms] {realm}: bad kdc entry {entry:?}")]
     BadKdc { realm: String, entry: String },
+    /// Neither krb5.conf nor DNS (`_kerberos` URI, `_kerberos._tcp` /
+    /// `_udp` SRV) names a KDC for the realm.
+    #[error("no KDC for {realm} in krb5.conf{}", if *dns { " or DNS" } else { " (DNS lookup is off: dns_lookup_kdc)" })]
+    NoKdcFound { realm: String, dns: bool },
+    /// The DNS lookup itself failed (no nameserver answered).
+    #[error("looking up the KDCs for {realm} in DNS: {source}")]
+    Dns {
+        realm: String,
+        source: std::io::Error,
+    },
 }
 
 fn origin(path: &Option<PathBuf>) -> String {
@@ -252,7 +262,7 @@ impl Krb5Conf {
 /// MIT `k5_parse_host_string`, minus the port-only form (which has no
 /// host and is an error for a KDC entry). Returns `host:port`, with an
 /// IPv6 address bracketed.
-fn parse_host_string(entry: &str, default_port: u16) -> Option<String> {
+pub(crate) fn parse_host_string(entry: &str, default_port: u16) -> Option<String> {
     if entry.is_empty() || entry.starts_with(':') || entry.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }

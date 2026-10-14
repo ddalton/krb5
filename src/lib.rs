@@ -16,7 +16,8 @@
 //!   credential caches, read and written, for tickets shared with `kinit`
 //!   and `klist`; [`KdcClient::service_ticket_cached`] is `kvno`.
 //! * [`Krb5Conf`] — `krb5.conf`, for the default realm, a realm's KDCs
-//!   ([`KdcClient::discover`]) and `[domain_realm]`.
+//!   ([`KdcClient::discover`]) and `[domain_realm]`; [`dns`] finds KDCs
+//!   from URI and SRV records when `krb5.conf` lists none.
 //! * [`InitiatorContext`] — `gss_init_sec_context`: the AP-REQ token and
 //!   verification of the acceptor's AP-REP.
 //!
@@ -25,7 +26,7 @@
 //! Supported enctypes are the four AES ones: 17/18
 //! (`aes{128,256}-cts-hmac-sha1-96`, RFC 3962) and 19/20
 //! (`aes128-cts-hmac-sha256-128`, `aes256-cts-hmac-sha384-192`, RFC 8009).
-//! Not implemented: a KDC, UDP transport, DNS SRV KDC discovery,
+//! Not implemented: a KDC, UDP transport,
 //! cross-realm referrals, FAST, PKINIT, delegation, KEYRING and API
 //! credential caches, and macOS's Mach-based KCM.
 //!
@@ -85,6 +86,7 @@ pub mod ccache; // FILE: and DIR: credential caches, MIT format
 pub mod client;
 pub mod config; // krb5.conf: default realm, KDCs, [domain_realm]
 mod der;
+pub mod dns; // KDC discovery: URI and SRV records, stub resolver
 pub mod initiator;
 pub mod kdf; // RFC 3961 §5.1 DR/DK, RFC 3962 §4, RFC 8009 §3
 pub mod key;
