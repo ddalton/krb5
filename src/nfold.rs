@@ -132,13 +132,13 @@ fn rotate_right_13(input: &[u8]) -> Vec<u8> {
     let bit_shift = r % 8;
 
     let mut out = vec![0u8; n];
-    for i in 0..n {
+    for (i, o) in out.iter_mut().enumerate() {
         // Output octet i takes its high (8 - bit_shift) bits from the octet
         // `byte_shift` to its left, and its low bit_shift bits from the octet
         // before that — both indices wrapping, because this is a rotation.
         let src = (i + n - byte_shift) % n;
         let prev = (src + n - 1) % n;
-        out[i] = if bit_shift == 0 {
+        *o = if bit_shift == 0 {
             input[src]
         } else {
             (input[src] >> bit_shift) | (input[prev] << (8 - bit_shift))

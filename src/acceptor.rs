@@ -1337,13 +1337,13 @@ fn parse_kerberos_time(data: &[u8]) -> Result<i64> {
     }
 
     // Validate ranges
-    if month < 1 || month > 12 {
+    if !(1..=12).contains(&month) {
         return Err(KerberosError::ParseError(format!(
             "Invalid month: {}",
             month
         )));
     }
-    if day < 1 || day > 31 {
+    if !(1..=31).contains(&day) {
         return Err(KerberosError::ParseError(format!("Invalid day: {}", day)));
     }
     if hour > 23 {
@@ -1549,7 +1549,7 @@ fn parse_der_tag_length(data: &[u8]) -> Result<(u8, usize, usize)> {
 
 /// Extract tagged field from ASN.1 SEQUENCE
 /// Returns (value_bytes, remaining_bytes)
-fn extract_tagged_field<'a>(data: &'a [u8], expected_tag: u8) -> Result<(&'a [u8], &'a [u8])> {
+fn extract_tagged_field(data: &[u8], expected_tag: u8) -> Result<(&[u8], &[u8])> {
     let (tag, length, header_size) = parse_der_tag_length(data)?;
 
     if tag != expected_tag {
@@ -1664,7 +1664,7 @@ impl KerberosContext {
             ));
         }
 
-        if &token[gss_content_start..gss_content_start + krb5_oid.len()] != &krb5_oid {
+        if token[gss_content_start..gss_content_start + krb5_oid.len()] != krb5_oid {
             return Err(KerberosError::ParseError(
                 "Not a Kerberos GSS token".to_string(),
             ));
@@ -1910,24 +1910,11 @@ impl KerberosContext {
         //   msg-type[1] INTEGER (15),
         //   enc-part[2] EncryptedData
         // }
-        let mut ap_rep_content = Vec::new();
-
-        // pvno[0] = 5
-        ap_rep_content.push(0xA0);
-        ap_rep_content.push(0x03);
-        ap_rep_content.push(0x02);
-        ap_rep_content.push(0x01);
-        ap_rep_content.push(0x05);
-
-        // msg-type[1] = 15
-        ap_rep_content.push(0xA1);
-        ap_rep_content.push(0x03);
-        ap_rep_content.push(0x02);
-        ap_rep_content.push(0x01);
-        ap_rep_content.push(0x0F);
-
-        // enc-part[2]
-        ap_rep_content.push(0xA2);
+        let mut ap_rep_content = vec![
+            0xA0, 0x03, 0x02, 0x01, 0x05, // pvno[0] = 5
+            0xA1, 0x03, 0x02, 0x01, 0x0F, // msg-type[1] = 15
+            0xA2, // enc-part[2]
+        ];
         Self::encode_length(&mut ap_rep_content, encrypted.len());
         ap_rep_content.extend_from_slice(&encrypted);
 
@@ -1960,124 +1947,17 @@ impl KerberosContext {
         Ok(token)
     }
 
-    /// Generate a minimal valid AP-REP token wrapped in GSS-API framing
-    ///
-    /// Structure:
-    /// - GSS-API Application tag `0x60`
-    /// - GSS OID for Kerberos (1.2.840.113554.1.2.2)
-    /// - Kerberos AP-REP message
-    #[allow(dead_code)]
-    fn generate_ap_rep_token() -> Result<Vec<u8>> {
-        let mut token = Vec::new();
-
-        // Kerberos OID: 1.2.840.113554.1.2.2 (RFC 1964)
-        let krb5_oid = vec![
-            0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02,
-        ];
-
-        // Generate minimal AP-REP (Application tag 15)
-        // AP-REP ::= [APPLICATION 15] SEQUENCE {
-        //   pvno[0] INTEGER (5),
-        //   msg-type[1] INTEGER (15),  -- AP-REP
-        //   enc-part[2] EncryptedData  -- minimal placeholder
-        // }
-        let ap_rep_inner = Self::encode_ap_rep_inner();
-
-        // Wrap in APPLICATION 15 tag
-        let mut ap_rep = Vec::new();
-        ap_rep.push(0x6F); // APPLICATION 15
-        Self::encode_length(&mut ap_rep, ap_rep_inner.len());
-        ap_rep.extend_from_slice(&ap_rep_inner);
-
-        // Calculate total length for GSS wrapper
-        let gss_content_len = krb5_oid.len() + TOK_ID_AP_REP.len() + ap_rep.len();
-
-        // GSS-API wrapper: APPLICATION 0 (0x60)
-        token.push(0x60);
-        Self::encode_length(&mut token, gss_content_len);
-        token.extend_from_slice(&krb5_oid);
-        token.extend_from_slice(TOK_ID_AP_REP);
-        token.extend_from_slice(&ap_rep);
-
-        debug!("Generated GSS-wrapped AP-REP: {} bytes", token.len());
-        Ok(token)
-    }
-
-    /// Encode the inner AP-REP structure
-    #[allow(dead_code)]
-    fn encode_ap_rep_inner() -> Vec<u8> {
-        let mut inner = Vec::new();
-
-        // SEQUENCE
-        let mut seq = Vec::new();
-
-        // pvno[0] INTEGER (5)
-        seq.push(0xA0); // Context tag 0
-        seq.push(0x03); // Length
-        seq.push(0x02); // INTEGER
-        seq.push(0x01); // Length 1
-        seq.push(0x05); // Value: 5
-
-        // msg-type[1] INTEGER (15 = AP-REP)
-        seq.push(0xA1); // Context tag 1
-        seq.push(0x03); // Length
-        seq.push(0x02); // INTEGER
-        seq.push(0x01); // Length 1
-        seq.push(0x0F); // Value: 15
-
-        // enc-part[2] EncryptedData (minimal placeholder)
-        // EncryptedData ::= SEQUENCE {
-        //   etype[0] INTEGER,
-        //   kvno[1] INTEGER OPTIONAL,
-        //   cipher[2] OCTET STRING
-        // }
-        let mut enc_part = Vec::new();
-
-        // etype[0] = 18 (AES256-CTS-HMAC-SHA1-96)
-        enc_part.push(0xA0); // Context tag 0
-        enc_part.push(0x03); // Length
-        enc_part.push(0x02); // INTEGER
-        enc_part.push(0x01); // Length 1
-        enc_part.push(0x12); // Value: 18
-
-        // cipher[2] = empty octet string (placeholder - would be encrypted in production)
-        enc_part.push(0xA2); // Context tag 2
-        enc_part.push(0x11); // Length (17 bytes for the OCTET STRING structure + 15 bytes data)
-        enc_part.push(0x04); // OCTET STRING
-        enc_part.push(0x0F); // Length (15 bytes of dummy encrypted data)
-        enc_part.extend_from_slice(&[0u8; 15]); // Placeholder encrypted data
-
-        // Wrap enc_part in SEQUENCE
-        let mut enc_part_seq = Vec::new();
-        enc_part_seq.push(0x30); // SEQUENCE
-        Self::encode_length(&mut enc_part_seq, enc_part.len());
-        enc_part_seq.extend_from_slice(&enc_part);
-
-        // Add enc-part to main sequence with context tag 2
-        seq.push(0xA2); // Context tag 2
-        Self::encode_length(&mut seq, enc_part_seq.len());
-        seq.extend_from_slice(&enc_part_seq);
-
-        // Wrap everything in SEQUENCE
-        inner.push(0x30); // SEQUENCE
-        Self::encode_length(&mut inner, seq.len());
-        inner.extend_from_slice(&seq);
-
-        inner
-    }
-
     /// Encode ASN.1 DER length
     fn encode_length(output: &mut Vec<u8>, length: usize) {
         if length < 128 {
             output.push(length as u8);
-        } else if length < 256 {
-            output.push(0x81); // Long form, 1 byte
-            output.push(length as u8);
-        } else {
-            output.push(0x82); // Long form, 2 bytes
-            output.push((length >> 8) as u8);
-            output.push((length & 0xFF) as u8);
+            return;
         }
+        // Long form: 0x80 | octet count, then the minimal big-endian octets.
+        let bytes = length.to_be_bytes();
+        let skip = bytes.iter().take_while(|&&b| b == 0).count();
+        output.push(0x80 | (bytes.len() - skip) as u8);
+        output.extend_from_slice(&bytes[skip..]);
     }
 }
 
@@ -2116,40 +1996,13 @@ mod tests {
     }
 
     #[test]
-    fn test_ap_rep_structure() {
-        // Test that AP-REP generation doesn't panic
-        let result = KerberosContext::generate_ap_rep_token();
-        assert!(result.is_ok());
-
-        let token = result.unwrap();
-
-        // Verify it's not empty
-        assert!(token.len() > 20, "AP-REP token should be substantial");
-
-        // Verify GSS-API wrapper (APPLICATION 0)
-        assert_eq!(token[0], 0x60, "Should start with GSS APPLICATION tag");
-
-        // Token should contain Kerberos OID
-        assert!(token.len() > 15, "Should have room for OID and AP-REP");
-    }
-
-    #[test]
-    fn test_ap_rep_contains_krb5_oid() {
-        let token = KerberosContext::generate_ap_rep_token().unwrap();
-
-        // Kerberos OID: 1.2.840.113554.1.2.2
-        // In DER: 06 09 2a 86 48 86 f7 12 01 02 02
-        let krb5_oid = vec![
-            0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02,
-        ];
-
-        // Check if the OID appears in the token
-        assert!(
-            token
-                .windows(krb5_oid.len())
-                .any(|window| window == krb5_oid.as_slice()),
-            "AP-REP should contain Kerberos OID"
-        );
+    fn test_encode_length_beyond_two_octets_is_not_truncated() {
+        let mut output = Vec::new();
+        KerberosContext::encode_length(&mut output, 0x01_0000);
+        assert_eq!(output, vec![0x83, 0x01, 0x00, 0x00]);
+        output.clear();
+        KerberosContext::encode_length(&mut output, 255);
+        assert_eq!(output, vec![0x81, 0xFF]);
     }
 
     #[test]
@@ -2297,17 +2150,6 @@ mod tests {
         data.extend_from_slice(time_str);
 
         assert!(parse_kerberos_time(&data).is_ok());
-    }
-
-    #[test]
-    fn test_ap_rep_has_application_tag() {
-        let token = KerberosContext::generate_ap_rep_token().unwrap();
-
-        // Find the AP-REP application tag (0x6F = APPLICATION 15)
-        assert!(
-            token.contains(&0x6F),
-            "Should contain APPLICATION 15 tag for AP-REP"
-        );
     }
 
     #[test]

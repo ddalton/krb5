@@ -273,6 +273,11 @@ impl Enctype {
 
 /// AES-192 is deliberately absent: it is not a Kerberos enctype, and accepting
 /// a 24-octet key here would silently admit the wrong-length Ki of enctype 20.
+///
+/// The variants differ in size (the AES-256 key schedule is larger), but an
+/// `Aes` lives for one operation on the stack; boxing it would only add an
+/// allocation.
+#[allow(clippy::large_enum_variant)]
 enum Aes {
     A128(aes::Aes128),
     A256(aes::Aes256),
@@ -1190,6 +1195,8 @@ mod tests {
 
     /// Asserts the AES output and the truncated HMAC separately before the
     /// concatenation, and that the tag lands OUTSIDE the encrypted region.
+    /// One argument per column of the vector table.
+    #[allow(clippy::too_many_arguments)]
     fn k3961_case(
         et: Enctype,
         ke: &str,
