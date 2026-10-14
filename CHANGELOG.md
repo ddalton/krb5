@@ -7,6 +7,8 @@ may break the API).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-14
+
 ### Added
 
 - The `[libdefaults]` settings MIT's clients read, applied by
@@ -211,7 +213,8 @@ Initial release: the GSS-API acceptor extracted from
 - RFC 3961 n-fold and DR/DK, RFC 3962 and RFC 8009 AES enctypes.
 - RFC 4121 Wrap and MIC tokens.
 
-[Unreleased]: https://github.com/ddalton/krb5/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/ddalton/krb5/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/ddalton/krb5/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/ddalton/krb5/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/ddalton/krb5/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/ddalton/krb5/compare/v0.3.0...v0.4.0
