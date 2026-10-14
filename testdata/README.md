@@ -65,3 +65,18 @@ scripts/import-mit-vectors.py <krb5>/src/lib/crypto/crypto_tests <commit> > test
 ```
 
 The script only reformats: every value is MIT's.
+
+## `ccache/` — credential caches written by MIT krb5
+
+`mit-v1.ccache` to `mit-v4.ccache` were written by MIT's `kinit` and
+`kvno` in each file format version (`ccache_type = 1..4`), each holding a
+TGT, a service ticket and MIT's `fast_avail` / `pa_type` config entries;
+`mit-vN.klist` is `klist -e -f` of each. Consumed by `src/ccache.rs`, whose
+tests include re-encoding `mit-v4.ccache` octet for octet. Like the
+keytab, the keys belong to a throwaway realm.
+
+Regenerate against a realm from `scripts/test-kdc.sh`:
+
+```sh
+scripts/make-ccache-fixtures.sh /tmp/krb5test testdata/ccache
+```

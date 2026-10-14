@@ -186,3 +186,163 @@ fn the_realms_krb5_conf_finds_the_kdc() {
     let tgt = kdc.login_with_password(&e.p("alice"), "alicepw").unwrap();
     assert_eq!(tgt.server, Principal::krbtgt(&e.realm));
 }
+
+// ------------------------------------------------- credential caches vs MIT
+
+/// True if `klist` on the PATH is MIT's. macOS ships Heimdal's in
+/// /usr/bin, which reads our files but formats its output differently and
+/// has no DIR: caches.
+fn mit_tools_installed() -> bool {
+    std::process::Command::new("klist")
+        .arg("-V")
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).starts_with("Kerberos 5 version"))
+}
+
+/// Run an MIT tool against the test realm, or `None` if MIT's tools are
+/// not installed (the cache tests then skip; CI installs krb5-user).
+fn mit(e: &Env, ccache: &str, cmd: &str, args: &[&str], stdin: Option<&str>) -> Option<String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    if !mit_tools_installed() {
+        return None;
+    }
+    let mut child = Command::new(cmd)
+        .args(args)
+        .env("KRB5_CONFIG", format!("{}/krb5.conf", e.dir))
+        .env("KRB5CCNAME", ccache)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    if let Some(input) = stdin {
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{cmd} {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Some(String::from_utf8(out.stdout).unwrap())
+}
+
+fn scratch(e: &Env, tag: &str) -> std::path::PathBuf {
+    let p = std::path::Path::new(&e.dir).join(format!("cc-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&p);
+    let _ = std::fs::remove_file(&p);
+    p
+}
+
+/// We log in and write the cache; MIT's klist reads it and MIT's kvno
+/// uses our TGT, appending its service ticket to our file, which we then
+/// read back.
+#[test]
+fn mit_tools_use_a_cache_we_wrote() {
+    let e = live!();
+    let path = scratch(&e, "ours");
+    let name = format!("FILE:{}", path.display());
+    let tgt = e
+        .client
+        .login_with_password(&e.p("alice"), "alicepw")
+        .unwrap();
+    krb5::CCache::with_credentials(&tgt).write(&path).unwrap();
+
+    let Some(listed) = mit(&e, &name, "klist", &[], None) else {
+        eprintln!("MIT's krb5 tools not on PATH; skipping");
+        return;
+    };
+    assert!(
+        listed.contains(&format!("Default principal: alice@{}", e.realm)),
+        "{listed}"
+    );
+    assert!(
+        listed.contains(&format!("krbtgt/{0}@{0}", e.realm)),
+        "{listed}"
+    );
+
+    mit(&e, &name, "kvno", &["svc18/svc.krb5.test"], None).unwrap();
+    let cc = krb5::CCache::read(&path).unwrap();
+    let svc = e.p("svc18/svc.krb5.test");
+    let st = cc.find(&svc, 0).expect("kvno's ticket is in our cache");
+    establish(&e, &st);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// MIT's kinit writes the cache; service_ticket_cached uses its TGT,
+/// stores the ticket, and MIT's klist then lists it.
+#[test]
+fn we_use_a_cache_mit_wrote() {
+    let e = live!();
+    let path = scratch(&e, "mit");
+    let name = format!("FILE:{}", path.display());
+    if mit(&e, &name, "kinit", &["alice"], Some("alicepw\n")).is_none() {
+        eprintln!("MIT's krb5 tools not on PATH; skipping");
+        return;
+    }
+    let cache = krb5::CacheName::parse(&name).unwrap();
+    let svc = e.p("svc18/svc.krb5.test");
+    let st = e.client.service_ticket_cached(&cache, &svc).unwrap();
+    establish(&e, &st);
+
+    let listed = mit(&e, &name, "klist", &[], None).unwrap();
+    assert!(listed.contains("svc18/svc.krb5.test@"), "{listed}");
+    // MIT's config entries survived our rewrite.
+    let cc = krb5::CCache::read(&path).unwrap();
+    assert!(
+        cc.config("pa_type", Some(&Principal::krbtgt(&e.realm)))
+            .is_some()
+    );
+
+    // Second call: served from the cache, same ticket.
+    let again = e.client.service_ticket_cached(&cache, &svc).unwrap();
+    assert_eq!(again.ticket, st.ticket);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A DIR: collection MIT created resolves through its primary file.
+#[test]
+fn a_dir_collection_mit_made() {
+    let e = live!();
+    let dir = scratch(&e, "dir");
+    let name = format!("DIR:{}", dir.display());
+    if mit(&e, &name, "kinit", &["alice"], Some("alicepw\n")).is_none() {
+        eprintln!("MIT's krb5 tools not on PATH; skipping");
+        return;
+    }
+    let cache = krb5::CacheName::parse(&name).unwrap();
+    let cc = cache.read().unwrap();
+    assert_eq!(cc.principal.to_string(), format!("alice@{}", e.realm));
+    let svc = e.p("svc18/svc.krb5.test");
+    e.client.service_ticket_cached(&cache, &svc).unwrap();
+    let listed = mit(&e, &name, "klist", &[], None).unwrap();
+    assert!(listed.contains("svc18/svc.krb5.test@"), "{listed}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// No TGT, no service ticket: the error says so instead of asking the KDC.
+#[test]
+fn an_expired_cache_reports_no_tgt() {
+    let e = live!();
+    let path = scratch(&e, "expired");
+    let mut tgt = e
+        .client
+        .login_with_password(&e.p("alice"), "alicepw")
+        .unwrap();
+    // Already over when written (and non-zero, which would mean removed).
+    tgt.endtime = tgt.authtime - 60;
+    krb5::CCache::with_credentials(&tgt).write(&path).unwrap();
+    let cache = krb5::CacheName::File(path.clone());
+    let err = e
+        .client
+        .service_ticket_cached(&cache, &e.p("svc18/svc.krb5.test"))
+        .unwrap_err();
+    assert!(matches!(err, krb5::ClientError::NoTgt { .. }), "{err}");
+    let _ = std::fs::remove_file(&path);
+}

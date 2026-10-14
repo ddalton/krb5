@@ -11,6 +11,7 @@
 //! FAST: the caller names the realm and its KDCs.
 
 use crate::acceptor::Keytab;
+use crate::ccache::{CCache, CacheError, CacheName};
 use crate::config::{self, Krb5Conf};
 use crate::der::{self, Fields, Reader, app};
 use crate::key::{Key, KeyError};
@@ -57,6 +58,7 @@ const MAX_REPLY: usize = 1 << 20;
 
 /// A client-side failure.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ClientError {
     /// The KDC answered with a KRB-ERROR.
     #[error("KDC error {code} ({}){}", kdc_error_name(*code), text.as_ref().map(|t| format!(": {t}")).unwrap_or_default())]
@@ -72,6 +74,11 @@ pub enum ClientError {
     /// KDC will accept.
     #[error("no usable key: {0}")]
     NoKey(String),
+    #[error("credential cache: {0}")]
+    Cache(#[from] CacheError),
+    /// The cache holds no unexpired ticket-granting ticket.
+    #[error("no valid TGT for {principal} in {cache} (run kinit)")]
+    NoTgt { principal: String, cache: String },
 }
 
 impl From<der::DerError> for ClientError {
@@ -354,6 +361,35 @@ impl KdcClient {
             )));
         }
         self.as_exchange(client, Secret::Keytab(keytab), have)
+    }
+
+    /// A ticket for `service` through the credential cache `cache`, as
+    /// `kvno` gets one: an unexpired ticket already cached is returned
+    /// as is; otherwise the cache's TGT buys one from the KDC, and it is
+    /// stored in the cache for next time.
+    ///
+    /// The cache is read again just before the new ticket is written, so
+    /// a ticket another process cached meanwhile is not dropped.
+    pub fn service_ticket_cached(
+        &self,
+        cache: &CacheName,
+        service: &Principal,
+    ) -> Result<Credentials> {
+        let path = cache.path()?;
+        let cc = CCache::read(&path)?;
+        let (now, _) = now();
+        if let Some(creds) = cc.find(service, now) {
+            return Ok(creds);
+        }
+        let tgt = cc.tgt(now).ok_or_else(|| ClientError::NoTgt {
+            principal: cc.principal.to_string(),
+            cache: cache.to_string(),
+        })?;
+        let creds = self.service_ticket(&tgt, service)?;
+        let mut cc = CCache::read(&path)?;
+        cc.store(&creds);
+        cc.write(&path)?;
+        Ok(creds)
     }
 
     /// TGS exchange: trade a TGT for a ticket to `service`.

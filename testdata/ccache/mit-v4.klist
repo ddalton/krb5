@@ -1,0 +1,10 @@
+Ticket cache: FILE:mit-v4.ccache
+Default principal: alice@KRB5.TEST
+
+Valid starting       Expires              Service principal
+10/14/2026 08:48:13  10/15/2026 08:48:13  krbtgt/KRB5.TEST@KRB5.TEST
+	renew until 10/14/2026 08:48:13, Flags: FRIA
+	Etype (skey, tkt): aes256-cts-hmac-sha1-96, aes256-cts-hmac-sha1-96 
+10/14/2026 08:48:13  10/15/2026 08:48:13  svc18/svc.krb5.test@KRB5.TEST
+	renew until 10/14/2026 08:48:13, Flags: FRAT
+	Etype (skey, tkt): aes256-cts-hmac-sha1-96, aes256-cts-hmac-sha1-96 

@@ -18,6 +18,11 @@ tickets without shelling out to `kinit`.
   PA-ENC-TIMESTAMP pre-authentication and ETYPE-INFO2 salts; TGS exchange
   for service tickets; TCP transport. KDCs come from `krb5.conf` or are
   passed in directly.
+- **Credential caches** — MIT's `FILE:` format (versions 1-4) and
+  `DIR:` collections, so tickets move both ways between this crate and
+  `kinit`, `klist`, `kvno` and other GSS programs. Default cache name as
+  MIT resolves it (`KRB5CCNAME`, `default_ccache_name`,
+  `/tmp/krb5cc_%{uid}`).
 - **krb5.conf** — MIT's profile format, parsed as MIT does (includes,
   final flags, `KRB5_CONFIG` lists): default realm, a realm's KDCs, and
   `[domain_realm]` host-to-realm mapping.
@@ -29,7 +34,9 @@ tickets without shelling out to `kinit`.
 - **Per-message tokens** — RFC 4121 §4.2 Wrap and MIC.
 
 Not implemented: a KDC, UDP, KDC discovery through DNS SRV records,
-cross-realm referrals, FAST, PKINIT, credential caches, delegation.
+cross-realm referrals, FAST, PKINIT, delegation, and the `KCM:`,
+`KEYRING:` and `API:` cache types (the defaults on Fedora/RHEL and macOS;
+point `KRB5CCNAME` at a `FILE:` or `DIR:` cache there).
 
 ## Server
 
@@ -68,6 +75,24 @@ let (mut ctx, token) = InitiatorContext::new(&creds, GSS_C_MUTUAL_FLAG | GSS_C_I
 // send `token`, receive the server's AP-REP:
 ctx.step(&ap_rep)?;
 let tokens = ctx.per_message_tokens()?;
+```
+
+With a credential cache, as `kinit` and `kvno` use one:
+
+```rust
+use krb5::{CCache, CacheName, KdcClient, Krb5Conf, Principal};
+
+let conf = Krb5Conf::load_default()?;
+let cache = CacheName::default(&conf)?; // KRB5CCNAME, else /tmp/krb5cc_<uid>
+
+// kinit: log in and write the cache
+let kdc = KdcClient::from_config(&conf, "EXAMPLE.COM")?;
+let tgt = kdc.login_with_password(&Principal::parse("alice@EXAMPLE.COM")?, "secret")?;
+cache.write(&CCache::with_credentials(&tgt))?;
+
+// kvno: a service ticket from the cache, or bought with its TGT and stored
+let service = Principal::parse("nfs/server.example.com@EXAMPLE.COM")?;
+let creds = kdc.service_ticket_cached(&cache, &service)?;
 ```
 
 `examples/gss_client.rs` is a complete client.

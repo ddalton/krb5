@@ -16,6 +16,21 @@ may break the API).
   `[domain_realm]` host-to-realm mapping.
 - `KdcClient::from_config` and `KdcClient::discover`, which take a realm's
   KDCs from `krb5.conf`.
+- Credential caches (`CCache`, `CacheName`): MIT's `FILE:` format,
+  versions 1-4 read and version 4 written, and `DIR:` collections.
+  Configuration entries, unknown header fields and entries with
+  unsupported enctypes are kept on rewrite. Caches are replaced by an
+  atomic rename rather than modified in place, so no file locking (and
+  no libc) is needed. The default name is resolved as MIT does
+  (`KRB5CCNAME`, `default_ccache_name` with `%{uid}`-style tokens,
+  `FILE:/tmp/krb5cc_%{uid}`).
+- `KdcClient::service_ticket_cached`: `kvno` against a credential cache.
+
+### Changed
+
+- **Breaking:** `ClientError` is `#[non_exhaustive]` and has new variants
+  `Cache` and `NoTgt`. The new `ConfigError` and `CacheError` are
+  `#[non_exhaustive]` too.
 
 ### Fixed
 

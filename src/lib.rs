@@ -12,6 +12,9 @@
 //! * [`KdcClient`] — the AS exchange (`kinit`, with a password or a
 //!   keytab, including PA-ENC-TIMESTAMP pre-authentication) and the TGS
 //!   exchange (service tickets), over TCP.
+//! * [`CCache`] / [`CacheName`] — MIT `FILE:` and `DIR:` credential
+//!   caches, read and written, for tickets shared with `kinit` and
+//!   `klist`; [`KdcClient::service_ticket_cached`] is `kvno`.
 //! * [`Krb5Conf`] — `krb5.conf`, for the default realm, a realm's KDCs
 //!   ([`KdcClient::discover`]) and `[domain_realm]`.
 //! * [`InitiatorContext`] — `gss_init_sec_context`: the AP-REQ token and
@@ -23,7 +26,8 @@
 //! (`aes{128,256}-cts-hmac-sha1-96`, RFC 3962) and 19/20
 //! (`aes128-cts-hmac-sha256-128`, `aes256-cts-hmac-sha384-192`, RFC 8009).
 //! Not implemented: a KDC, UDP transport, DNS SRV KDC discovery,
-//! cross-realm referrals, FAST, PKINIT, credential caches and delegation.
+//! cross-realm referrals, FAST, PKINIT, delegation, and the KCM, KEYRING
+//! and API credential cache types.
 //!
 //! # Evidence
 //!
@@ -77,6 +81,7 @@
 //! ```
 
 pub mod acceptor;
+pub mod ccache; // FILE: and DIR: credential caches, MIT format
 pub mod client;
 pub mod config; // krb5.conf: default realm, KDCs, [domain_realm]
 mod der;
@@ -95,6 +100,7 @@ mod mit_vectors; // MIT krb5's crypto_tests known answers, enctypes 17-20
 pub use acceptor::{
     DEFAULT_CLOCK_SKEW_SECS, EncType, KerberosContext, KerberosError, Keytab, Result, ServiceKey,
 };
+pub use ccache::{CCache, CacheError, CacheName};
 pub use client::{ClientError, Credentials, KdcClient, Principal};
 pub use config::{ConfigError, Krb5Conf};
 pub use initiator::InitiatorContext;

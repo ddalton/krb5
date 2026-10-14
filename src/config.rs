@@ -39,6 +39,7 @@ const MAX_INCLUDE_DEPTH: usize = 16;
 
 /// A `krb5.conf` that could not be read or used.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ConfigError {
     #[error("{}: {source}", path.display())]
     Io { path: PathBuf, source: io::Error },
