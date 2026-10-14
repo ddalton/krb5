@@ -7,6 +7,8 @@ may break the API).
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-14
+
 ### Added
 
 - KDC discovery through DNS, as MIT's `locate_kdc.c` does when
@@ -23,6 +25,14 @@ may break the API).
   source.
 - `KdcClient::kdcs`.
 - `ConfigError::NoKdcFound` and `ConfigError::Dns`.
+
+### Changed
+
+- When `krb5.conf` lists no `kdc` for the realm, `KdcClient::from_config`
+  and `discover` now query DNS (set `dns_lookup_kdc = false` to stop
+  that), and report finding nothing as `ConfigError::NoKdcFound` rather
+  than `ConfigError::NoKdcs`, which now means only that the realm's
+  `kdc` entries are all unusable.
 
 ## [0.4.0] - 2026-10-14
 
@@ -115,7 +125,8 @@ Initial release: the GSS-API acceptor extracted from
 - RFC 3961 n-fold and DR/DK, RFC 3962 and RFC 8009 AES enctypes.
 - RFC 4121 Wrap and MIC tokens.
 
-[Unreleased]: https://github.com/ddalton/krb5/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/ddalton/krb5/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/ddalton/krb5/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/ddalton/krb5/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/ddalton/krb5/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ddalton/krb5/compare/v0.1.0...v0.2.0
