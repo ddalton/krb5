@@ -1777,3 +1777,530 @@ mod pkinit {
         );
     }
 }
+
+// ------------------------------------------------------- kadmin, kpasswd
+
+/// kadmind as `scripts/test-kdc.sh` runs it: admin/admin may do anything,
+/// limited may only inquire and list.
+mod kadmin {
+    use super::*;
+    use krb5::kadmin::{AdminClient, Policy, PrincipalChanges, attributes};
+    use krb5::kpasswd;
+
+    macro_rules! kadm {
+        () => {{
+            let e = live!();
+            let Ok(server) = std::env::var("KRB5_TEST_KADMIN") else {
+                eprintln!("KRB5_TEST_KADMIN not set; skipping kadmin test");
+                return;
+            };
+            (e, server)
+        }};
+    }
+
+    fn admin(e: &Env, server: &str) -> AdminClient {
+        AdminClient::connect_with_password(&e.client, &e.p("admin/admin"), "adminpw", server)
+            .unwrap()
+    }
+
+    /// MIT's kadmin, as admin/admin, running `query`.
+    fn mit_kadmin(e: &Env, query: &str) -> Option<String> {
+        let cc = format!("FILE:{}", scratch(e, "kadmin-cc").display());
+        mit(
+            e,
+            &cc,
+            "kadmin",
+            &["-p", "admin/admin", "-w", "adminpw", "-q", query],
+            None,
+        )
+    }
+
+    /// A fresh name for this test run.
+    fn fresh(e: &Env, tag: &str) -> Principal {
+        e.p(&format!("{tag}{}", std::process::id()))
+    }
+
+    #[test]
+    fn connect_negotiates_and_reports_privileges() {
+        let (e, server) = kadm!();
+        let mut a = admin(&e, &server);
+        assert_eq!(
+            a.api_version(),
+            0x1234_5704,
+            "MIT 1.18+ speak API version 4"
+        );
+        let p = a.privileges().unwrap();
+        assert!(p.get() && p.add() && p.modify() && p.delete());
+        let mut l =
+            AdminClient::connect_with_password(&e.client, &e.p("limited"), "limitedpw", &server)
+                .unwrap();
+        // MIT's kadmind reports every privilege to everyone; what the ACL
+        // does not allow it refuses per operation, by name.
+        assert_eq!(l.privileges().unwrap(), p);
+        let err = l
+            .create_principal(
+                &fresh(&e, "denied"),
+                &PrincipalChanges::default(),
+                Some("x"),
+            )
+            .unwrap_err();
+        assert_eq!(
+            err.code().and_then(|c| c.name()),
+            Some("KADM5_AUTH_ADD"),
+            "{err}"
+        );
+        assert!(!l.list_principals("*").unwrap().is_empty());
+        // A wrong password never reaches kadmind.
+        assert!(
+            AdminClient::connect_with_password(&e.client, &e.p("admin/admin"), "wrong", &server)
+                .is_err()
+        );
+        a.close();
+    }
+
+    #[test]
+    fn getprinc_and_listprincs_agree_with_mit() {
+        let (e, server) = kadm!();
+        let mut a = admin(&e, &server);
+        let alice = a.get_principal(&e.p("alice")).unwrap();
+        assert_eq!(alice.principal, e.p("alice"));
+        assert!(alice.attributes & attributes::REQUIRES_PRE_AUTH != 0);
+        assert_eq!(alice.keys.len(), 4, "the four AES enctypes");
+        assert!(alice.keys.iter().all(|k| k.kvno == alice.kvno));
+        let err = a.get_principal(&e.p("nobody")).unwrap_err();
+        assert!(
+            err.code().is_some_and(|c| c.is_unknown_principal()),
+            "{err}"
+        );
+        let ours: Vec<String> = a
+            .list_principals("*")
+            .unwrap()
+            .iter()
+            .map(|p| p.to_string())
+            .collect();
+        if let Some(out) = mit_kadmin(&e, "listprincs") {
+            let theirs: Vec<&str> = out.lines().filter(|l| l.contains('@')).collect();
+            assert_eq!(ours, theirs);
+            let gp = mit_kadmin(&e, "getprinc alice").unwrap();
+            assert!(gp.contains(&format!("Key: vno {}", alice.kvno)), "{gp}");
+        }
+    }
+
+    /// Our addprinc, modprinc, cpw, renprinc and delprinc, each seen by
+    /// MIT's kadmin and kinit.
+    #[test]
+    fn principals_made_and_changed_here_are_what_mit_sees() {
+        let (e, server) = kadm!();
+        let mut a = admin(&e, &server);
+        let p = fresh(&e, "made");
+        let changes = PrincipalChanges {
+            max_life: Some(3600),
+            max_renewable_life: Some(7200),
+            ..PrincipalChanges::default()
+        };
+        a.create_principal(&p, &changes, Some("first-pw-1"))
+            .unwrap();
+        let err = a.create_principal(&p, &changes, Some("again")).unwrap_err();
+        assert_eq!(err.code().and_then(|c| c.name()), Some("KADM5_DUP"));
+        let tgt = e.client.login_with_password(&p, "first-pw-1").unwrap();
+        assert!(tgt.endtime - tgt.authtime <= 3600);
+        if let Some(out) = mit_kadmin(&e, &format!("getprinc {p}")) {
+            assert!(
+                out.contains("Maximum ticket life: 0 days 01:00:00"),
+                "{out}"
+            );
+        }
+
+        let entry = a.get_principal(&p).unwrap();
+        a.modify_principal(
+            &p,
+            &PrincipalChanges::default().with_attributes(&entry, attributes::DISALLOW_ALL_TIX, 0),
+        )
+        .unwrap();
+        assert!(
+            e.client.login_with_password(&p, "first-pw-1").is_err(),
+            "-allow_tix"
+        );
+        if let Some(out) = mit_kadmin(&e, &format!("getprinc {p}")) {
+            assert!(out.contains("DISALLOW_ALL_TIX"), "{out}");
+        }
+        let entry = a.get_principal(&p).unwrap();
+        a.modify_principal(
+            &p,
+            &PrincipalChanges::default().with_attributes(&entry, 0, attributes::DISALLOW_ALL_TIX),
+        )
+        .unwrap();
+
+        a.change_password(&p, "second-pw-2").unwrap();
+        e.client.login_with_password(&p, "second-pw-2").unwrap();
+        assert!(a.get_principal(&p).unwrap().kvno > entry.kvno);
+
+        let q = fresh(&e, "renamed");
+        a.rename_principal(&p, &q).unwrap();
+        assert!(
+            a.get_principal(&p)
+                .unwrap_err()
+                .code()
+                .unwrap()
+                .is_unknown_principal()
+        );
+        a.delete_principal(&q).unwrap();
+        if let Some(out) = mit_kadmin(&e, &format!("getprinc {q}")) {
+            assert!(!out.contains("Principal:"), "{out}");
+        }
+    }
+
+    /// addprinc -randkey, then ktadd: MIT's klist reads the keytab, and the
+    /// keys in it are the KDC's (a keytab login works). ktadd -norandkey
+    /// keeps them.
+    #[test]
+    fn random_keys_and_ktadd_make_a_keytab_mit_reads() {
+        let (e, server) = kadm!();
+        let mut a = admin(&e, &server);
+        let p =
+            Principal::parse_in_realm(&format!("svc/kt{}.krb5.test", std::process::id()), &e.realm)
+                .unwrap();
+        a.create_principal(&p, &PrincipalChanges::default(), None)
+            .unwrap();
+        let kt = scratch(&e, "ktadd");
+        let written = a.ktadd(&p, &kt, true).unwrap();
+        assert_eq!(written.len(), 4);
+        let kvno = written[0].kvno;
+        assert_eq!(a.get_principal(&p).unwrap().kvno, kvno);
+        let keytab = Keytab::load(&kt).unwrap();
+        e.client.login_with_keytab(&p, &keytab).unwrap();
+        if let Some(out) = mit(
+            &e,
+            "FILE:/dev/null",
+            "klist",
+            &["-k", "-e", &kt.display().to_string()],
+            None,
+        ) {
+            assert_eq!(out.matches(&p.to_string()).count(), 4, "{out}");
+            assert!(out.contains("aes256-cts-hmac-sha384-192"), "{out}");
+        }
+        // -norandkey: the same keys again, appended.
+        let again = a.ktadd(&p, &kt, false).unwrap();
+        assert!(again.iter().all(|k| k.kvno == kvno));
+        let mut keys: Vec<_> = written.iter().map(|k| k.key.clone()).collect();
+        let mut keys2: Vec<_> = again.iter().map(|k| k.key.clone()).collect();
+        keys.sort();
+        keys2.sort();
+        assert_eq!(keys, keys2);
+        assert_eq!(Keytab::load(&kt).unwrap().keys().len(), 8);
+        // randkey: new keys, a new kvno, and the old keytab no longer works.
+        let (kvno2, fresh_keys) = a.randomize_keys(&p).unwrap();
+        assert!(kvno2 > kvno && fresh_keys.len() == 4);
+        assert!(
+            e.client
+                .login_with_keytab(&p, &Keytab::load(&kt).unwrap())
+                .is_err()
+        );
+        a.delete_principal(&p).unwrap();
+    }
+
+    #[test]
+    fn policies_and_string_attributes_round_trip_with_mit() {
+        let (e, server) = kadm!();
+        let mut a = admin(&e, &server);
+        let name = format!("pol{}", std::process::id());
+        let pol = Policy {
+            name: name.clone(),
+            pw_min_length: 12,
+            pw_min_classes: 2,
+            pw_max_fail: 5,
+            pw_lockout_duration: 600,
+            ..Policy::default()
+        };
+        a.create_policy(&pol).unwrap();
+        let got = a.get_policy(&name).unwrap();
+        assert_eq!(
+            (got.pw_min_length, got.pw_min_classes, got.pw_max_fail),
+            (12, 2, 5)
+        );
+        assert!(a.list_policies("*").unwrap().contains(&name));
+        if let Some(out) = mit_kadmin(&e, &format!("getpol {name}")) {
+            assert!(out.contains("Minimum password length: 12"), "{out}");
+        }
+        a.modify_policy(&Policy {
+            pw_min_length: 14,
+            ..pol.clone()
+        })
+        .unwrap();
+        assert_eq!(a.get_policy(&name).unwrap().pw_min_length, 14);
+
+        // A principal under the policy: a short password is refused.
+        let p = fresh(&e, "pol");
+        let under = PrincipalChanges {
+            policy: Some(Some(name.clone())),
+            ..PrincipalChanges::default()
+        };
+        let err = a.create_principal(&p, &under, Some("short1A")).unwrap_err();
+        assert_eq!(
+            err.code().and_then(|c| c.name()),
+            Some("KADM5_PASS_Q_TOOSHORT"),
+            "{err}"
+        );
+        a.create_principal(&p, &under, Some("long-enough-Pw-1"))
+            .unwrap();
+        assert_eq!(
+            a.get_principal(&p).unwrap().policy.as_deref(),
+            Some(name.as_str())
+        );
+
+        a.set_string(&p, "session_enctypes", Some("aes256-cts"))
+            .unwrap();
+        assert_eq!(
+            a.get_strings(&p).unwrap(),
+            [("session_enctypes".into(), "aes256-cts".into())]
+        );
+        if let Some(out) = mit_kadmin(&e, &format!("getstrs {p}")) {
+            assert!(out.contains("session_enctypes: aes256-cts"), "{out}");
+            mit_kadmin(&e, &format!("setstr {p} require_auth otp"));
+            assert!(
+                a.get_strings(&p)
+                    .unwrap()
+                    .contains(&("require_auth".into(), "otp".into()))
+            );
+        }
+        a.set_string(&p, "session_enctypes", None).unwrap();
+        assert!(
+            !a.get_strings(&p)
+                .unwrap()
+                .iter()
+                .any(|(k, _)| k == "session_enctypes")
+        );
+
+        a.modify_principal(
+            &p,
+            &PrincipalChanges {
+                policy: Some(None),
+                ..PrincipalChanges::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(a.get_principal(&p).unwrap().policy, None);
+        a.delete_principal(&p).unwrap();
+        a.delete_policy(&name).unwrap();
+        assert!(a.get_policy(&name).is_err());
+    }
+
+    #[test]
+    fn kpasswd_changes_and_sets_passwords() {
+        let (e, server) = kadm!();
+        let kp = std::env::var("KRB5_TEST_KPASSWD").unwrap();
+        let mut a = admin(&e, &server);
+        let p = fresh(&e, "kpw");
+        a.create_principal(&p, &PrincipalChanges::default(), Some("kpw-old-1"))
+            .unwrap();
+
+        kpasswd::change_password(&e.client, &p, "kpw-old-1", "kpw-new-2", &kp).unwrap();
+        e.client.login_with_password(&p, "kpw-new-2").unwrap();
+        // MIT's kinit agrees.
+        let cc = format!("FILE:{}", scratch(&e, "kpw-mit").display());
+        mit(&e, &cc, "kinit", &[&p.to_string()], Some("kpw-new-2\n"));
+
+        // An administrator sets it (RFC 3244 set-password).
+        let svc = kpasswd::changepw_service(&e.realm);
+        let t = e
+            .client
+            .initial_ticket_with_password(&e.p("admin/admin"), "adminpw", &svc)
+            .unwrap();
+        kpasswd::set_password(&t, &p, "kpw-set-3", &kp).unwrap();
+        e.client.login_with_password(&p, "kpw-set-3").unwrap();
+        // limited may not set others' passwords.
+        let t = e
+            .client
+            .initial_ticket_with_password(&e.p("limited"), "limitedpw", &svc)
+            .unwrap();
+        let err = kpasswd::set_password(&t, &p, "kpw-no-4", &kp).unwrap_err();
+        assert!(matches!(err, kpasswd::Error::Refused { .. }), "{err}");
+
+        // Policy refusals come back with kadmind's reason.
+        let name = format!("kpwpol{}", std::process::id());
+        a.create_policy(&Policy {
+            name: name.clone(),
+            pw_min_length: 20,
+            ..Policy::default()
+        })
+        .unwrap();
+        a.modify_principal(
+            &p,
+            &PrincipalChanges {
+                policy: Some(Some(name.clone())),
+                ..PrincipalChanges::default()
+            },
+        )
+        .unwrap();
+        let err = kpasswd::change_password(&e.client, &p, "kpw-set-3", "short", &kp).unwrap_err();
+        match err {
+            kpasswd::Error::Refused { code, message } => {
+                assert_eq!(code, kpasswd::ResultCode::SoftError);
+                assert!(message.to_lowercase().contains("too short"), "{message}");
+            }
+            other => panic!("{other}"),
+        }
+        a.delete_principal(&p).unwrap();
+        a.delete_policy(&name).unwrap();
+    }
+
+    type Tamper = Box<dyn FnMut(usize, &mut Vec<u8>, &[Vec<u8>]) + Send>;
+
+    /// A TCP relay to `target` that passes each reply (the n-th on any
+    /// connection, the replies before it, untouched) through `tamper`.
+    /// Framing is a 4-octet length, RPC's last-fragment bit kept.
+    fn tamper_relay(target: String, mut tamper: Tamper) -> String {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let read = |s: &mut std::net::TcpStream| -> Option<(u32, Vec<u8>)> {
+                let mut h = [0u8; 4];
+                s.read_exact(&mut h).ok()?;
+                let h = u32::from_be_bytes(h);
+                let mut m = vec![0; (h & 0x7FFF_FFFF) as usize];
+                s.read_exact(&mut m).ok()?;
+                Some((h & 0x8000_0000, m))
+            };
+            let mut n = 0;
+            let mut history = Vec::new();
+            for c in l.incoming() {
+                let mut c = c.unwrap();
+                let mut up = std::net::TcpStream::connect(&target).unwrap();
+                while let Some((bit, req)) = read(&mut c) {
+                    up.write_all(&(bit | req.len() as u32).to_be_bytes())
+                        .unwrap();
+                    up.write_all(&req).unwrap();
+                    let Some((bit, rep)) = read(&mut up) else {
+                        break;
+                    };
+                    let mut out = rep.clone();
+                    tamper(n, &mut out, &history);
+                    history.push(rep);
+                    n += 1;
+                    c.write_all(&(bit | out.len() as u32).to_be_bytes())
+                        .unwrap();
+                    c.write_all(&out).unwrap();
+                }
+            }
+        });
+        addr
+    }
+
+    /// An accepted RPC reply's verifier octets and where its results start.
+    fn rpc_parts(rep: &[u8]) -> (std::ops::Range<usize>, usize) {
+        let len = u32::from_be_bytes(rep[16..20].try_into().unwrap()) as usize;
+        let end = 20 + len.div_ceil(4) * 4;
+        (20..20 + len, end + 4)
+    }
+
+    /// Replies 0 (the context), 1 (kadm5 INIT) and 2 (getprinc), each
+    /// altered so that exactly one check must catch it.
+    #[test]
+    fn rpcsec_gss_replies_are_bound_to_their_calls() {
+        let (e, server) = kadm!();
+        let ticket = e
+            .client
+            .initial_ticket_with_password(
+                &e.p("admin/admin"),
+                "adminpw",
+                &Principal::new(1, ["kadmin", "admin"], e.realm.clone()),
+            )
+            .unwrap();
+        let run = |t: Tamper| -> Result<(), String> {
+            let relay = tamper_relay(server.clone(), t);
+            let mut a = AdminClient::connect(&relay, &ticket).map_err(|e| e.to_string())?;
+            a.get_principal(&e.p("alice"))
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        };
+        run(Box::new(|_, _, _| {})).unwrap();
+        // The context's verifier (a MIC over the window), forged.
+        let err = run(Box::new(|n, r, _| {
+            if n == 0 {
+                let (v, _) = rpc_parts(r);
+                r[v.end - 1] ^= 1;
+            }
+        }))
+        .unwrap_err();
+        assert!(err.contains("context verifier"), "{err}");
+        // A reply's verifier (a MIC over its sequence number), forged.
+        let err = run(Box::new(|n, r, _| {
+            if n == 2 {
+                let (v, _) = rpc_parts(r);
+                r[v.end - 1] ^= 1;
+            }
+        }))
+        .unwrap_err();
+        assert!(err.contains("reply verifier"), "{err}");
+        // A reply for another call.
+        let err = run(Box::new(|n, r, _| {
+            if n == 2 {
+                r[3] ^= 1;
+            }
+        }))
+        .unwrap_err();
+        assert!(err.contains("another call"), "{err}");
+        // The right verifier around the previous call's sealed results.
+        let err = run(Box::new(|n, r, h| {
+            if n == 2 {
+                let (_, body) = rpc_parts(r);
+                let (_, old_body) = rpc_parts(&h[1]);
+                r.truncate(body);
+                r.extend_from_slice(&h[1][old_body..]);
+            }
+        }))
+        .unwrap_err();
+        assert!(err.contains("sequence number"), "{err}");
+    }
+
+    /// kpasswd: the AP-REP of an earlier exchange (same ticket, so it
+    /// decrypts) does not answer this one.
+    #[test]
+    fn kpasswd_replies_must_answer_this_request() {
+        let (e, server) = kadm!();
+        let kp = std::env::var("KRB5_TEST_KPASSWD").unwrap();
+        let mut a = admin(&e, &server);
+        let p = fresh(&e, "kpwmitm");
+        a.create_principal(&p, &PrincipalChanges::default(), Some("mitm-old-1"))
+            .unwrap();
+        let t = e
+            .client
+            .initial_ticket_with_password(&p, "mitm-old-1", &kpasswd::changepw_service(&e.realm))
+            .unwrap();
+        let relay = tamper_relay(
+            kp,
+            Box::new(|n, r, h| {
+                if n == 1 {
+                    // len(2) vno(2) ap-rep-len(2) AP-REP KRB-PRIV
+                    let ap = |m: &[u8]| usize::from(u16::from_be_bytes([m[4], m[5]]));
+                    let old_ap = &h[0][6..6 + ap(&h[0])];
+                    let priv_ = r[6 + ap(r)..].to_vec();
+                    let mut m = Vec::new();
+                    m.extend_from_slice(&((6 + old_ap.len() + priv_.len()) as u16).to_be_bytes());
+                    m.extend_from_slice(&r[2..4]);
+                    m.extend_from_slice(&(old_ap.len() as u16).to_be_bytes());
+                    m.extend_from_slice(old_ap);
+                    m.extend_from_slice(&priv_);
+                    *r = m;
+                }
+            }),
+        );
+        kpasswd::change_password_with_ticket(&t, "mitm-new-2", &relay).unwrap();
+        let err = kpasswd::change_password_with_ticket(&t, "mitm-new-3", &relay).unwrap_err();
+        assert!(err.to_string().contains("echo"), "{err}");
+        a.delete_principal(&p).unwrap();
+    }
+
+    /// The kadmin and kpasswd servers from krb5.conf, as MIT finds them.
+    #[test]
+    fn servers_come_from_krb5_conf() {
+        let (e, server) = kadm!();
+        let conf = krb5::Krb5Conf::load([format!("{}/krb5.conf", e.dir)]).unwrap();
+        assert_eq!(AdminClient::admin_server(&conf, &e.realm).unwrap(), server);
+        assert_eq!(
+            kpasswd::kpasswd_server(&conf, &e.realm).unwrap(),
+            std::env::var("KRB5_TEST_KPASSWD").unwrap()
+        );
+    }
+}

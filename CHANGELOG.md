@@ -7,6 +7,41 @@ may break the API).
 
 ## [Unreleased]
 
+### Added
+
+- `kadmin::AdminClient`: a client for MIT's `kadmind`, as `kadmin` uses it.
+  ONC RPC over TCP (program 2112), authenticated and encrypted by
+  RPCSEC_GSS (RFC 2203) with privacy, every reply's verifier and sealed
+  sequence number checked; the kadm5 API version negotiated down from 4
+  as MIT's client does. Principals: `get_principal`, `list_principals`,
+  `create_principal` (password or random keys), `modify_principal`
+  (`PrincipalChanges`, `attributes`), `rename_principal`,
+  `delete_principal`, `change_password`, `randomize_keys`,
+  `extract_keys`, `ktadd` (random or `-norandkey`); policies
+  (`get/list/create/modify/delete_policy`); string attributes
+  (`get_strings`, `set_string`); `privileges`. kadm5 error codes keep
+  MIT's names (`Kadm5Code`). `AdminClient::admin_server` reads
+  `admin_server` and `kadmind_port` from `krb5.conf`.
+- `kpasswd`: `change_password` (`kpasswd`: an initial ticket for
+  `kadmin/changepw` from the old password, then the new one in a
+  KRB-PRIV under a fresh subkey), `change_password_with_ticket`, and RFC
+  3244 `set_password` for administrators; the server's AP-REP must answer
+  this request, and its result text (Active Directory's packed policy
+  too) comes back on refusal. `kpasswd_server` finds the server as MIT
+  does. TCP first, then UDP.
+- `KdcClient::initial_ticket_with_password` / `initial_ticket_with_keytab`:
+  an AS exchange for a named service (`kinit -S`), for services that take
+  no TGS-issued ticket.
+- Keytab writing: `Keytab::new`, `add`, `to_bytes`, `save`, and
+  `Keytab::append_to` as `ktadd` appends; files created mode 0600.
+- `scripts/test-kdc.sh` runs `kadmind` too (kadmin and kpasswd), with an
+  admin principal and a restricted one.
+
+### Fixed
+
+- Keytabs: the 32-bit kvno MIT writes after the key is read, so a kvno
+  above 255 is no longer taken modulo 256.
+
 ## [0.7.1] - 2026-10-14
 
 ### Added

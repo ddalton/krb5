@@ -25,6 +25,12 @@
 # and KRB5_TEST_PKINIT_ECDH=1 for an MIT 1.22+ KDC. With
 # KRB5_TEST_PKINIT_EC_KDC=1 in the environment the KDC's key is P-256.
 #
+# kadmind serves KRB5.TEST on the next port (kadmin) and the one after
+# (kpasswd), with admin/admin (password adminpw) allowed everything,
+# extracting keys included, and limited (limitedpw) only to inquire and
+# list. kdc.pid holds both
+# daemons' process IDs.
+#
 # Writes <dir>/test.env with the KRB5_TEST_* variables the tests read.
 # The keys are random and the passwords are fixed strings: nothing here
 # protects anything.
@@ -32,13 +38,15 @@ set -euo pipefail
 
 DIR=$(mkdir -p "$1" && cd "$1" && pwd)
 PORT=${2:-18888}
+KADMIN_PORT=$((PORT + 1))
+KPASSWD_PORT=$((PORT + 2))
 REALM=${KRB5_TEST_REALM:-KRB5.TEST}
 XREALM=CROSS.TEST
 FREALM=FAR.TEST
 HOST=${KRB5_TEST_HOST:-127.0.0.1}
 PATH=$PATH:/usr/sbin:/usr/local/sbin
 
-if [ -f "$DIR/kdc.pid" ]; then kill "$(cat "$DIR/kdc.pid")" 2>/dev/null || true; fi
+if [ -f "$DIR/kdc.pid" ]; then kill $(cat "$DIR/kdc.pid") 2>/dev/null || true; fi
 rm -rf "${DIR:?}"/*
 
 ENCTYPES="aes256-cts-hmac-sha1-96 aes128-cts-hmac-sha1-96 aes256-cts-hmac-sha384-192 aes128-cts-hmac-sha256-128"
@@ -53,6 +61,8 @@ cat >"$DIR/krb5.conf" <<EOF
 [realms]
     $REALM = {
         kdc = 127.0.0.1:$PORT
+        admin_server = 127.0.0.1:$KADMIN_PORT
+        kpasswd_server = 127.0.0.1:$KPASSWD_PORT
     }
     $XREALM = {
         kdc = 127.0.0.1:$PORT
@@ -198,6 +208,8 @@ $(for r in $REALM $XREALM $FREALM; do cat <<REALM
         default_principal_flags = +preauth
         max_life = 1d
         max_renewable_life = 7d
+        kadmind_port = $KADMIN_PORT
+        kpasswd_port = $KPASSWD_PORT
 $(pkinit_kdc_conf "$r")
     }
 REALM
@@ -205,7 +217,10 @@ done)
 [logging]
     kdc = FILE:$DIR/kdc.log
 EOF
-: >"$DIR/kadm5.acl"
+cat >"$DIR/kadm5.acl" <<EOF
+admin/admin@$REALM admcilmpse
+limited@$REALM il
+EOF
 
 export KRB5_CONFIG=$DIR/krb5.conf KRB5_KDC_PROFILE=$DIR/kdc.conf
 for r in $REALM $XREALM $FREALM; do
@@ -227,6 +242,8 @@ k() { kr "$REALM" "$@"; }
 # does not require pre-authentication, and one per enctype so each
 # string-to-key path is exercised.
 k addprinc -pw alicepw alice
+k addprinc -pw adminpw admin/admin
+k addprinc -pw limitedpw limited
 k addprinc -pw bobpw -requires_preauth bob
 # A function, not $(case ...): bash 3.2 (macOS) cannot parse ;; inside $().
 enctype_number() {
@@ -268,11 +285,15 @@ kr "$FREALM" ktadd -k "$DIR/far.keytab" host/server.far.test
 kr "$FREALM" addprinc -randkey host/other.far.test
 kr "$FREALM" ktadd -k "$DIR/far.keytab" host/other.far.test
 
-krb5kdc -n -P "$DIR/kdc.pid" -r "$REALM" -r "$XREALM" -r "$FREALM" >"$DIR/kdc.out" 2>&1 &
+krb5kdc -n -r "$REALM" -r "$XREALM" -r "$FREALM" >"$DIR/kdc.out" 2>&1 &
 echo $! >"$DIR/kdc.pid"
-for _ in $(seq 50); do
-    if (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; then break; fi
-    sleep 0.1
+kadmind -nofork -r "$REALM" >"$DIR/kadmind.out" 2>&1 &
+echo $! >>"$DIR/kdc.pid"
+for p in "$PORT" "$KADMIN_PORT" "$KPASSWD_PORT"; do
+    for _ in $(seq 50); do
+        if (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null; then break; fi
+        sleep 0.1
+    done
 done
 
 cat >"$DIR/test.env" <<EOF
@@ -282,5 +303,7 @@ KRB5_TEST_DIR=$DIR
 KRB5_TEST_CROSS_REALMS="$XREALM $FREALM"
 KRB5_TEST_PKINIT=$PKINIT
 KRB5_TEST_PKINIT_ECDH=$ECDH
+KRB5_TEST_KADMIN=$HOST:$KADMIN_PORT
+KRB5_TEST_KPASSWD=$HOST:$KPASSWD_PORT
 EOF
-echo "KDC for $REALM listening on port $PORT (pid $(cat "$DIR/kdc.pid")); env in $DIR/test.env"
+echo "KDC for $REALM on port $PORT, kadmind on $KADMIN_PORT and $KPASSWD_PORT (pids $(tr '\n' ' ' <"$DIR/kdc.pid")); env in $DIR/test.env"

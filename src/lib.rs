@@ -16,6 +16,11 @@
 //! * `pkinit` (with the `pkinit` feature) — PKINIT: login with an X.509
 //!   certificate (`kinit -X`), anonymous PKINIT (`kinit -n`), and FAST
 //!   armor from it (`auto_fast_armor`), in pure Rust.
+//! * [`kadmin::AdminClient`] — `kadmin` against MIT's `kadmind`:
+//!   principals (`addprinc`, `getprinc`, `modprinc`, `cpw`, `ktadd`, ...),
+//!   policies and string attributes, over RPCSEC_GSS with privacy.
+//! * [`kpasswd`] — password changes (`kpasswd`) and RFC 3244 set-password,
+//!   to `kadmind` or Active Directory.
 //! * [`CCache`] / [`CacheName`] — MIT `FILE:`, `DIR:` and `KCM:`
 //!   credential caches, read and written, for tickets shared with `kinit`
 //!   and `klist`; [`KdcClient::service_ticket_cached`] is `kvno`.
@@ -91,8 +96,10 @@ pub mod config; // krb5.conf: default realm, KDCs, [domain_realm]
 mod der;
 pub mod dns; // KDC discovery: URI and SRV records, stub resolver
 pub mod initiator;
+pub mod kadmin; // kadmind's kadm5 RPC protocol: what kadmin does
 pub mod kdf; // RFC 3961 §5.1 DR/DK, RFC 3962 §4, RFC 8009 §3
 pub mod key;
+pub mod kpasswd; // password changes over the kpasswd protocol (RFC 3244)
 pub mod nfold; // RFC 3961 §5.1 n-fold
 #[cfg(feature = "pkinit")]
 pub mod pkinit; // RFC 4556 PKINIT, RFC 8062 anonymous PKINIT

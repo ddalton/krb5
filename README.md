@@ -33,6 +33,15 @@ tickets without shelling out to `kinit`.
   for DH and RSA, RustCrypto's `p256`/`p384`/`p521` for the curves.
   Identities from PEM files or PKCS #12 (`PKCS12:file.p12`, modern AES or
   legacy 3DES/RC2 encryption). Not yet: PKCS #11 (smart cards).
+- **kadmin** — a client for MIT's `kadmind` (the kadm5 RPC protocol over
+  RPCSEC_GSS, privacy-protected, API versions 2–4): principals (get,
+  list, create with a password or random keys, modify, rename, delete,
+  change password, randomize keys, extract keys, `ktadd` to a keytab),
+  policies, string attributes. Keytabs are written as MIT writes them.
+- **kpasswd** — password changes over the kpasswd protocol (port 464):
+  your own (`kpasswd`), and RFC 3244 set-password for an administrator,
+  to `kadmind` or Active Directory, with the server's reasons for a
+  refusal.
 - **Credential caches** — MIT's `FILE:` format (versions 1-4), `DIR:`
   collections, and `KCM:` (sssd-kcm, the Fedora/RHEL default, or
   Heimdal's `kcm`, over its Unix socket), so tickets move both ways between this crate and

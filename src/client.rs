@@ -835,6 +835,13 @@ impl KdcClient {
         client: &Principal,
         keytab: &Keytab,
     ) -> Result<(Credentials, AsInfo)> {
+        let have = self.keytab_enctypes(client, keytab)?;
+        self.as_exchange(client, Secret::Keytab(keytab), have)
+    }
+
+    /// The enctypes to ask for with `keytab`'s keys for `client`: only
+    /// those it holds, so the KDC cannot pick one the client has no key for.
+    fn keytab_enctypes(&self, client: &Principal, keytab: &Keytab) -> Result<Vec<i32>> {
         let have: Vec<i32> = self
             .tkt_enctypes
             .iter()
@@ -846,7 +853,7 @@ impl KdcClient {
                 "keytab has no AES key for {client}"
             )));
         }
-        self.as_exchange(client, Secret::Keytab(keytab), have)
+        Ok(have)
     }
 
     /// Trust `anchors` for KDC certificates, in place of the
@@ -953,6 +960,37 @@ impl KdcClient {
         )?;
         write_kinit_cache(cache, &creds, &info)?;
         Ok(creds)
+    }
+
+    /// An initial ticket for `service` from the AS exchange with a
+    /// password, as `kinit -S service` gets one: for services that take no
+    /// ticket bought with a TGT, such as `kadmin/admin` and
+    /// `kadmin/changepw` (see [`crate::kadmin`] and [`crate::kpasswd`]).
+    pub fn initial_ticket_with_password(
+        &self,
+        client: &Principal,
+        password: &str,
+        service: &Principal,
+    ) -> Result<Credentials> {
+        self.as_exchange_to(
+            client,
+            service,
+            Secret::Password(password),
+            self.tkt_enctypes.clone(),
+        )
+        .map(|(c, _)| c)
+    }
+
+    /// [`KdcClient::initial_ticket_with_password`] with a key from a keytab.
+    pub fn initial_ticket_with_keytab(
+        &self,
+        client: &Principal,
+        keytab: &Keytab,
+        service: &Principal,
+    ) -> Result<Credentials> {
+        let have = self.keytab_enctypes(client, keytab)?;
+        self.as_exchange_to(client, service, Secret::Keytab(keytab), have)
+            .map(|(c, _)| c)
     }
 
     /// A ticket for `service` through the credential cache `cache`, as
@@ -1134,13 +1172,27 @@ impl KdcClient {
         Ok(creds)
     }
 
+    /// The AS exchange for a TGT.
     fn as_exchange(
         &self,
         client: &Principal,
         secret: Secret<'_>,
         enctypes: Vec<i32>,
     ) -> Result<(Credentials, AsInfo)> {
-        let krbtgt = Principal::krbtgt(&client.realm);
+        self.as_exchange_to(client, &Principal::krbtgt(&client.realm), secret, enctypes)
+    }
+
+    /// The AS exchange for a ticket to `server`: a TGT, or an initial
+    /// ticket for a service that accepts no others (`kadmin/admin`,
+    /// `kadmin/changepw`), as `kinit -S` gets one.
+    fn as_exchange_to(
+        &self,
+        client: &Principal,
+        server: &Principal,
+        secret: Secret<'_>,
+        enctypes: Vec<i32>,
+    ) -> Result<(Credentials, AsInfo)> {
+        let krbtgt = server.clone();
         #[allow(unused_mut)]
         let mut kdc_options = self.as_options();
         #[cfg(feature = "pkinit")]
@@ -1163,7 +1215,7 @@ impl KdcClient {
                 return self
                     .clone()
                     .with_fast_armor(armor)
-                    .as_exchange(client, secret, enctypes);
+                    .as_exchange_to(client, server, secret, enctypes);
             }
         }
         // MIT's state: whether we armor, whether we may still upgrade to
@@ -1417,6 +1469,7 @@ impl KdcClient {
                         settings: &self.pkinit,
                         pa_value: value,
                         realm: &client.realm,
+                        server,
                         client,
                         as_req: &req,
                         enctype: rep.enc_etype,

@@ -272,6 +272,16 @@ impl Keytab {
             ));
         }
         let key = data[offset..offset + key_len].to_vec();
+        offset += key_len;
+        // MIT's 32-bit kvno after the key, when the 8-bit one overflowed;
+        // zero means "use the 8-bit one".
+        let kvno = match data.get(offset..offset + 4) {
+            Some(b) => match u32::from_be_bytes([b[0], b[1], b[2], b[3]]) {
+                0 => kvno,
+                k => k,
+            },
+            None => kvno,
+        };
 
         Ok(ServiceKey {
             principal,
@@ -280,6 +290,62 @@ impl Keytab {
             enctype,
             key,
         })
+    }
+
+    /// An empty keytab, to [`Keytab::add`] keys to.
+    pub fn new() -> Self {
+        Keytab { keys: Vec::new() }
+    }
+
+    /// Add a key.
+    pub fn add(&mut self, key: ServiceKey) {
+        self.keys.push(key);
+    }
+
+    /// The keytab file (format 0x0502) MIT writes for these keys.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = vec![0x05, 0x02];
+        for k in &self.keys {
+            out.extend(encode_entry(k));
+        }
+        out
+    }
+
+    /// Write the keytab to `path`, replacing any file there (mode 0600 on
+    /// Unix when the file is created).
+    pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        let mut f = create_private(path.as_ref(), true)?;
+        std::io::Write::write_all(&mut f, &self.to_bytes())?;
+        Ok(())
+    }
+
+    /// Append `keys` to the keytab at `path`, creating it if need be, as
+    /// `kadmin ktadd` does: entries already there are left alone.
+    pub fn append_to<P: AsRef<Path>>(path: P, keys: &[ServiceKey]) -> Result<()> {
+        let path = path.as_ref();
+        let existing = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(e.into()),
+        };
+        if existing.is_empty() {
+            let mut kt = Keytab::new();
+            for k in keys {
+                kt.add(k.clone());
+            }
+            return kt.save(path);
+        }
+        if existing.len() < 2 || existing[..2] != [0x05, 0x02] {
+            return Err(KerberosError::ParseError(format!(
+                "{} is not a version 0x0502 keytab",
+                path.display()
+            )));
+        }
+        let mut f = std::fs::OpenOptions::new().append(true).open(path)?;
+        for k in keys {
+            std::io::Write::write_all(&mut f, &encode_entry(k))?;
+        }
+        Ok(())
     }
 
     /// Find a service key for the given principal
@@ -351,6 +417,54 @@ impl Keytab {
     pub fn keys(&self) -> &[ServiceKey] {
         &self.keys
     }
+}
+
+impl Default for Keytab {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// One keytab entry, its length first: the principal (realm, then
+/// components), name type, timestamp, 8-bit kvno, enctype, key, and the
+/// 32-bit kvno, as MIT's `krb5_ktfileint_write_entry` lays them out.
+fn encode_entry(k: &ServiceKey) -> Vec<u8> {
+    let put16 = |v: &mut Vec<u8>, b: &[u8]| {
+        v.extend_from_slice(&(b.len() as u16).to_be_bytes());
+        v.extend_from_slice(b);
+    };
+    let components: Vec<&str> = k.principal.split('/').collect();
+    let mut e = Vec::new();
+    e.extend_from_slice(&(components.len() as u16).to_be_bytes());
+    put16(&mut e, k.realm.as_bytes());
+    for c in &components {
+        put16(&mut e, c.as_bytes());
+    }
+    e.extend_from_slice(&1u32.to_be_bytes()); // KRB5_NT_PRINCIPAL, as ktadd writes
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as u32)
+        .unwrap_or(0);
+    e.extend_from_slice(&now.to_be_bytes());
+    e.push(k.kvno as u8);
+    e.extend_from_slice(&(k.enctype.etype() as u16).to_be_bytes());
+    put16(&mut e, &k.key);
+    e.extend_from_slice(&k.kvno.to_be_bytes());
+    let mut out = (e.len() as i32).to_be_bytes().to_vec();
+    out.extend(e);
+    out
+}
+
+/// Open `path` for writing, created mode 0600 on Unix.
+fn create_private(path: &Path, truncate: bool) -> std::io::Result<File> {
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create(true).truncate(truncate);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    o.open(path)
 }
 
 /// GSS-API Kerberos context
@@ -2077,6 +2191,63 @@ impl KerberosContext {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn written_keytabs_read_back_with_32_bit_kvnos() {
+        let key = |kvno, et: EncType, b: u8| ServiceKey {
+            principal: "svc/h.a.org".into(),
+            realm: "A.ORG".into(),
+            kvno,
+            enctype: et,
+            key: vec![
+                b;
+                if et.etype() == 17 || et.etype() == 19 {
+                    16
+                } else {
+                    32
+                }
+            ],
+        };
+        let mut kt = Keytab::new();
+        kt.add(key(3, EncType::AES256CtsHmacSha196, 1));
+        kt.add(key(300, EncType::AES128CtsHmacSha196, 2));
+        let bytes = kt.to_bytes();
+        assert_eq!(&bytes[..2], &[0x05, 0x02]);
+        let back = Keytab::parse(&bytes).unwrap();
+        let k: Vec<_> = back
+            .keys()
+            .iter()
+            .map(|k| (k.principal.as_str(), k.realm.as_str(), k.kvno, k.key[0]))
+            .collect();
+        assert_eq!(
+            k,
+            [
+                ("svc/h.a.org", "A.ORG", 3, 1),
+                ("svc/h.a.org", "A.ORG", 300, 2)
+            ]
+        );
+
+        let dir = std::env::temp_dir().join(format!("krb5-kt-{}", std::process::id()));
+        let _ = std::fs::remove_file(&dir);
+        Keytab::append_to(&dir, &[key(1, EncType::AES256CtsHmacSha384192, 3)]).unwrap();
+        Keytab::append_to(&dir, &[key(2, EncType::AES128CtsHmacSha256128, 4)]).unwrap();
+        let both = Keytab::load(&dir).unwrap();
+        assert_eq!(
+            both.keys().iter().map(|k| k.kvno).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        std::fs::write(&dir, b"not a keytab").unwrap();
+        assert!(Keytab::append_to(&dir, &[key(1, EncType::AES256CtsHmacSha196, 0)]).is_err());
+        std::fs::remove_file(&dir).unwrap();
+    }
+
     use super::*;
 
     #[test]

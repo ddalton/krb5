@@ -561,9 +561,11 @@ pub(crate) struct ReplyInput<'a> {
     pub(crate) settings: &'a Settings,
     /// The PA-PK-AS-REP value.
     pub(crate) pa_value: &'a [u8],
-    /// The request's realm, client name as sent, and whole encoding.
+    /// The request's realm, client and server names as sent, and whole
+    /// encoding.
     pub(crate) realm: &'a str,
     pub(crate) client: &'a Principal,
+    pub(crate) server: &'a Principal,
     pub(crate) as_req: &'a [u8],
     /// The reply's enctype.
     pub(crate) enctype: i32,
@@ -639,14 +641,8 @@ impl Request {
                 } else {
                     r.client
                 };
-                let info = kdf::other_info(
-                    name,
-                    party_u,
-                    &Principal::krbtgt(r.realm),
-                    r.enctype,
-                    r.as_req,
-                    r.pa_value,
-                );
+                let info =
+                    kdf::other_info(name, party_u, r.server, r.enctype, r.as_req, r.pa_value);
                 kdf::sp800_56a(name, &z, &info, len).expect("an offered KDF")
             }
         };
@@ -802,6 +798,7 @@ mod tests {
             pa_value: &kdc.pa_value,
             realm: REALM,
             client,
+            server: &Principal::krbtgt(REALM),
             as_req: b"the AS-REQ",
             enctype: 18,
             now: NOW,
