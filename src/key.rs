@@ -120,6 +120,12 @@ impl Key {
         profile::checksum(self.profile(), &kc, message).map_err(|e| KeyError(e.to_string()))
     }
 
+    /// RFC 3961 `pseudo-random` (RFC 3962 §6 for 17/18, RFC 8009 §5 for
+    /// 19/20), keyed with this key directly.
+    pub fn prf(&self, input: &[u8]) -> Result<Vec<u8>, KeyError> {
+        kdf::prf(self.enctype, &self.bytes, input).map_err(|e| KeyError(e.to_string()))
+    }
+
     /// Constant-time `verify_mic`.
     pub fn verify_checksum(
         &self,

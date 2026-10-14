@@ -29,7 +29,7 @@
 //! asserting the vector actually *discriminates* against it.
 //!
 //! # References
-//! - RFC 3961 §5.1 (DR/DK), §5.3 (Kc/Ke/Ki constants)
+//! - RFC 3961 §5.1 (DR/DK), §5.3 (Kc/Ke/Ki constants, PRF)
 //! - RFC 3962 §4 (string-to-key), §6 (random-to-key = identity)
 //! - RFC 8009 §3 (KDF-HMAC-SHA2), §4 (string-to-key), §5 (parameters, PRF)
 
@@ -41,7 +41,7 @@ use aes::{
 };
 use hmac::{Hmac, Mac};
 use pbkdf2::pbkdf2_hmac;
-use sha1::Sha1;
+use sha1::{Digest, Sha1};
 use sha2::{Sha256, Sha384};
 
 use super::nfold::n_fold;
@@ -499,8 +499,8 @@ pub fn derive_key(enctype: Enctype, base_key: &[u8], usage: u32, which: KeyUse) 
 /// There is no key usage and no Kc/Ke/Ki step: the input key is used
 /// directly.
 ///
-/// Enctypes 17/18 have their own PRF (RFC 3961 §5.3) built on `E()` and
-/// `DK(key, "prf")`, which lives with the simplified profile, not here.
+/// Enctypes 17/18 have their own PRF, [`prf_simplified`]; [`prf`] picks
+/// the right one.
 pub fn prf_hmac_sha2(enctype: Enctype, input_key: &[u8], octet_string: &[u8]) -> Result<Vec<u8>> {
     let k_bits = match enctype {
         Enctype::Aes128CtsHmacSha256128 => 256,
@@ -508,6 +508,47 @@ pub fn prf_hmac_sha2(enctype: Enctype, input_key: &[u8], octet_string: &[u8]) ->
         other => return Err(KdfError::NotAnRfc8009Enctype(other.etype())),
     };
     kdf_hmac_sha2(enctype, input_key, b"prf", Some(octet_string), k_bits)
+}
+
+/// RFC 3961 §5.3 simplified-profile PRF, for enctypes 17/18 (RFC 3962 §6).
+///
+/// ```text
+/// tmp1 = SHA-1(octet-string)
+/// tmp2 = truncate tmp1 to a multiple of the 16-octet block: 16 octets
+/// PRF  = E(DK(protocol-key, "prf"), tmp2, initial-cipher-state)
+/// ```
+///
+/// The output is one AES block, 16 octets for both key sizes. `E` is
+/// AES-CTS, which on exactly one block is a single AES encryption under
+/// the all-zero IV. The key is `DK(key, "prf")`, not the key itself, and
+/// the 3-octet constant is n-folded like every other DK constant.
+pub fn prf_simplified(enctype: Enctype, input_key: &[u8], octet_string: &[u8]) -> Result<Vec<u8>> {
+    if enctype.is_rfc8009() {
+        return Err(KdfError::UnsupportedEnctype(enctype.etype()));
+    }
+    if input_key.len() != enctype.key_size() {
+        return Err(KdfError::BaseKeyLength {
+            etype: enctype.etype(),
+            got: input_key.len(),
+            want: enctype.key_size(),
+        });
+    }
+    let kp = dk(input_key, b"prf", enctype.key_size())?;
+    let mut block = [0u8; AES_BLOCK];
+    block.copy_from_slice(&Sha1::digest(octet_string)[..AES_BLOCK]);
+    aes_encrypt_block(&kp, &mut block)?;
+    Ok(block.to_vec())
+}
+
+/// The enctype's `pseudo-random` function (RFC 3961 §3): [`prf_simplified`]
+/// for 17/18, [`prf_hmac_sha2`] for 19/20. Output is 16, 16, 32 and 48
+/// octets respectively.
+pub fn prf(enctype: Enctype, input_key: &[u8], octet_string: &[u8]) -> Result<Vec<u8>> {
+    if enctype.is_rfc8009() {
+        prf_hmac_sha2(enctype, input_key, octet_string)
+    } else {
+        prf_simplified(enctype, input_key, octet_string)
+    }
 }
 
 // ---------------------------------------------------------------------------
