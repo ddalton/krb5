@@ -152,6 +152,13 @@ EXT
         -out "$P/alice-ec.req" -subj "/CN=alice"
     o x509 -req -in "$P/alice-ec.req" -CA "$P/ca.pem" -CAkey "$P/ca-key.pem" \
         -CAcreateserial -out "$P/alice-ec.pem" -days 365 -extfile "$P/ext.cnf" -extensions client_cert
+    # alice's certificate and key as PKCS #12, pass phrase "alicep12":
+    # OpenSSL 3's default encryption, and (where OpenSSL has its legacy
+    # provider) the RC2/3DES of older tools.
+    o pkcs12 -export -in "$P/alice.pem" -inkey "$P/alice-key.pem" -certfile "$P/ca.pem" \
+        -passout pass:alicep12 -out "$P/alice.p12"
+    o pkcs12 -export -legacy -in "$P/alice.pem" -inkey "$P/alice-key.pem" \
+        -passout pass:alicep12 -out "$P/alice-legacy.p12" || rm -f "$P/alice-legacy.p12"
     cat >>"$DIR/krb5.conf" <<EOF
 [realms]
     $REALM = {

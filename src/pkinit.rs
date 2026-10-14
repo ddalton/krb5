@@ -23,10 +23,11 @@
 //!
 //! Supported: RSA and elliptic-curve (P-256, P-384, P-521) certificates
 //! and keys, for the client and the KDC (PKCS #1 v1.5 and ECDSA
-//! signatures with SHA-256/384/512), in unencrypted PEM files (`FILE:`);
+//! signatures with SHA-256/384/512), in unencrypted PEM files (`FILE:`)
+//! or PKCS #12 files (`PKCS12:`, [`Identity::from_pkcs12`]);
 //! key exchange by finite-field DH or, against MIT 1.22 and later, ECDH
 //! ([`DhGroup`]). Not supported: RSA key transport (which MIT's client
-//! also refuses), PKCS #11 and PKCS #12 identities, and revocation
+//! also refuses), PKCS #11 identities (smart cards), and revocation
 //! checking.
 
 mod asn1;
@@ -37,6 +38,7 @@ mod ec;
 mod kdf;
 mod keys;
 mod pem;
+mod pkcs12;
 mod rsa;
 mod x509;
 
@@ -335,13 +337,49 @@ impl Identity {
         Ok(Identity { certs, key })
     }
 
+    /// A PKCS #12 (`.p12`, `.pfx`) file's certificate and key, the other
+    /// certificates in it sent along as intermediates. With `password`
+    /// `None` the file is read as MIT first tries it, with no pass phrase
+    /// (the empty password, both ways OpenSSL tries it).
+    ///
+    /// Modern files (PBES2 with AES, as OpenSSL 3 and current Windows
+    /// write them) and legacy ones (3DES and 40-bit RC2, as OpenSSL 1.x,
+    /// Windows and Java long wrote them) are read; a wrong password is
+    /// reported as such, by the file's MAC.
+    pub fn from_pkcs12(data: &[u8], password: Option<&str>) -> Result<Self> {
+        match pkcs12::parse(data, password) {
+            Ok(c) => Ok(Identity {
+                certs: c.certs,
+                key: c.key,
+            }),
+            Err(pkcs12::Error::BadPassword) => pk_err(match password {
+                None => "the PKCS #12 file needs a password",
+                Some(_) => "wrong password for the PKCS #12 file",
+            }),
+            Err(pkcs12::Error::Malformed(m)) => pk_err(format!("PKCS #12: {m}")),
+        }
+    }
+
     /// An identity as `X509_user_identity` or `kinit -X` writes one:
-    /// `FILE:cert.pem,key.pem`, or `FILE:both.pem` for one file holding
-    /// both.
+    /// `FILE:cert.pem,key.pem`, `FILE:both.pem` for one file holding both,
+    /// or `PKCS12:file.p12` (read with no password; see
+    /// [`Identity::load_with_password`]).
     pub fn load(spec: &str) -> Result<Self> {
+        Self::load_with_password(spec, None)
+    }
+
+    /// [`Identity::load`], with the pass phrase for a `PKCS12:` file, as
+    /// `kinit` asks for one when the file will not open without.
+    pub fn load_with_password(spec: &str, password: Option<&str>) -> Result<Self> {
+        if let Some(file) = spec.strip_prefix("PKCS12:") {
+            let data =
+                std::fs::read(file).map_err(|e| ClientError::Pkinit(format!("{file}: {e}")))?;
+            return Self::from_pkcs12(&data, password)
+                .map_err(|e| ClientError::Pkinit(format!("{file}: {e}")));
+        }
         let Some(files) = spec.strip_prefix("FILE:") else {
             return pk_err(format!(
-                "unsupported identity {spec:?} (only FILE:cert[,key] is supported)"
+                "unsupported identity {spec:?} (FILE:cert[,key] and PKCS12:file are supported)"
             ));
         };
         let (cert, key) = files.split_once(',').unwrap_or((files, files));

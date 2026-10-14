@@ -7,6 +7,22 @@ may break the API).
 
 ## [Unreleased]
 
+### Added
+
+- PKCS #12 identities (`pkinit` feature): `pkinit::Identity::from_pkcs12`,
+  and `PKCS12:file.p12` in `Identity::load` / `load_with_password`, as
+  `X509_user_identity` names them. The certificate for the key comes first
+  and the file's other certificates go along as intermediates. Read: PBES2
+  (PBKDF2 with HMAC-SHA-1/224/256/384/512, AES-128/192/256-CBC or
+  3DES-CBC), the legacy PKCS #12 PBEs (SHA-1 with 3DES or RC2, as OpenSSL
+  1.x, Windows and older Java write them), unencrypted bags; MACs by
+  HMAC (PKCS #12 KDF) or PBMAC1 (RFC 9579), checked first, so a wrong
+  password is reported as one; BER with indefinite lengths. With no
+  password the empty one is tried both ways, as MIT and OpenSSL do. Adds
+  RustCrypto's `des` and `rc2` to the feature (decryption only).
+- `scripts/make-pkcs12-testdata.sh`; the test KDC script also writes
+  alice's identity as PKCS #12, modern and legacy.
+
 ## [0.7.0] - 2026-10-14
 
 ### Added

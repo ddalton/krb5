@@ -26,11 +26,13 @@ crypto-bigint = { version = "0.7.5", optional = true, default-features = false, 
 p256 = { version = "0.14", optional = true, default-features = false, features = ["ecdh", "ecdsa"] }
 p384 = { version = "0.14", optional = true, default-features = false, features = ["ecdh", "ecdsa"] }
 p521 = { version = "0.14", optional = true, default-features = false, features = ["ecdh", "ecdsa"] }
+des = { version = "0.8", optional = true }
+rc2 = { version = "0.8", optional = true }
 
 [features]
 # PKINIT (RFC 4556), anonymous PKINIT (RFC 8062) and ECDH/ECDSA (RFC 5349):
 # `krb5::pkinit`.
-pkinit = ["dep:crypto-bigint", "dep:p256", "dep:p384", "dep:p521"]
+pkinit = ["dep:crypto-bigint", "dep:p256", "dep:p384", "dep:p521", "dep:des", "dep:rc2"]
 
 [package.metadata.docs.rs]
 all-features = true

@@ -30,8 +30,9 @@ tickets without shelling out to `kinit`.
   and MIT's group negotiation; the KDC's signature (RSA or ECDSA),
   certificate chain (`pkinit_anchors`) and name are checked as MIT checks
   them. Pure Rust, no OpenSSL: crypto-bigint's constant-time arithmetic
-  for DH and RSA, RustCrypto's `p256`/`p384`/`p521` for the curves. Not
-  yet: PKCS #11 and PKCS #12 identities.
+  for DH and RSA, RustCrypto's `p256`/`p384`/`p521` for the curves.
+  Identities from PEM files or PKCS #12 (`PKCS12:file.p12`, modern AES or
+  legacy 3DES/RC2 encryption). Not yet: PKCS #11 (smart cards).
 - **Credential caches** — MIT's `FILE:` format (versions 1-4), `DIR:`
   collections, and `KCM:` (sssd-kcm, the Fedora/RHEL default, or
   Heimdal's `kcm`, over its Unix socket), so tickets move both ways between this crate and

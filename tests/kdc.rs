@@ -1432,6 +1432,48 @@ mod pkinit {
         yes
     }
 
+    /// alice's identity from PKCS #12 files, modern and legacy, as `kinit
+    /// -X X509_user_identity=PKCS12:...` reads them; and MIT's kinit
+    /// reading the same file, its pass phrase on stdin.
+    #[test]
+    fn certificate_login_from_a_pkcs12_file() {
+        let e = pk!();
+        let mut files = vec!["alice.p12"];
+        if std::path::Path::new(&format!("{}/pki/alice-legacy.p12", e.dir)).exists() {
+            files.push("alice-legacy.p12");
+        }
+        for f in files {
+            let spec = format!("PKCS12:{}/pki/{f}", e.dir);
+            let err = Identity::load(&spec).unwrap_err();
+            assert!(err.to_string().contains("needs a password"), "{err}");
+            let err = Identity::load_with_password(&spec, Some("wrong")).unwrap_err();
+            assert!(err.to_string().contains("wrong password"), "{err}");
+            let id = Identity::load_with_password(&spec, Some("alicep12")).unwrap();
+            assert_eq!(id.principals(), [e.p("alice")]);
+            let tgt = client(&e)
+                .login_with_certificate(&e.p("alice"), &id)
+                .unwrap_or_else(|err| panic!("{f}: {err}"));
+            assert_eq!(tgt.client, e.p("alice"));
+        }
+        let path = scratch(&e, "pk-p12-mit");
+        let ccname = format!("FILE:{}", path.display());
+        let x = format!("X509_user_identity=PKCS12:{}/pki/alice.p12", e.dir);
+        if mit(
+            &e,
+            &ccname,
+            "kinit",
+            &["-X", &x, "alice"],
+            Some("alicep12\n"),
+        )
+        .is_some()
+        {
+            assert_eq!(
+                krb5::CacheName::File(path).read().unwrap().principal,
+                e.p("alice")
+            );
+        }
+    }
+
     /// An ECDSA client signature, which MIT's KDC verifies (1.20 too).
     #[test]
     fn ec_certificate_login() {
