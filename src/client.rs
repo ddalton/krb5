@@ -11,7 +11,7 @@
 //! FAST: the caller names the realm and its KDCs.
 
 use crate::acceptor::Keytab;
-use crate::ccache::{CCache, CacheError, CacheName};
+use crate::ccache::{CacheError, CacheName};
 use crate::config::{self, Krb5Conf};
 use crate::der::{self, Fields, Reader, app};
 use crate::key::{Key, KeyError};
@@ -375,8 +375,8 @@ impl KdcClient {
         cache: &CacheName,
         service: &Principal,
     ) -> Result<Credentials> {
-        let path = cache.path()?;
-        let cc = CCache::read(&path)?;
+        let cache = cache.resolved()?;
+        let cc = cache.read()?;
         let (now, _) = now();
         if let Some(creds) = cc.find(service, now) {
             return Ok(creds);
@@ -385,10 +385,11 @@ impl KdcClient {
             principal: cc.principal.to_string(),
             cache: cache.to_string(),
         })?;
+
         let creds = self.service_ticket(&tgt, service)?;
-        let mut cc = CCache::read(&path)?;
+        let mut cc = cache.read()?;
         cc.store(&creds);
-        cc.write(&path)?;
+        cache.write(&cc)?;
         Ok(creds)
     }
 

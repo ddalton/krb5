@@ -51,3 +51,13 @@ jobs:
       - run: cargo test --test kdc -- --nocapture
       - run: cargo build --example gss_client
       - run: KRB5_CONFIG="$KRB5_TEST_DIR/krb5.conf" scripts/mit-acceptor.py "$KRB5_TEST_DIR" target/debug/examples/gss_client
+      # KCM caches against sssd-kcm, the Fedora/RHEL default, with MIT's
+      # tools on the other side. (Heimdal's kcm is tested by hand: it
+      # wants the same socket.)
+      - run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends sssd-kcm
+          sudo systemctl start sssd-kcm.socket
+          test -S /var/run/.heim_org.h5l.kcm-socket
+      - run: cargo test --test kdc kcm_ -- --nocapture
+        env:
+          KRB5_TEST_KCM: "1"

@@ -18,8 +18,9 @@ tickets without shelling out to `kinit`.
   PA-ENC-TIMESTAMP pre-authentication and ETYPE-INFO2 salts; TGS exchange
   for service tickets; TCP transport. KDCs come from `krb5.conf` or are
   passed in directly.
-- **Credential caches** — MIT's `FILE:` format (versions 1-4) and
-  `DIR:` collections, so tickets move both ways between this crate and
+- **Credential caches** — MIT's `FILE:` format (versions 1-4), `DIR:`
+  collections, and `KCM:` (sssd-kcm, the Fedora/RHEL default, or
+  Heimdal's `kcm`, over its Unix socket), so tickets move both ways between this crate and
   `kinit`, `klist`, `kvno` and other GSS programs. Default cache name as
   MIT resolves it (`KRB5CCNAME`, `default_ccache_name`,
   `/tmp/krb5cc_%{uid}`).
@@ -34,9 +35,9 @@ tickets without shelling out to `kinit`.
 - **Per-message tokens** — RFC 4121 §4.2 Wrap and MIC.
 
 Not implemented: a KDC, UDP, KDC discovery through DNS SRV records,
-cross-realm referrals, FAST, PKINIT, delegation, and the `KCM:`,
-`KEYRING:` and `API:` cache types (the defaults on Fedora/RHEL and macOS;
-point `KRB5CCNAME` at a `FILE:` or `DIR:` cache there).
+cross-realm referrals, FAST, PKINIT, delegation, `KEYRING:` and `API:`
+caches, and macOS's KCM, which is reached over Mach IPC rather than a
+socket (point `KRB5CCNAME` at a `FILE:` cache there).
 
 ## Server
 

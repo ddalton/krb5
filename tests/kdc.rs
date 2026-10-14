@@ -346,3 +346,89 @@ fn an_expired_cache_reports_no_tgt() {
     assert!(matches!(err, krb5::ClientError::NoTgt { .. }), "{err}");
     let _ = std::fs::remove_file(&path);
 }
+
+// ------------------------------------------------------- KCM vs a daemon
+
+/// A KCM cache name of our own for `tag`, if `KRB5_TEST_KCM` is set (a KCM
+/// daemon is listening on the default socket, or on `KRB5_TEST_KCM_SOCKET`).
+fn kcm_name(tag: &str) -> Option<krb5::CacheName> {
+    std::env::var_os("KRB5_TEST_KCM")?;
+    let uid = std::process::Command::new("id").arg("-u").output().unwrap();
+    let uid = String::from_utf8(uid.stdout).unwrap().trim().to_string();
+    let conf = match std::env::var("KRB5_TEST_KCM_SOCKET") {
+        Ok(s) => krb5::Krb5Conf::parse(&format!("[libdefaults]\n kcm_socket = {s}\n")).unwrap(),
+        Err(_) => krb5::Krb5Conf::empty(),
+    };
+    Some(
+        krb5::CacheName::parse_with(
+            &format!("KCM:{uid}:krb5-rs-{tag}-{}", std::process::id()),
+            &conf,
+        )
+        .unwrap(),
+    )
+}
+
+/// Asking for the KCM tests means a daemon and MIT's tools are there; a
+/// missing tool is a failure, not a skip that would pass CI vacuously.
+const NEED_MIT: &str = "KRB5_TEST_KCM is set but MIT's krb5 tools are not on PATH";
+
+macro_rules! kcm {
+    ($tag:expr) => {
+        match kcm_name($tag) {
+            Some(n) => n,
+            None => {
+                eprintln!("KRB5_TEST_KCM not set; skipping KCM test");
+                return;
+            }
+        }
+    };
+}
+
+/// We write a KCM cache; MIT's klist lists it and MIT's kvno adds a
+/// ticket to it with our TGT, which we then read back and use.
+#[test]
+fn kcm_mit_tools_use_a_cache_we_wrote() {
+    let e = live!();
+    let cache = kcm!("ours");
+    let tgt = e
+        .client
+        .login_with_password(&e.p("alice"), "alicepw")
+        .unwrap();
+    cache.write(&krb5::CCache::with_credentials(&tgt)).unwrap();
+
+    let name = cache.to_string();
+    let listed = mit(&e, &name, "klist", &[], None).expect(NEED_MIT);
+    assert!(
+        listed.contains(&format!("Default principal: alice@{}", e.realm)),
+        "{listed}"
+    );
+    mit(&e, &name, "kvno", &["svc18/svc.krb5.test"], None).unwrap();
+
+    let cc = cache.read().unwrap();
+    let st = cc
+        .find(&e.p("svc18/svc.krb5.test"), 0)
+        .expect("kvno's ticket is in the KCM cache");
+    establish(&e, &st);
+    let _ = mit(&e, &name, "kdestroy", &[], None);
+}
+
+/// MIT's kinit fills a KCM cache; we buy a service ticket with its TGT and
+/// store it, and MIT's klist sees it.
+#[test]
+fn kcm_we_use_a_cache_mit_wrote() {
+    let e = live!();
+    let cache = kcm!("mit");
+    let name = cache.to_string();
+    mit(&e, &name, "kinit", &["alice"], Some("alicepw\n")).expect(NEED_MIT);
+    let svc = e.p("svc18/svc.krb5.test");
+    let st = e.client.service_ticket_cached(&cache, &svc).unwrap();
+    establish(&e, &st);
+    let listed = mit(&e, &name, "klist", &[], None).unwrap();
+    assert!(listed.contains("svc18/svc.krb5.test@"), "{listed}");
+    let again = e.client.service_ticket_cached(&cache, &svc).unwrap();
+    assert_eq!(
+        again.ticket, st.ticket,
+        "served from the cache the second time"
+    );
+    let _ = mit(&e, &name, "kdestroy", &[], None);
+}

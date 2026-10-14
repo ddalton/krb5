@@ -26,8 +26,9 @@
 //!
 //! [`CacheName`] resolves names as MIT does: `KRB5CCNAME`, then
 //! `[libdefaults] default_ccache_name`, then `FILE:/tmp/krb5cc_%{uid}`.
-//! `FILE:` and `DIR:` are supported; `KCM:`, `KEYRING:`, `API:` and
-//! `MEMORY:` are refused with [`CacheError::UnsupportedType`].
+//! `FILE:`, `DIR:` and (on Unix) `KCM:` are supported; `KEYRING:`, `API:`
+//! and `MEMORY:` are refused with [`CacheError::UnsupportedType`]. See
+//! [`kcm`] for the KCM protocol and its limits.
 
 use crate::client::{Credentials, Principal, decode_encrypted_data};
 use crate::config::Krb5Conf;
@@ -37,6 +38,9 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+pub mod kcm;
 
 /// The realm of configuration entries' server principals.
 pub const CONF_REALM: &str = "X-CACHECONF:";
@@ -58,14 +62,34 @@ pub enum CacheError {
     Io { path: PathBuf, source: io::Error },
     #[error("{}: not a credential cache: {msg}", path.display())]
     Format { path: PathBuf, msg: String },
-    /// A cache type this crate does not implement (`KCM`, `KEYRING`, ...).
-    #[error("credential cache type {0:?} is not supported (only FILE and DIR)")]
+    /// A cache type this crate does not implement (`KEYRING`, `API`, ...).
+    #[error("credential cache type {0:?} is not supported (only FILE, DIR and KCM)")]
     UnsupportedType(String),
+    /// No KCM daemon is listening (or KCM is disabled with
+    /// `kcm_socket = -`).
+    #[error("no KCM daemon at {}: {source}{}", socket.display(), if cfg!(target_os = "macos") { " (macOS's own KCM uses Mach IPC, which this crate does not speak)" } else { "" })]
+    KcmUnavailable { socket: PathBuf, source: io::Error },
+    /// The KCM daemon refused an operation with a krb5 error code.
+    #[error("KCM {op} failed: {} ({code})", kcm_error_name(*code))]
+    Kcm { op: &'static str, code: i32 },
+    /// A KCM cache has no file path.
+    #[error("{0} is not a file cache")]
+    NotAFile(String),
     #[error("bad credential cache name {0:?}: {1}")]
     BadName(String, String),
 }
 
 pub type Result<T> = std::result::Result<T, CacheError>;
+
+fn kcm_error_name(code: i32) -> &'static str {
+    #[cfg(unix)]
+    return kcm::error_name(code);
+    #[cfg(not(unix))]
+    {
+        let _ = code;
+        "unknown"
+    }
+}
 
 // ------------------------------------------------------------------ entries
 
@@ -599,8 +623,9 @@ fn atomic_write(target: &Path, data: &[u8]) -> io::Result<()> {
 
 // ------------------------------------------------------------------- names
 
-/// A resolved credential cache name.
+/// A credential cache name.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CacheName {
     /// `FILE:path`, or a name with no type prefix.
     File(PathBuf),
@@ -608,6 +633,12 @@ pub enum CacheName {
     Dir(PathBuf),
     /// `DIR::dir/tktNAME`: one cache within a collection.
     DirMember(PathBuf),
+    /// `KCM:name`, or `KCM:` for the daemon's primary cache. `socket` is
+    /// `None` when `kcm_socket = -` disables KCM.
+    Kcm {
+        name: String,
+        socket: Option<PathBuf>,
+    },
 }
 
 impl fmt::Display for CacheName {
@@ -616,14 +647,22 @@ impl fmt::Display for CacheName {
             CacheName::File(p) => write!(f, "FILE:{}", p.display()),
             CacheName::Dir(p) => write!(f, "DIR:{}", p.display()),
             CacheName::DirMember(p) => write!(f, "DIR::{}", p.display()),
+            CacheName::Kcm { name, .. } => write!(f, "KCM:{name}"),
         }
     }
 }
 
 impl CacheName {
     /// Parse `TYPE:residual` as MIT's `krb5_cc_resolve` does: no colon
-    /// means FILE, and so does a one-letter prefix (a drive letter).
+    /// means FILE, and so does a one-letter prefix (a drive letter). A
+    /// `KCM:` name uses the default socket; see [`CacheName::parse_with`].
     pub fn parse(name: &str) -> Result<Self> {
+        Self::parse_with(name, &Krb5Conf::empty())
+    }
+
+    /// [`CacheName::parse`], taking the KCM socket from `conf`'s
+    /// `[libdefaults] kcm_socket`.
+    pub fn parse_with(name: &str, conf: &Krb5Conf) -> Result<Self> {
         let bad = |why: &str| CacheError::BadName(name.to_string(), why.to_string());
         let (kind, residual) = match name.find(':') {
             None => ("FILE", name),
@@ -646,6 +685,11 @@ impl CacheName {
                 None if residual.is_empty() => Err(bad("empty directory")),
                 None => Ok(CacheName::Dir(PathBuf::from(residual))),
             },
+            #[cfg(unix)]
+            "KCM" => Ok(CacheName::Kcm {
+                name: residual.to_string(),
+                socket: kcm::socket_path(conf),
+            }),
             other => Err(CacheError::UnsupportedType(other.to_string())),
         }
     }
@@ -665,9 +709,38 @@ impl CacheName {
         expand_tokens(template)
     }
 
-    /// [`CacheName::parse`] of [`CacheName::default_name`].
+    /// [`CacheName::parse_with`] of [`CacheName::default_name`].
     pub fn default(conf: &Krb5Conf) -> Result<Self> {
-        Self::parse(&Self::default_name(conf)?)
+        Self::parse_with(&Self::default_name(conf)?, conf)
+    }
+
+    /// This name with any indirection resolved: a `DIR:` collection to
+    /// the member its `primary` names, `KCM:` to the daemon's primary
+    /// cache. Read and write through the result to be sure both touch
+    /// the same cache.
+    pub fn resolved(&self) -> Result<Self> {
+        match self {
+            CacheName::Dir(_) => Ok(CacheName::DirMember(self.path()?)),
+            #[cfg(unix)]
+            CacheName::Kcm { name, socket } if name.is_empty() => Ok(CacheName::Kcm {
+                name: self.kcm()?.default_cache()?,
+                socket: socket.clone(),
+            }),
+            other => Ok(other.clone()),
+        }
+    }
+
+    #[cfg(unix)]
+    fn kcm(&self) -> Result<kcm::Kcm> {
+        match self {
+            CacheName::Kcm {
+                socket: Some(s), ..
+            } => kcm::Kcm::connect(s),
+            _ => Err(CacheError::KcmUnavailable {
+                socket: PathBuf::from("-"),
+                source: io::Error::new(io::ErrorKind::NotFound, "KCM disabled by kcm_socket = -"),
+            }),
+        }
     }
 
     /// The cache file this name refers to now. For a `DIR:` collection
@@ -677,6 +750,7 @@ impl CacheName {
     pub fn path(&self) -> Result<PathBuf> {
         match self {
             CacheName::File(p) | CacheName::DirMember(p) => Ok(p.clone()),
+            CacheName::Kcm { .. } => Err(CacheError::NotAFile(self.to_string())),
             CacheName::Dir(dir) => {
                 ensure_dir(dir)?;
                 let primary = dir.join("primary");
@@ -710,9 +784,16 @@ impl CacheName {
         }
     }
 
-    /// Make this the collection's primary cache (`kswitch`). Only
-    /// meaningful for a `DIR::` member; other names are left alone.
+    /// Make this the collection's primary cache (`kswitch`). Meaningful
+    /// for a `DIR::` member or a named `KCM:` cache; others are left alone.
     pub fn make_primary(&self) -> Result<()> {
+        #[cfg(unix)]
+        if let CacheName::Kcm { name, .. } = self {
+            if !name.is_empty() {
+                self.kcm()?.set_default_cache(name)?;
+            }
+            return Ok(());
+        }
         if let CacheName::DirMember(p) = self {
             let dir = p.parent().expect("checked in parse");
             ensure_dir(dir)?;
@@ -730,11 +811,25 @@ impl CacheName {
 
     /// Read the cache this name refers to.
     pub fn read(&self) -> Result<CCache> {
+        #[cfg(unix)]
+        if let CacheName::Kcm { .. } = self {
+            let CacheName::Kcm { name, .. } = self.resolved()? else {
+                unreachable!()
+            };
+            return self.kcm()?.read(&name);
+        }
         CCache::read(self.path()?)
     }
 
     /// Replace the cache this name refers to with `cache`.
     pub fn write(&self, cache: &CCache) -> Result<()> {
+        #[cfg(unix)]
+        if let CacheName::Kcm { .. } = self {
+            let CacheName::Kcm { name, .. } = self.resolved()? else {
+                unreachable!()
+            };
+            return self.kcm()?.write(&name, cache);
+        }
         cache.write(self.path()?)
     }
 }
@@ -1222,8 +1317,31 @@ mod tests {
             p("DIR::/run/cc/tktabc"),
             CacheName::DirMember("/run/cc/tktabc".into())
         );
+        #[cfg(unix)]
+        {
+            let k = |name: &str, sock: Option<&str>| CacheName::Kcm {
+                name: name.into(),
+                socket: sock.map(PathBuf::from),
+            };
+            assert_eq!(p("KCM:"), k("", Some(kcm::DEFAULT_KCM_SOCKET)));
+            assert_eq!(
+                p("KCM:1000:abc"),
+                k("1000:abc", Some(kcm::DEFAULT_KCM_SOCKET))
+            );
+            assert_eq!(p("KCM:1000").to_string(), "KCM:1000");
+            let conf =
+                |v: &str| Krb5Conf::parse(&format!("[libdefaults]\n kcm_socket = {v}\n")).unwrap();
+            assert_eq!(
+                CacheName::parse_with("KCM:", &conf("/run/kcm.sock")).unwrap(),
+                k("", Some("/run/kcm.sock"))
+            );
+            assert_eq!(
+                CacheName::parse_with("KCM:", &conf("-")).unwrap(),
+                k("", None)
+            );
+            assert!(matches!(p("KCM:x").path(), Err(CacheError::NotAFile(_))));
+        }
         for name in [
-            "KCM:1000",
             "KEYRING:persistent:1000",
             "API:x",
             "MEMORY:x",

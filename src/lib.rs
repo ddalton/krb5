@@ -12,9 +12,9 @@
 //! * [`KdcClient`] — the AS exchange (`kinit`, with a password or a
 //!   keytab, including PA-ENC-TIMESTAMP pre-authentication) and the TGS
 //!   exchange (service tickets), over TCP.
-//! * [`CCache`] / [`CacheName`] — MIT `FILE:` and `DIR:` credential
-//!   caches, read and written, for tickets shared with `kinit` and
-//!   `klist`; [`KdcClient::service_ticket_cached`] is `kvno`.
+//! * [`CCache`] / [`CacheName`] — MIT `FILE:`, `DIR:` and `KCM:`
+//!   credential caches, read and written, for tickets shared with `kinit`
+//!   and `klist`; [`KdcClient::service_ticket_cached`] is `kvno`.
 //! * [`Krb5Conf`] — `krb5.conf`, for the default realm, a realm's KDCs
 //!   ([`KdcClient::discover`]) and `[domain_realm]`.
 //! * [`InitiatorContext`] — `gss_init_sec_context`: the AP-REQ token and
@@ -26,8 +26,8 @@
 //! (`aes{128,256}-cts-hmac-sha1-96`, RFC 3962) and 19/20
 //! (`aes128-cts-hmac-sha256-128`, `aes256-cts-hmac-sha384-192`, RFC 8009).
 //! Not implemented: a KDC, UDP transport, DNS SRV KDC discovery,
-//! cross-realm referrals, FAST, PKINIT, delegation, and the KCM, KEYRING
-//! and API credential cache types.
+//! cross-realm referrals, FAST, PKINIT, delegation, KEYRING and API
+//! credential caches, and macOS's Mach-based KCM.
 //!
 //! # Evidence
 //!

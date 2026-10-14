@@ -25,6 +25,13 @@ may break the API).
   (`KRB5CCNAME`, `default_ccache_name` with `%{uid}`-style tokens,
   `FILE:/tmp/krb5cc_%{uid}`).
 - `KdcClient::service_ticket_cached`: `kvno` against a credential cache.
+- `KCM:` credential caches (Unix only), over the KCM daemon's Unix socket
+  (`[libdefaults] kcm_socket`, default
+  `/var/run/.heim_org.h5l.kcm-socket`). Uses MIT's `GET_CRED_LIST` and
+  `REPLACE` extensions where the daemon has them (sssd-kcm) and falls back
+  to the Heimdal operations where it does not. macOS's Mach-based KCM is
+  not supported.
+- `CacheName::resolved` and `CacheName::parse_with`.
 
 ### Changed
 
