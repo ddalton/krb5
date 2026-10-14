@@ -537,7 +537,9 @@ fn dns_answers_agree_with_dig() {
             .unwrap()
             .lines()
             .map(|l| l.trim().to_ascii_lowercase())
-            .filter(|l| !l.is_empty())
+            // dig reports retries (";; communications error ... timed out")
+            // on stdout among the records.
+            .filter(|l| !l.is_empty() && !l.starts_with(";;"))
             .collect();
         let mut got: Vec<String> = r
             .query(name, qtype)
