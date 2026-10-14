@@ -1085,3 +1085,133 @@ fn mit_delegates_to_our_acceptor() {
     establish(&e, &onward);
     let _ = std::fs::remove_file(&path);
 }
+
+// ------------------------------------------------------------------ FAST
+
+/// An armor TGT, as a host would hold one from its keytab.
+fn armor_tgt(e: &Env) -> Credentials {
+    e.client
+        .login_with_keytab(&e.p("robot"), &e.keytab("robot.keytab"))
+        .unwrap()
+}
+
+/// A FAST-armored password login: the encrypted challenge inside the
+/// armor, the KDC's challenge verified, the finished checksum checked.
+#[test]
+fn fast_armored_password_login() {
+    let e = live!();
+    let kdc = e.client.clone().with_fast_armor(armor_tgt(&e));
+    let tgt = kdc.login_with_password(&e.p("alice"), "alicepw").unwrap();
+    assert_eq!(tgt.client.to_string(), format!("alice@{}", e.realm));
+    assert_eq!(tgt.server, Principal::krbtgt(&e.realm));
+    // The TGT works like any other.
+    let st = e
+        .client
+        .service_ticket(&tgt, &e.p("host/svc.krb5.test"))
+        .unwrap();
+    establish(&e, &st);
+}
+
+/// Errors come back inside the armor (PA-FX-ERROR) and are the real ones.
+#[test]
+fn fast_errors_are_the_kdcs_own() {
+    let e = live!();
+    let kdc = e.client.clone().with_fast_armor(armor_tgt(&e));
+    let err = kdc.login_with_password(&e.p("alice"), "wrong").unwrap_err();
+    assert_eq!(err.kdc_code(), Some(KDC_ERR_PREAUTH_FAILED), "{err}");
+    let err = kdc.login_with_password(&e.p("nobody"), "x").unwrap_err();
+    assert_eq!(err.kdc_code(), Some(KDC_ERR_C_PRINCIPAL_UNKNOWN), "{err}");
+}
+
+/// A keytab login and a principal that needs no pre-authentication, both
+/// through the armor.
+#[test]
+fn fast_keytab_and_no_preauth_logins() {
+    let e = live!();
+    let kdc = e.client.clone().with_fast_armor(armor_tgt(&e));
+    let tgt = kdc
+        .login_with_keytab(&e.p("robot"), &e.keytab("robot.keytab"))
+        .unwrap();
+    assert_eq!(tgt.client.to_string(), format!("robot@{}", e.realm));
+    // bob was made with -requires_preauth: the KDC answers at once.
+    let tgt = kdc.login_with_password(&e.p("bob"), "bobpw").unwrap();
+    assert_eq!(tgt.client.to_string(), format!("bob@{}", e.realm));
+}
+
+/// FAST with MIT on the other side of the armor: MIT's kinit -T uses an
+/// armor cache we wrote, and we armor with a TGT MIT's kinit -k got.
+#[test]
+fn fast_armor_caches_are_shared_with_mit() {
+    let e = live!();
+    if !mit_tools_installed() {
+        eprintln!("MIT's krb5 tools not on PATH; skipping");
+        return;
+    }
+    // Our robot TGT as MIT's armor.
+    let armor_path = scratch(&e, "armor-ours");
+    krb5::CCache::with_credentials(&armor_tgt(&e))
+        .write(&armor_path)
+        .unwrap();
+    let out_path = scratch(&e, "armored-by-mit");
+    let out = format!("FILE:{}", out_path.display());
+    let armor_name = format!("FILE:{}", armor_path.display());
+    mit(
+        &e,
+        &out,
+        "kinit",
+        &["-T", &armor_name, "alice"],
+        Some("alicepw\n"),
+    )
+    .unwrap();
+    let listed = mit(&e, &out, "klist", &[], None).unwrap();
+    assert!(
+        listed.contains(&format!("krbtgt/{0}@{0}", e.realm)),
+        "{listed}"
+    );
+
+    // MIT's robot TGT as our armor.
+    let mit_armor = scratch(&e, "armor-mit");
+    let mit_armor_name = format!("FILE:{}", mit_armor.display());
+    let kt = format!("{}/robot.keytab", e.dir);
+    mit(
+        &e,
+        &mit_armor_name,
+        "kinit",
+        &["-k", "-t", &kt, "robot"],
+        None,
+    )
+    .unwrap();
+    let armor = krb5::CCache::read(&mit_armor).unwrap().tgt(0).unwrap();
+    let tgt = e
+        .client
+        .clone()
+        .with_fast_armor(armor)
+        .login_with_password(&e.p("alice"), "alicepw")
+        .unwrap();
+    assert_eq!(tgt.client.to_string(), format!("alice@{}", e.realm));
+    for p in [armor_path, out_path, mit_armor] {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// TGS requests through a FAST client are armored too (the implicit armor
+/// from the TGT, as MIT's send_tgs does), cross-realm hops included.
+#[test]
+fn fast_armors_service_ticket_requests() {
+    let e = live!();
+    let kdc = e.client.clone().with_fast_armor(armor_tgt(&e));
+    let tgt = kdc.login_with_password(&e.p("alice"), "alicepw").unwrap();
+    let st = kdc
+        .service_ticket(&tgt, &e.p("host/svc.krb5.test"))
+        .unwrap();
+    establish(&e, &st);
+    if let Some((_, conf)) = cross(&e) {
+        let x = KdcClient::from_config(&conf, &e.realm)
+            .unwrap()
+            .with_fast_armor(armor_tgt(&e));
+        let tgt = x.login_with_password(&e.p("alice"), "alicepw").unwrap();
+        let far = Principal::new(krb5::client::NT_SRV_HST, ["host", "server.far.test"], "");
+        let st = x.service_ticket(&tgt, &far).unwrap();
+        establish_with(&e, &st, "far.keytab");
+    }
+}

@@ -14,6 +14,7 @@ use crate::acceptor::Keytab;
 use crate::ccache::{CCache, CacheError, CacheName, same_principal};
 use std::collections::HashMap;
 
+mod fast;
 pub(crate) mod krbcred;
 mod xrealm;
 use crate::config::{self, ClientDefaults, ConfigError, Krb5Conf};
@@ -43,6 +44,7 @@ const KU_AS_REP_ENC_PART: u32 = 3;
 const KU_TGS_REQ_AUTH_CKSUM: u32 = 6;
 const KU_TGS_REQ_AUTH: u32 = 7;
 const KU_TGS_REP_ENC_PART_SESSION: u32 = 8;
+const KU_TGS_REP_ENC_PART_SUBKEY: u32 = 9;
 
 // RFC 4120 §7.5.2 / RFC 6113 PA-DATA types.
 const PA_TGS_REQ: i32 = 1;
@@ -407,6 +409,8 @@ pub struct KdcClient {
     resolver: Option<Resolver>,
     /// Other realms' KDCs given explicitly, ahead of `conf` and DNS.
     realm_kdcs: HashMap<String, Vec<String>>,
+    /// A TGT to armor AS requests with (FAST).
+    fast_armor: Option<Credentials>,
 }
 
 impl KdcClient {
@@ -433,7 +437,19 @@ impl KdcClient {
             conf: Krb5Conf::empty(),
             resolver: None,
             realm_kdcs: HashMap::new(),
+            fast_armor: None,
         }
+    }
+
+    /// Armor every AS exchange (login) with FAST (RFC 6113), as MIT's
+    /// `kinit -T` does: `armor` is a TGT for this realm, typically a
+    /// host's from its keytab ([`KdcClient::login_with_keytab`]) or one
+    /// read from a cache. The KDC must support FAST; pre-authentication is
+    /// then the encrypted challenge, and the KDC proves it knows the
+    /// client's key too. See the `fast` module docs.
+    pub fn with_fast_armor(mut self, armor: Credentials) -> Self {
+        self.fast_armor = Some(armor);
+        self
     }
 
     /// Use `kdcs` for `realm` when a cross-realm request needs its KDC,
@@ -747,21 +763,50 @@ impl KdcClient {
         let kdc_options = kdc_options | (tgt.flags & KDC_TKT_COMMON_MASK);
         let body = kdc.req_body_with(None, server, nonce, now, &kdc.tgs_enctypes, kdc_options);
 
+        // With FAST, a subkey in the authenticator: it keys the implicit
+        // armor and the reply (MIT send_tgs.c always does this).
+        let subkey = match self.fast_armor {
+            Some(_) => Some(Key::random(tgt.session_key.enctype())?),
+            None => None,
+        };
         let cksum = tgt.session_key.checksum(KU_TGS_REQ_AUTH_CKSUM, &body)?;
         let authenticator = encode_authenticator(
             &tgt.client,
             Some((tgt.session_key.checksum_type(), cksum)),
             usec,
             now,
-            None,
+            subkey.as_ref(),
             None,
         );
         let enc_auth = tgt.session_key.encrypt(KU_TGS_REQ_AUTH, &authenticator)?;
         let ap_req = encode_ap_req(0, &tgt.ticket, tgt.session_key.enctype(), &enc_auth);
 
-        let req = encode_kdc_req(12, &[(PA_TGS_REQ, ap_req)], body);
+        let armor = match &subkey {
+            Some(sk) => Some(fast::Armor::implicit(sk, &tgt.session_key)?),
+            None => None,
+        };
+        let req = match &armor {
+            None => encode_kdc_req(12, &[(PA_TGS_REQ, ap_req)], body),
+            Some(a) => {
+                let fx = a.wrap(&ap_req, &body, &[])?;
+                encode_kdc_req(12, &[(PA_TGS_REQ, ap_req), fx], body)
+            }
+        };
         let rep = match parse_reply(&kdc.exchange(&req)?, 13)? {
-            Reply::Error(e) => return Err(e.into_error()),
+            Reply::Error(e) => {
+                let Some(a) = &armor else {
+                    return Err(e.into_error());
+                };
+                return Err(match e.method_data().and_then(|m| a.open(&m, nonce)) {
+                    Ok(fr) => match fr.padata.iter().find(|(t, _)| *t == fast::PA_FX_ERROR) {
+                        Some((_, inner)) => KrbError::parse(inner)?.into_error(),
+                        None => {
+                            return protocol("expecting FX_ERROR pa-data inside FAST container");
+                        }
+                    },
+                    Err(_) => e.into_error(),
+                });
+            }
             Reply::Rep(r) => r,
         };
         if !same_principal(&rep.client, &tgt.client) {
@@ -771,9 +816,22 @@ impl KdcClient {
             ));
         }
         let ticket_server = rep.ticket_server.clone();
-        let plain = tgt
-            .session_key
-            .decrypt(KU_TGS_REP_ENC_PART_SESSION, &rep.cipher)?;
+        let plain = match (&armor, &subkey) {
+            (Some(a), Some(sk)) => {
+                let fr = a.open(&rep.padata, nonce)?;
+                a.check_finished(&fr, &rep.ticket)?;
+                // RFC 4120 §5.4.2: with a subkey the reply is in it (usage
+                // 9); FAST may strengthen it (MIT krb5int_fast_reply_key).
+                let key = match &fr.strengthen_key {
+                    Some(st) => Key::cf2(st, "strengthenkey", sk, "replykey")?,
+                    None => sk.clone(),
+                };
+                key.decrypt(KU_TGS_REP_ENC_PART_SUBKEY, &rep.cipher)?
+            }
+            _ => tgt
+                .session_key
+                .decrypt(KU_TGS_REP_ENC_PART_SESSION, &rep.cipher)?,
+        };
         let mut creds = rep.into_credentials(&plain, nonce)?;
 
         // MIT's check_reply_server: the ticket and the encrypted part must
@@ -813,6 +871,13 @@ impl KdcClient {
         let krbtgt = Principal::krbtgt(&client.realm);
         let mut padata: Vec<(i32, Vec<u8>)> = Vec::new();
         let mut preauth_key: Option<Key> = None;
+        let armor = match &self.fast_armor {
+            Some(tgt) => {
+                let (now, usec) = now();
+                Some(fast::Armor::from_tgt(tgt, now, usec)?)
+            }
+            None => None,
+        };
 
         for round in 0..2 {
             let (now, usec) = now();
@@ -825,41 +890,106 @@ impl KdcClient {
                 &enctypes,
                 self.as_options(),
             );
-            let req = encode_kdc_req(10, &padata, body);
+            let req = match &armor {
+                None => encode_kdc_req(10, &padata, body),
+                Some(a) => {
+                    let outer = a.wrap(&body, &body, &padata)?;
+                    encode_kdc_req(10, &[outer], body)
+                }
+            };
 
             let rep = match parse_reply(&self.exchange(&req)?, 11)? {
                 Reply::Rep(r) => r,
-                Reply::Error(e) if e.code == KDC_ERR_PREAUTH_REQUIRED && round == 0 => {
-                    let methods = e.method_data()?;
+                Reply::Error(outer) => {
+                    // Under FAST the real error, and the PA-DATA that goes
+                    // with it, are inside the armored response.
+                    let (e, methods) = match &armor {
+                        None => {
+                            let m = outer.method_data()?;
+                            (outer, m)
+                        }
+                        Some(a) => match outer.method_data().and_then(|m| a.open(&m, nonce)) {
+                            Ok(fr) => {
+                                let Some((_, inner)) =
+                                    fr.padata.iter().find(|(t, _)| *t == fast::PA_FX_ERROR)
+                                else {
+                                    return protocol(
+                                        "expecting FX_ERROR pa-data inside FAST container",
+                                    );
+                                };
+                                (KrbError::parse(inner)?, fr.padata.clone())
+                            }
+                            // A KDC that does not speak FAST: its error is the error.
+                            Err(_) => (outer, Vec::new()),
+                        },
+                    };
+                    if e.code != KDC_ERR_PREAUTH_REQUIRED || round != 0 {
+                        return Err(e.into_error());
+                    }
                     let info = choose_salt(&methods, &enctypes).ok_or_else(|| {
                         ClientError::NoKey(
                             "KDC offered no supported enctype for pre-authentication".into(),
                         )
                     })?;
                     let key = derive_key(&secret, client, &info)?;
-                    debug!(
-                        etype = info.etype,
-                        "pre-authenticating with PA-ENC-TIMESTAMP"
-                    );
-                    padata = vec![(PA_ENC_TIMESTAMP, encode_enc_timestamp(&key, now, usec)?)];
+                    padata = match &armor {
+                        None => {
+                            debug!(
+                                etype = info.etype,
+                                "pre-authenticating with PA-ENC-TIMESTAMP"
+                            );
+                            vec![(PA_ENC_TIMESTAMP, encode_enc_timestamp(&key, now, usec)?)]
+                        }
+                        Some(a) => {
+                            if !methods
+                                .iter()
+                                .any(|(t, _)| *t == fast::PA_ENCRYPTED_CHALLENGE)
+                            {
+                                return Err(ClientError::NoKey(
+                                    "the KDC offers no encrypted challenge inside FAST".into(),
+                                ));
+                            }
+                            debug!(
+                                etype = info.etype,
+                                "pre-authenticating with PA-ENCRYPTED-CHALLENGE"
+                            );
+                            // MIT uses the KDC's time from the (armored)
+                            // error, so the client's clock does not matter.
+                            vec![(
+                                fast::PA_ENCRYPTED_CHALLENGE,
+                                a.client_challenge(&key, e.stime, e.susec)?,
+                            )]
+                        }
+                    };
                     // RFC 6113 §5.2: echo the cookie so a stateless KDC can
                     // continue the conversation.
-                    if let Some((_, c)) = methods.iter().find(|(t, _)| *t == PA_FX_COOKIE) {
-                        padata.push((PA_FX_COOKIE, c.clone()));
+                    if let Some(c) = fast::cookie(&methods) {
+                        padata.push(c);
                     }
                     preauth_key = Some(key);
                     continue;
                 }
-                Reply::Error(e) => return Err(e.into_error()),
             };
+
+            let fast_rep = match &armor {
+                None => None,
+                Some(a) => {
+                    let fr = a.open(&rep.padata, nonce)?;
+                    let client = a.check_finished(&fr, &rep.ticket)?;
+                    Some((a, fr, client))
+                }
+            };
+            let reply_padata = fast_rep
+                .as_ref()
+                .map_or(&rep.padata, |(_, fr, _)| &fr.padata);
 
             // The reply key is the long-term key for the enctype the KDC
             // chose; reuse the pre-auth key when it matches, otherwise
             // take the salt from the reply's own PA-DATA.
-            let key = match preauth_key {
+            let long_term = match preauth_key.take() {
                 Some(k) if k.enctype() == rep.enc_etype => k,
                 _ => {
-                    let info = choose_salt(&rep.padata, &[rep.enc_etype]).unwrap_or(SaltInfo {
+                    let info = choose_salt(reply_padata, &[rep.enc_etype]).unwrap_or(SaltInfo {
                         etype: rep.enc_etype,
                         salt: None,
                         params: None,
@@ -867,6 +997,24 @@ impl KdcClient {
                     derive_key(&secret, client, &info)?
                 }
             };
+            let mut key = long_term.clone();
+            if let Some((a, fr, _)) = &fast_rep {
+                // The KDC's encrypted challenge proves it knows our key.
+                if let Some((_, ch)) = fr
+                    .padata
+                    .iter()
+                    .find(|(t, _)| *t == fast::PA_ENCRYPTED_CHALLENGE)
+                {
+                    a.verify_kdc_challenge(&long_term, ch)?;
+                } else if round > 0 {
+                    return protocol(
+                        "the KDC returned no encrypted challenge (KDC not authenticated)",
+                    );
+                }
+                if let Some(sk) = &fr.strengthen_key {
+                    key = Key::cf2(sk, "strengthenkey", &long_term, "replykey")?;
+                }
+            }
             let plain = key
                 .decrypt(KU_AS_REP_ENC_PART, &rep.cipher)
                 .map_err(|e| match secret {
@@ -876,6 +1024,11 @@ impl KdcClient {
                     ))),
                     Secret::Keytab(_) => ClientError::Crypto(e),
                 })?;
+            let mut rep = rep;
+            if let Some((_, _, client)) = fast_rep {
+                // MIT: the finished message names the client.
+                rep.client = client;
+            }
             return rep.into_credentials(&plain, nonce);
         }
         Err(ClientError::Kdc {
@@ -1333,12 +1486,17 @@ pub(crate) struct KrbError {
     pub code: i32,
     pub text: Option<String>,
     pub e_data: Option<Vec<u8>>,
+    /// The KDC's clock (stime, susec).
+    pub stime: i64,
+    pub susec: u32,
 }
 
 impl KrbError {
     pub(crate) fn parse(data: &[u8]) -> Result<Self> {
         let f = Fields::parse_tagged("KRB-ERROR", app(30), data)?;
         Ok(KrbError {
+            stime: f.get(4)?.time()?,
+            susec: f.get(5)?.u32()?,
             code: f.get(6)?.i32()?,
             text: f.opt(11).map(|mut r| r.string()).transpose()?,
             e_data: f

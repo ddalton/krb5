@@ -17,7 +17,9 @@ tickets without shelling out to `kinit`.
 - **KDC client** — AS exchange with a password or keytab, including
   PA-ENC-TIMESTAMP pre-authentication and ETYPE-INFO2 salts; TGS exchange
   for service tickets, in other realms too (RFC 6806 referrals and
-  `[capaths]`, as MIT follows them); UDP and TCP, chosen as MIT chooses. KDCs come from `krb5.conf`, from DNS
+  `[capaths]`, as MIT follows them); FAST armoring (RFC 6113, as with
+  `kinit -T`: the encrypted challenge, armored errors and replies, TGS
+  requests too); UDP and TCP, chosen as MIT chooses. KDCs come from `krb5.conf`, from DNS
   (URI and SRV records, as MIT looks them up), or are passed in directly.
 - **Credential caches** — MIT's `FILE:` format (versions 1-4), `DIR:`
   collections, and `KCM:` (sssd-kcm, the Fedora/RHEL default, or
@@ -39,7 +41,7 @@ tickets without shelling out to `kinit`.
   (`aes128-cts-hmac-sha256-128`, `aes256-cts-hmac-sha384-192`).
 - **Per-message tokens** — RFC 4121 §4.2 Wrap and MIC.
 
-Not implemented: a KDC, FAST, PKINIT, `KEYRING:` and `API:`
+Not implemented: a KDC, PKINIT, `KEYRING:` and `API:`
 caches, and macOS's KCM, which is reached over Mach IPC rather than a
 socket (point `KRB5CCNAME` at a `FILE:` cache there).
 

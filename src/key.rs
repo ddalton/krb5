@@ -126,6 +126,37 @@ impl Key {
         kdf::prf(self.enctype, &self.bytes, input).map_err(|e| KeyError(e.to_string()))
     }
 
+    /// RFC 6113 §5.1 PRF+: `PRF(K, 1 || s) || PRF(K, 2 || s) || ...`,
+    /// truncated to `len` octets (MIT `krb5_c_prfplus`).
+    pub fn prf_plus(&self, s: &[u8], len: usize) -> Result<Vec<u8>, KeyError> {
+        let mut out = Vec::with_capacity(len);
+        let mut input = Vec::with_capacity(1 + s.len());
+        for i in 1u8..=255 {
+            if out.len() >= len {
+                break;
+            }
+            input.clear();
+            input.push(i);
+            input.extend_from_slice(s);
+            out.extend_from_slice(&self.prf(&input)?);
+        }
+        if out.len() < len {
+            return Err(KeyError("PRF+ output too long".into()));
+        }
+        out.truncate(len);
+        Ok(out)
+    }
+
+    /// RFC 6113 §5.1 KRB-FX-CF2: `PRF+(k1, pepper1) XOR PRF+(k2, pepper2)`,
+    /// as a key of `k1`'s enctype (random-to-key is the identity for AES),
+    /// as MIT's `krb5_c_fx_cf2_simple`.
+    pub fn cf2(k1: &Key, pepper1: &str, k2: &Key, pepper2: &str) -> Result<Key, KeyError> {
+        let n = k1.enctype.key_size();
+        let a = k1.prf_plus(pepper1.as_bytes(), n)?;
+        let b = k2.prf_plus(pepper2.as_bytes(), n)?;
+        Key::new(k1.enctype(), a.iter().zip(&b).map(|(x, y)| x ^ y).collect())
+    }
+
     /// Constant-time `verify_mic`.
     pub fn verify_checksum(
         &self,
@@ -173,6 +204,31 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.0.contains("below the enctype's default"), "{e}");
+    }
+
+    /// MIT's lib/crypto/crypto_tests/t_cf2.in and t_cf2.expected: k1 and
+    /// k2 are string-to-key("key1", salt "key1") and ("key2", "key2") with
+    /// default parameters, peppers "a" and "b".
+    #[test]
+    fn cf2_matches_mit_t_cf2() {
+        for (etype, want) in [
+            (17, "97df97e4b798b29eb31ed7280287a92a"),
+            (
+                18,
+                "4d6ca4e629785c1f01baf55e2e548566b9617ae3a96868c337cb93b5e72b1c7b",
+            ),
+            (19, "edd02a39d2dbde31611c16e610be062c"),
+            (
+                20,
+                "67f6ea530aea85a37dcbb23349ea52dcc61ca8493ff557252327fd8304341584",
+            ),
+        ] {
+            let k1 = Key::from_password(etype, "key1", b"key1", None).unwrap();
+            let k2 = Key::from_password(etype, "key2", b"key2", None).unwrap();
+            let k = Key::cf2(&k1, "a", &k2, "b").unwrap();
+            assert_eq!(k.bytes(), hex(want), "enctype {etype}");
+            assert_eq!(k.enctype(), etype);
+        }
     }
 
     #[test]

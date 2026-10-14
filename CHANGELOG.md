@@ -7,6 +7,23 @@ may break the API).
 
 ## [Unreleased]
 
+### Added
+
+- FAST (RFC 6113), as MIT's `kinit -T` uses it:
+  `KdcClient::with_fast_armor` takes a TGT (a host's, from its keytab, or
+  one from a cache) whose AP-REQ, with a fresh subkey, armors every AS
+  request. The request body and pre-authentication travel encrypted in
+  the armor key; pre-authentication is the encrypted challenge, and the
+  KDC's own challenge is verified, so the KDC is authenticated too.
+  Replies must carry the armored response with the request's nonce and a
+  `finished` checksum over the ticket; a strengthen key, if sent, is
+  applied to the reply key; errors are unwrapped from `PA-FX-ERROR` and
+  cookies echoed. TGS requests from such a client are armored as MIT
+  armors them, with the implicit armor of the TGT and an authenticator
+  subkey, whose key (strengthened) then decrypts the reply.
+- `Key::prf_plus` and `Key::cf2` (KRB-FX-CF2), checked against MIT's
+  `t_cf2` vectors.
+
 ## [0.6.0] - 2026-10-14
 
 ### Added
