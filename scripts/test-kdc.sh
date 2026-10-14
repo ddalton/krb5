@@ -71,10 +71,15 @@ k() {
 # string-to-key path is exercised.
 k addprinc -pw alicepw alice
 k addprinc -pw bobpw -requires_preauth bob
-for e in $ENCTYPES; do
-    n=$(case $e in
+# A function, not $(case ...): bash 3.2 (macOS) cannot parse ;; inside $().
+enctype_number() {
+    case $1 in
         aes128-cts-hmac-sha1-96) echo 17 ;; aes256-cts-hmac-sha1-96) echo 18 ;;
-        aes128-cts-hmac-sha256-128) echo 19 ;; aes256-cts-hmac-sha384-192) echo 20 ;; esac)
+        aes128-cts-hmac-sha256-128) echo 19 ;; aes256-cts-hmac-sha384-192) echo 20 ;;
+    esac
+}
+for e in $ENCTYPES; do
+    n=$(enctype_number "$e")
     k addprinc -pw "pw$n" -e "$e:normal" "u$n"
     k addprinc -randkey -e "$e:normal" "svc$n/svc.krb5.test"
     k ktadd -k "$DIR/service.keytab" -e "$e:normal" "svc$n/svc.krb5.test"
