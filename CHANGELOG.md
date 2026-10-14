@@ -7,6 +7,8 @@ may break the API).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-14
+
 ### Added
 
 - `kadmin::AdminClient`: a client for MIT's `kadmind`, as `kadmin` uses it.
@@ -353,7 +355,8 @@ Initial release: the GSS-API acceptor extracted from
 - RFC 3961 n-fold and DR/DK, RFC 3962 and RFC 8009 AES enctypes.
 - RFC 4121 Wrap and MIC tokens.
 
-[Unreleased]: https://github.com/ddalton/krb5/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/ddalton/krb5/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/ddalton/krb5/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/ddalton/krb5/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/ddalton/krb5/compare/v0.6.2...v0.7.0
 [0.6.2]: https://github.com/ddalton/krb5/compare/v0.6.1...v0.6.2
