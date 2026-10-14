@@ -12,6 +12,7 @@
 //! subkey in the AP-REP (MIT does for the AES enctypes), RFC 4121 §2 makes
 //! that the per-message key and sets the AcceptorSubkey token flag.
 
+use crate::client::krbcred;
 use crate::client::{
     ClientError, Credentials, KrbError, Result, decode_encrypted_data, decode_key, encode_ap_req,
     encode_authenticator,
@@ -66,10 +67,32 @@ pub struct InitiatorContext {
 impl InitiatorContext {
     /// Build the initial context token for `creds` (a service ticket).
     ///
-    /// `flags` are `GSS_C_*_FLAG`s. Delegation is not supported and is
-    /// ignored. Returns the context and the token to send to the acceptor.
+    /// `flags` are `GSS_C_*_FLAG`s. `GSS_C_DELEG_FLAG` is dropped here, as
+    /// there is no TGT to delegate; see [`InitiatorContext::new_delegating`].
+    /// Returns the context and the token to send to the acceptor.
     pub fn new(creds: &Credentials, flags: u32) -> Result<(Self, Vec<u8>)> {
-        let flags = flags & !GSS_C_DELEG_FLAG;
+        Self::build(creds, flags & !GSS_C_DELEG_FLAG, None)
+    }
+
+    /// As [`InitiatorContext::new`], delegating `forwarded` (a forwarded
+    /// TGT, from [`KdcClient::forwarded_tgt`](crate::KdcClient::forwarded_tgt))
+    /// to the acceptor, as `gss_init_sec_context` does with
+    /// `GSS_C_DELEG_FLAG`: a KRB-CRED in the authenticator checksum
+    /// (RFC 4121 §4.1.1), encrypted in the ticket session key as the RFC
+    /// requires and MIT does. `GSS_C_DELEG_FLAG` is added to `flags`.
+    pub fn new_delegating(
+        creds: &Credentials,
+        flags: u32,
+        forwarded: &Credentials,
+    ) -> Result<(Self, Vec<u8>)> {
+        Self::build(creds, flags | GSS_C_DELEG_FLAG, Some(forwarded))
+    }
+
+    fn build(
+        creds: &Credentials,
+        flags: u32,
+        forwarded: Option<&Credentials>,
+    ) -> Result<(Self, Vec<u8>)> {
         let d = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
@@ -78,10 +101,14 @@ impl InitiatorContext {
         // MIT keeps the initial sequence number below 2^30 so wraparound
         // never reaches the sign bit.
         let seq_number = rand::thread_rng().next_u32() & 0x3FFF_FFFF;
+        let deleg = match forwarded {
+            Some(f) => Some(krbcred::encode(f, &creds.session_key, ctime, cusec)?),
+            None => None,
+        };
 
         let authenticator = encode_authenticator(
             &creds.client,
-            Some((CKSUMTYPE_GSSAPI, gss_checksum(flags))),
+            Some((CKSUMTYPE_GSSAPI, gss_checksum(flags, deleg.as_deref())?)),
             cusec,
             ctime,
             Some(&subkey),
@@ -159,7 +186,8 @@ impl InitiatorContext {
         self.established
     }
 
-    /// The flags actually requested (delegation removed).
+    /// The flags actually requested (`GSS_C_DELEG_FLAG` only when
+    /// delegating).
     pub fn flags(&self) -> u32 {
         self.flags
     }
@@ -199,13 +227,25 @@ impl InitiatorContext {
 }
 
 /// RFC 4121 §4.1.1 checksum: Lgth (16, little-endian), Bnd (MD5 of the
-/// channel bindings; all zero for none), Flags (little-endian).
-fn gss_checksum(flags: u32) -> Vec<u8> {
-    let mut c = Vec::with_capacity(24);
+/// channel bindings; all zero for none), Flags (little-endian), and, when
+/// delegating, DlgOpt (1), Dlgth and the KRB-CRED, both little-endian.
+fn gss_checksum(flags: u32, deleg: Option<&[u8]>) -> Result<Vec<u8>> {
+    let mut c = Vec::with_capacity(28 + deleg.map_or(0, <[u8]>::len));
     c.extend_from_slice(&16u32.to_le_bytes());
     c.extend_from_slice(&[0u8; 16]);
     c.extend_from_slice(&flags.to_le_bytes());
-    c
+    if let Some(d) = deleg {
+        // MIT's KRB5KRB_ERR_FIELD_TOOLONG: the checksum must fit an int16.
+        if d.len() + 28 > i16::MAX as usize {
+            return Err(ClientError::Protocol(
+                "delegated credentials too long".into(),
+            ));
+        }
+        c.extend_from_slice(&1u16.to_le_bytes());
+        c.extend_from_slice(&(d.len() as u16).to_le_bytes());
+        c.extend_from_slice(d);
+    }
+    Ok(c)
 }
 
 /// RFC 2743 §3.1 InitialContextToken framing, which RFC 4121 §4.1 also
@@ -307,8 +347,23 @@ mod tests {
     }
 
     #[test]
+    fn the_gss_checksum_carries_a_krb_cred_after_the_flags() {
+        let c = gss_checksum(GSS_C_DELEG_FLAG | GSS_C_MUTUAL_FLAG, Some(b"KRBCRED")).unwrap();
+        let mut want = vec![16, 0, 0, 0];
+        want.extend([0u8; 16]);
+        want.extend((GSS_C_DELEG_FLAG | GSS_C_MUTUAL_FLAG).to_le_bytes());
+        want.extend([1, 0, 7, 0]); // DlgOpt 1, Dlgth 7, little-endian
+        want.extend(b"KRBCRED");
+        assert_eq!(c, want);
+        assert!(
+            gss_checksum(GSS_C_DELEG_FLAG, Some(&vec![0; 32740])).is_err(),
+            "int16 limit"
+        );
+    }
+
+    #[test]
     fn the_gss_checksum_is_little_endian() {
-        let c = gss_checksum(GSS_C_MUTUAL_FLAG | GSS_C_INTEG_FLAG);
+        let c = gss_checksum(GSS_C_MUTUAL_FLAG | GSS_C_INTEG_FLAG, None).unwrap();
         assert_eq!(c.len(), 24);
         assert_eq!(&c[..4], &[16, 0, 0, 0]);
         assert_eq!(&c[20..], &[0x22, 0, 0, 0]);

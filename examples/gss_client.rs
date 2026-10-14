@@ -5,7 +5,9 @@
 //!
 //!     gss_client <kdc host:port> <client@REALM> <password> <service@REALM>
 //!
-//! `GSS_CLIENT_ENCTYPE=<17-20>` restricts the requested session enctype.
+//! `GSS_CLIENT_ENCTYPE=<17-20>` restricts the requested session enctype;
+//! `GSS_CLIENT_DELEGATE=1` logs in forwardable and delegates a forwarded
+//! TGT to the acceptor (`GSS_C_DELEG_FLAG`).
 //!
 //! Protocol: prints the AP-REQ token, reads the AP-REP, prints a Wrap of
 //! "ping", reads a Wrap that must contain "pong", prints "ok".
@@ -37,6 +39,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(et) = std::env::var("GSS_CLIENT_ENCTYPE") {
         kdc = kdc.with_enctypes(&[et.parse()?]);
     }
+    let delegate = std::env::var_os("GSS_CLIENT_DELEGATE").is_some();
+    kdc = kdc.with_forwardable(delegate);
 
     let tgt = kdc.login_with_password(&client, password)?;
     let creds = kdc.service_ticket(&tgt, &service)?;
@@ -47,10 +51,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         creds.session_key.enctype()
     );
 
-    let (mut ctx, token) = InitiatorContext::new(
-        &creds,
-        GSS_C_MUTUAL_FLAG | GSS_C_INTEG_FLAG | GSS_C_CONF_FLAG,
-    )?;
+    let flags = GSS_C_MUTUAL_FLAG | GSS_C_INTEG_FLAG | GSS_C_CONF_FLAG;
+    let (mut ctx, token) = if delegate {
+        let fwd = kdc.forwarded_tgt(&tgt, Some(creds.session_key.enctype()))?;
+        InitiatorContext::new_delegating(&creds, flags, &fwd)?
+    } else {
+        InitiatorContext::new(&creds, flags)?
+    };
     println!("{}", hex(&token));
 
     let mut lines = std::io::stdin().lock().lines();

@@ -14,6 +14,7 @@ use crate::acceptor::Keytab;
 use crate::ccache::{CCache, CacheError, CacheName, same_principal};
 use std::collections::HashMap;
 
+pub(crate) mod krbcred;
 mod xrealm;
 use crate::config::{self, ClientDefaults, ConfigError, Krb5Conf};
 use crate::der::{self, Fields, Reader, app};
@@ -288,6 +289,8 @@ const TKT_FLG_OK_AS_DELEGATE: u32 = 1 << 18;
 const KDC_OPT_FORWARDABLE: u32 = 1 << 30;
 const KDC_OPT_PROXIABLE: u32 = 1 << 28;
 const KDC_OPT_RENEWABLE: u32 = 1 << 23;
+/// Bit 2, not 4 (which is `proxy`).
+const KDC_OPT_FORWARDED: u32 = 1 << 29;
 /// MIT's KDC_TKT_COMMON_MASK: the ticket flags a TGS request asks for again.
 const KDC_TKT_COMMON_MASK: u32 = 0x5480_0000;
 
@@ -713,6 +716,23 @@ impl KdcClient {
     /// [`Principal::host_service`]) to let the KDC say where it lives.
     pub fn service_ticket(&self, tgt: &Credentials, service: &Principal) -> Result<Credentials> {
         self.get_creds(tgt, service, &mut NoStore)
+    }
+
+    /// A forwarded copy of `tgt` (the client's own TGT) for delegation: a
+    /// TGS request for it again with the FORWARDED option, as MIT's
+    /// `krb5_fwd_tgt_creds` makes, preferring `enctype` for its session key
+    /// (MIT asks for the service session key's) and taking any if the KDC
+    /// will not. The TGT must be forwardable; the KDC refuses otherwise
+    /// (`KDC_ERR_BADOPTION`).
+    pub fn forwarded_tgt(&self, tgt: &Credentials, enctype: Option<i32>) -> Result<Credentials> {
+        let me = Principal::krbtgt(&tgt.client.realm);
+        if let Some(e) = enctype {
+            let pref = self.clone().with_tgs_enctypes(&[e]);
+            if let Ok(c) = pref.tgs(tgt, &me, KDC_OPT_FORWARDED) {
+                return Ok(c);
+            }
+        }
+        self.tgs(tgt, &me, KDC_OPT_FORWARDED)
     }
 
     /// One TGS exchange with the KDC of the realm `tgt` is for: a ticket

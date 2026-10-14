@@ -379,6 +379,15 @@ pub struct KerberosContext {
     pub base_key_enctype: EncType,
     /// True when the initiator supplied a subkey and it was adopted.
     pub used_initiator_subkey: bool,
+    /// The initiator's `GSS_C_*_FLAG`s from the RFC 4121 authenticator
+    /// checksum (0 if it sent none). `GSS_C_DELEG_FLAG` is set only if
+    /// credentials were actually delegated, as MIT reports it.
+    pub gss_flags: u32,
+    /// A TGT the initiator delegated (`GSS_C_DELEG_FLAG`), usable as the
+    /// client: to get service tickets with
+    /// [`KdcClient::service_ticket`](crate::KdcClient::service_ticket), or to
+    /// store with [`CCache::with_credentials`](crate::CCache::with_credentials).
+    pub delegated: Option<crate::Credentials>,
 }
 
 /// Kerberos key usage constants (RFC 4120 Section 7.5.1)
@@ -870,6 +879,9 @@ impl EncTicketPart {
 struct Authenticator {
     crealm: String,
     cname: Vec<String>,
+    /// `cksum[3]`: (cksumtype, checksum). For GSS-API, type 0x8003 carries
+    /// the context flags and any delegated credentials (RFC 4121 §4.1.1).
+    cksum: Option<(i32, Vec<u8>)>,
     cusec: u32,
     ctime: i64,
     subkey: Option<SessionKey>,
@@ -949,11 +961,22 @@ impl Authenticator {
         let cname = parse_principal_name(cname_data)?;
         remaining = rest;
 
-        // Skip optional cksum[3]
-        if !remaining.is_empty() && remaining[0] == 0xA3 {
-            let (_, rest) = extract_tagged_field(remaining, 0xA3)?;
+        // Optional cksum[3]: Checksum ::= SEQUENCE { cksumtype [0], checksum [1] }
+        let cksum = if !remaining.is_empty() && remaining[0] == 0xA3 {
+            let (ck, rest) = extract_tagged_field(remaining, 0xA3)?;
             remaining = rest;
-        }
+            let (tag, _, header) = parse_der_tag_length(ck)?;
+            if tag != 0x30 {
+                return Err(KerberosError::ParseError(
+                    "Expected SEQUENCE for Checksum".into(),
+                ));
+            }
+            let (t, rest) = extract_tagged_field(&ck[header..], 0xA0)?;
+            let (v, _) = extract_tagged_field(rest, 0xA1)?;
+            Some((parse_asn1_integer(t)?, parse_asn1_octet_string(v)?))
+        } else {
+            None
+        };
 
         // Parse cusec[4]
         let (cusec_data, rest) = extract_tagged_field(remaining, 0xA4)?;
@@ -985,6 +1008,7 @@ impl Authenticator {
         Ok(Authenticator {
             crealm,
             cname,
+            cksum,
             cusec,
             ctime,
             subkey,
@@ -1549,6 +1573,62 @@ fn parse_der_tag_length(data: &[u8]) -> Result<(u8, usize, usize)> {
 
 /// Extract tagged field from ASN.1 SEQUENCE
 /// Returns (value_bytes, remaining_bytes)
+/// GSS_C_DELEG_FLAG (RFC 2743).
+const GSS_C_DELEG_FLAG: u32 = 1;
+/// RFC 4121 §4.1.1 DlgOpt for a KRB-CRED.
+const KRB5_GSS_FOR_CREDS_OPTION: u16 = 1;
+
+/// RFC 4121 §4.1.1 checksum value: Lgth (16) and Bnd, then Flags; when
+/// GSS_C_DELEG_FLAG is set and more follows, DlgOpt (1), Dlgth and the
+/// KRB-CRED (all little-endian), as MIT's `kg_verify_checksum` reads it.
+/// Returns the flags, with GSS_C_DELEG_FLAG kept only if a KRB-CRED came.
+fn parse_gss_checksum(ck: &[u8]) -> Result<(u32, Option<&[u8]>)> {
+    let bad = |m: &str| KerberosError::InvalidAuthenticator(format!("GSS checksum: {m}"));
+    if ck.len() < 24 {
+        return Err(bad("shorter than 24 octets"));
+    }
+    let lgth = u32::from_le_bytes(ck[0..4].try_into().unwrap());
+    if lgth != 16 {
+        return Err(bad("channel-binding length is not 16"));
+    }
+    let mut flags = u32::from_le_bytes(ck[20..24].try_into().unwrap());
+    let mut deleg = None;
+    if flags & GSS_C_DELEG_FLAG != 0 && ck.len() >= 28 {
+        let opt = u16::from_le_bytes([ck[24], ck[25]]);
+        if opt != KRB5_GSS_FOR_CREDS_OPTION {
+            return Err(bad("DlgOpt is not 1"));
+        }
+        let len = u16::from_le_bytes([ck[26], ck[27]]) as usize;
+        deleg = Some(
+            ck.get(28..28 + len)
+                .ok_or_else(|| bad("Dlgth overruns the checksum"))?,
+        );
+    }
+    if deleg.is_none() {
+        flags &= !GSS_C_DELEG_FLAG;
+    }
+    Ok((flags, deleg))
+}
+
+/// The delegated TGT in a KRB-CRED, sealed in the session key (RFC 4121)
+/// or the initiator's subkey, or unencrypted (RFC 6448), as MIT's
+/// `rd_and_store_for_creds` accepts them.
+fn decode_delegated(
+    krb_cred: &[u8],
+    session_key: &SessionKey,
+    subkey: Option<&SessionKey>,
+) -> Result<crate::Credentials> {
+    let to_key = |k: &SessionKey| crate::Key::new(k.enctype as i32, k.key.clone()).ok();
+    let keys: Vec<crate::Key> = [Some(session_key), subkey]
+        .into_iter()
+        .flatten()
+        .filter_map(to_key)
+        .collect();
+    let refs: Vec<&crate::Key> = keys.iter().collect();
+    crate::client::krbcred::decode(krb_cred, &refs)
+        .map_err(|e| KerberosError::InvalidAuthenticator(format!("delegated credentials: {e}")))
+}
+
 fn extract_tagged_field(data: &[u8], expected_tag: u8) -> Result<(&[u8], &[u8])> {
     let (tag, length, header_size) = parse_der_tag_length(data)?;
 
@@ -1771,7 +1851,28 @@ impl KerberosContext {
             info!("   Adopting the initiator's subkey as the per-message base key");
         }
 
+        let (gss_flags, delegated) = match &authenticator.cksum {
+            Some((0x8003, ck)) => {
+                let (flags, deleg) = parse_gss_checksum(ck)?;
+                let delegated = match deleg {
+                    Some(d) => Some(decode_delegated(
+                        d,
+                        &session_key,
+                        authenticator.subkey.as_ref(),
+                    )?),
+                    None => None,
+                };
+                (flags, delegated)
+            }
+            _ => (0, None),
+        };
+        if delegated.is_some() {
+            info!("   Initiator delegated a TGT");
+        }
+
         let context = KerberosContext {
+            gss_flags,
+            delegated,
             client_principal: format!("{}@{}", client_name, enc_ticket_part.crealm),
             service_principal: format!("{}@{}", service_name, service_key.realm),
             session_key: session_key.key.clone(),
@@ -1985,6 +2086,44 @@ mod tests {
         assert_eq!(EncType::from_i32(19), Some(EncType::AES128CtsHmacSha256128));
         assert_eq!(EncType::from_i32(20), Some(EncType::AES256CtsHmacSha384192));
         assert_eq!(EncType::from_i32(999), None);
+    }
+
+    fn gss_ck(flags: u32, tail: &[u8]) -> Vec<u8> {
+        let mut c = 16u32.to_le_bytes().to_vec();
+        c.extend([0u8; 16]);
+        c.extend(flags.to_le_bytes());
+        c.extend_from_slice(tail);
+        c
+    }
+
+    #[test]
+    fn gss_checksums_parse_as_mit_reads_them() {
+        // Flags only.
+        assert_eq!(
+            parse_gss_checksum(&gss_ck(0x3e, &[])).unwrap(),
+            (0x3e, None)
+        );
+        // DELEG set with a KRB-CRED.
+        let ck = gss_ck(0x3f, &[1, 0, 3, 0, b'a', b'b', b'c']);
+        assert_eq!(parse_gss_checksum(&ck).unwrap(), (0x3f, Some(&b"abc"[..])));
+        // DELEG set but nothing after the flags: the flag is not reported.
+        assert_eq!(
+            parse_gss_checksum(&gss_ck(0x3f, &[])).unwrap(),
+            (0x3e, None)
+        );
+        // Malformed.
+        assert!(
+            parse_gss_checksum(&gss_ck(0x3f, &[1, 0, 9, 0, b'a'])).is_err(),
+            "Dlgth overruns"
+        );
+        assert!(
+            parse_gss_checksum(&gss_ck(0x3f, &[2, 0, 0, 0])).is_err(),
+            "DlgOpt not 1"
+        );
+        assert!(parse_gss_checksum(&gss_ck(0, &[])[..23]).is_err(), "short");
+        let mut lg = gss_ck(0, &[]);
+        lg[0] = 17;
+        assert!(parse_gss_checksum(&lg).is_err(), "Lgth not 16");
     }
 
     #[test]
@@ -2535,6 +2674,7 @@ mod tests {
     #[test]
     fn test_authenticator_validate_success() {
         let auth = Authenticator {
+            cksum: None,
             crealm: "TEST.REALM".to_string(),
             cname: vec!["user".to_string()],
             cusec: 0,
@@ -2550,6 +2690,7 @@ mod tests {
     #[test]
     fn test_authenticator_validate_time_skew() {
         let auth = Authenticator {
+            cksum: None,
             crealm: "TEST.REALM".to_string(),
             cname: vec!["user".to_string()],
             cusec: 0,

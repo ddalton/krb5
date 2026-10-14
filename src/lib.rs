@@ -27,7 +27,7 @@
 //! Supported enctypes are the four AES ones: 17/18
 //! (`aes{128,256}-cts-hmac-sha1-96`, RFC 3962) and 19/20
 //! (`aes128-cts-hmac-sha256-128`, `aes256-cts-hmac-sha384-192`, RFC 8009).
-//! Not implemented: a KDC, FAST, PKINIT, delegation, KEYRING and API
+//! Not implemented: a KDC, FAST, PKINIT, KEYRING and API
 //! credential caches, and macOS's Mach-based KCM.
 //!
 //! # Evidence

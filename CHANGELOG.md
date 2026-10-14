@@ -36,8 +36,19 @@ may break the API).
   TCP only. `KdcClient::with_udp`, `with_udp_preference_limit`,
   `client::Transport`, `dns::locate_kdc_servers`.
 
+- Delegation (`GSS_C_DELEG_FLAG`), as MIT's GSS-API does it:
+  `KdcClient::forwarded_tgt` gets a forwarded TGT (FORWARDED, preferring
+  the service session key's enctype), `InitiatorContext::new_delegating`
+  sends it as a KRB-CRED in the RFC 4121 authenticator checksum, sealed in
+  the ticket session key; the acceptor reads the checksum it used to skip,
+  and `KerberosContext::delegated` holds the TGT (decrypted with the
+  session key or subkey, or unencrypted, as MIT accepts it) and
+  `KerberosContext::gss_flags` the initiator's flags.
+
 ### Changed
 
+- `KerberosContext` has two new public fields, `gss_flags` and
+  `delegated`.
 - Requests go over UDP first by default (see above); `with_udp(false)`
   keeps the previous TCP-only behaviour.
 - DNS lookup follows MIT's order with both transports: URI `tcp` and

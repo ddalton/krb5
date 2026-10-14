@@ -960,3 +960,126 @@ fn udp_preference_limit_from_krb5_conf() {
         seen.lock().unwrap()
     );
 }
+
+// ------------------------------------------------------------ delegation
+
+/// TicketFlags forwarded (bit 2).
+const FORWARDED: u32 = 1 << 29;
+
+/// Our initiator delegates a forwarded TGT to our acceptor, which can then
+/// act as the client: it buys a ticket to another service with it.
+#[test]
+fn a_delegated_tgt_reaches_the_acceptor_and_works() {
+    let e = live!();
+    let kdc = e.client.clone().with_forwardable(true);
+    let tgt = kdc.login_with_password(&e.p("alice"), "alicepw").unwrap();
+    let st = kdc
+        .service_ticket(&tgt, &e.p("host/svc.krb5.test"))
+        .unwrap();
+    let fwd = kdc
+        .forwarded_tgt(&tgt, Some(st.session_key.enctype()))
+        .unwrap();
+    assert_eq!(
+        fwd.flags & FORWARDED,
+        FORWARDED,
+        "the KDC marked it forwarded"
+    );
+    assert_eq!(
+        fwd.session_key.enctype(),
+        st.session_key.enctype(),
+        "MIT's enctype preference"
+    );
+
+    let flags = GSS_C_MUTUAL_FLAG | GSS_C_INTEG_FLAG;
+    let (mut ini, token) = InitiatorContext::new_delegating(&st, flags, &fwd).unwrap();
+    let (acc, ap_rep) = KerberosContext::accept_token(&e.keytab("service.keytab"), &token).unwrap();
+    ini.step(&ap_rep).unwrap();
+    assert_eq!(
+        acc.gss_flags & krb5::initiator::GSS_C_DELEG_FLAG,
+        krb5::initiator::GSS_C_DELEG_FLAG
+    );
+    let deleg = acc.delegated.expect("delegated credentials");
+    assert_eq!(deleg.client, tgt.client);
+    assert_eq!(deleg.ticket, fwd.ticket);
+
+    // The acceptor, as alice, to a third service.
+    let onward = e
+        .client
+        .service_ticket(&deleg, &e.p("svc18/svc.krb5.test"))
+        .unwrap();
+    assert_eq!(onward.client, tgt.client);
+    establish(&e, &onward);
+}
+
+/// A TGT that is not forwardable cannot be forwarded; and without
+/// new_delegating nothing is delegated, whatever the flags say.
+#[test]
+fn delegation_needs_a_forwardable_tgt_and_asking_for_it() {
+    let e = live!();
+    let tgt = e
+        .client
+        .login_with_password(&e.p("alice"), "alicepw")
+        .unwrap();
+    let err = e.client.forwarded_tgt(&tgt, None).unwrap_err();
+    assert_eq!(err.kdc_code(), Some(13), "KDC_ERR_BADOPTION: {err}");
+
+    let st = e
+        .client
+        .service_ticket(&tgt, &e.p("host/svc.krb5.test"))
+        .unwrap();
+    let (_, token) =
+        InitiatorContext::new(&st, krb5::initiator::GSS_C_DELEG_FLAG | GSS_C_MUTUAL_FLAG).unwrap();
+    let (acc, _) = KerberosContext::accept_token(&e.keytab("service.keytab"), &token).unwrap();
+    assert!(acc.delegated.is_none());
+    assert_eq!(acc.gss_flags & krb5::initiator::GSS_C_DELEG_FLAG, 0);
+}
+
+/// True if python3 can import MIT's GSS-API bindings.
+fn python_gssapi() -> bool {
+    std::process::Command::new("python3")
+        .args(["-c", "import gssapi"])
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// MIT's gss_init_sec_context delegates; our acceptor decodes the
+/// KRB-CRED and uses the TGT.
+#[test]
+fn mit_delegates_to_our_acceptor() {
+    let e = live!();
+    if !mit_tools_installed() || !python_gssapi() {
+        eprintln!("MIT's tools or python3-gssapi missing; skipping");
+        return;
+    }
+    let path = scratch(&e, "deleg-mit");
+    let name = format!("FILE:{}", path.display());
+    mit(&e, &name, "kinit", &["-f", "alice"], Some("alicepw\n")).unwrap();
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/mit-initiator.py");
+    let token = mit(
+        &e,
+        &name,
+        "python3",
+        &[
+            script,
+            &format!("host/svc.krb5.test@{}", e.realm),
+            "delegate",
+        ],
+        None,
+    )
+    .unwrap();
+    let token: Vec<u8> = (0..token.trim().len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&token.trim()[i..i + 2], 16).unwrap())
+        .collect();
+    let (acc, _) = KerberosContext::accept_token(&e.keytab("service.keytab"), &token).unwrap();
+    assert_eq!(acc.client_principal, format!("alice@{}", e.realm));
+    let deleg = acc.delegated.expect("MIT delegated a TGT");
+    assert_eq!(deleg.server, Principal::krbtgt(&e.realm));
+    assert_eq!(deleg.flags & FORWARDED, FORWARDED);
+    let onward = e
+        .client
+        .service_ticket(&deleg, &e.p("svc18/svc.krb5.test"))
+        .unwrap();
+    establish(&e, &onward);
+    let _ = std::fs::remove_file(&path);
+}

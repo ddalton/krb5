@@ -31,13 +31,15 @@ tickets without shelling out to `kinit`.
   (enctype lists, `ticket_lifetime`, `renew_lifetime`, `forwardable`,
   `proxiable`).
 - **Initiator** — the AP-REQ context token (subkey, sequence number,
-  RFC 4121 checksum) and AP-REP verification, including acceptor subkeys.
+  RFC 4121 checksum) and AP-REP verification, including acceptor subkeys;
+  delegation of a forwarded TGT (`GSS_C_DELEG_FLAG`), which the acceptor
+  receives and can use.
 - **Crypto** — RFC 3961 n-fold and DR/DK, RFC 3962
   (`aes128/256-cts-hmac-sha1-96`), RFC 8009
   (`aes128-cts-hmac-sha256-128`, `aes256-cts-hmac-sha384-192`).
 - **Per-message tokens** — RFC 4121 §4.2 Wrap and MIC.
 
-Not implemented: a KDC, FAST, PKINIT, delegation, `KEYRING:` and `API:`
+Not implemented: a KDC, FAST, PKINIT, `KEYRING:` and `API:`
 caches, and macOS's KCM, which is reached over Mach IPC rather than a
 socket (point `KRB5CCNAME` at a `FILE:` cache there).
 
