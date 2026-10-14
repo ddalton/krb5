@@ -30,6 +30,9 @@ use tracing::debug;
 pub use xrealm::MAX_HOPS;
 use xrealm::{KDC_OPT_CANONICALIZE, NoStore, TgtStore, is_tgs, tgt_realm};
 
+#[cfg(feature = "pkinit")]
+use crate::pkinit;
+
 /// RFC 4120 §6.2 name types.
 pub const NT_PRINCIPAL: i32 = 1;
 pub const NT_SRV_INST: i32 = 2;
@@ -95,6 +98,10 @@ pub enum ClientError {
     /// referral back to where we started.
     #[error("cross-realm: {0}")]
     Referral(String),
+    /// PKINIT failed on the client's side: the KDC's certificate, its
+    /// signature, or the client's own identity.
+    #[error("PKINIT: {0}")]
+    Pkinit(String),
 }
 
 impl From<der::DerError> for ClientError {
@@ -136,7 +143,17 @@ pub fn kdc_error_name(code: i32) -> &'static str {
         37 => "KRB_AP_ERR_SKEW",
         41 => "KRB_AP_ERR_MODIFIED",
         60 => "KRB_ERR_GENERIC",
+        62 => "KDC_ERR_CLIENT_NOT_TRUSTED",
+        63 => "KDC_ERR_KDC_NOT_TRUSTED",
+        64 => "KDC_ERR_INVALID_SIG",
+        65 => "KDC_ERR_DH_KEY_PARAMETERS_NOT_ACCEPTED",
         68 => "KDC_ERR_WRONG_REALM",
+        70 => "KDC_ERR_CANT_VERIFY_CERTIFICATE",
+        71 => "KDC_ERR_INVALID_CERTIFICATE",
+        72 => "KDC_ERR_REVOKED_CERTIFICATE",
+        75 => "KDC_ERR_CLIENT_NAME_MISMATCH",
+        76 => "KDC_ERR_KDC_NAME_MISMATCH",
+        77 => "KDC_ERR_INCONSISTENT_KEY_PURPOSE",
         _ => "unknown",
     }
 }
@@ -435,6 +452,26 @@ impl TgtStore for CacheStore<'_> {
 enum Secret<'a> {
     Password(&'a str),
     Keytab(&'a Keytab),
+    /// PKINIT with a certificate, or anonymous PKINIT (`None`).
+    #[cfg(feature = "pkinit")]
+    Pkinit(Option<&'a pkinit::Identity>),
+}
+
+/// Where an AS exchange is with PKINIT.
+#[derive(Default)]
+struct PkState {
+    /// PA-PK-AS-REQ goes with every request from now on.
+    pending: bool,
+    #[cfg(feature = "pkinit")]
+    request: Option<pkinit::Request>,
+    /// The KDC's freshness token (RFC 8070), echoed in the AuthPack.
+    #[cfg(feature = "pkinit")]
+    freshness: Option<Vec<u8>>,
+    /// The KDC offered PA-PKINIT-KX (RFC 6112).
+    #[cfg(feature = "pkinit")]
+    rfc6112_kdc: bool,
+    #[cfg(feature = "pkinit")]
+    dh_bits: u32,
 }
 
 /// Salt information from ETYPE-INFO2 / ETYPE-INFO / PW-SALT.
@@ -473,6 +510,8 @@ pub struct KdcClient {
     /// required from the first request or taken up when the KDC offers it.
     fast_armor: Option<Credentials>,
     fast_required: bool,
+    #[cfg(feature = "pkinit")]
+    pkinit: pkinit::Settings,
 }
 
 impl KdcClient {
@@ -501,6 +540,8 @@ impl KdcClient {
             realm_kdcs: HashMap::new(),
             fast_armor: None,
             fast_required: false,
+            #[cfg(feature = "pkinit")]
+            pkinit: pkinit::Settings::default(),
         }
     }
 
@@ -642,6 +683,10 @@ impl KdcClient {
     }
 
     fn remembering(mut self, conf: &Krb5Conf, resolver: Option<&Resolver>) -> Self {
+        #[cfg(feature = "pkinit")]
+        {
+            self.pkinit = pkinit::Settings::from_config(conf, &self.realm);
+        }
         self.conf = conf.clone();
         self.resolver = resolver.cloned();
         self
@@ -802,6 +847,109 @@ impl KdcClient {
             )));
         }
         self.as_exchange(client, Secret::Keytab(keytab), have)
+    }
+
+    /// Trust `anchors` for KDC certificates, in place of the
+    /// `pkinit_anchors` from `krb5.conf`.
+    #[cfg(feature = "pkinit")]
+    pub fn with_pkinit_anchors(mut self, anchors: pkinit::TrustAnchors) -> Self {
+        self.pkinit.anchors = Some(anchors);
+        self
+    }
+
+    /// Accept a KDC certificate whose dNSName is one of `hostnames` (with
+    /// the KDC key purpose), as `pkinit_kdc_hostname` does, besides one
+    /// naming `krbtgt/REALM@REALM`.
+    #[cfg(feature = "pkinit")]
+    pub fn with_pkinit_kdc_hostnames<I, S>(mut self, hostnames: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.pkinit.kdc_hostnames = hostnames.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// The smallest DH group to offer, in bits, as `pkinit_dh_min_bits`:
+    /// 2048 (the default) or 4096.
+    #[cfg(feature = "pkinit")]
+    pub fn with_pkinit_dh_min_bits(mut self, bits: u32) -> Self {
+        self.pkinit.dh_min_bits = bits;
+        self
+    }
+
+    /// Armor every login with FAST using an anonymous PKINIT TGT, as
+    /// `[realms] REALM auto_fast_armor = true` does in MIT, unless armor
+    /// is given ([`KdcClient::with_fast_armor`]). The KDC must allow
+    /// anonymous PKINIT. Read from `krb5.conf` by
+    /// [`KdcClient::from_config`].
+    #[cfg(feature = "pkinit")]
+    pub fn with_auto_fast_armor(mut self, yes: bool) -> Self {
+        self.pkinit.auto_fast_armor = yes;
+        self
+    }
+
+    /// Anonymous PKINIT (RFC 8062), `kinit -n @REALM`: a TGT for
+    /// `WELLKNOWN/ANONYMOUS@WELLKNOWN:ANONYMOUS` from this realm's KDC,
+    /// whose certificate must chain to the PKINIT trust anchors. The
+    /// ticket names no one; it serves as FAST armor, or for services that
+    /// accept anonymous clients.
+    #[cfg(feature = "pkinit")]
+    pub fn login_anonymous(&self) -> Result<Credentials> {
+        self.anonymous(&self.realm).map(|(c, _)| c)
+    }
+
+    /// `kinit -n`: [`KdcClient::login_anonymous`], written to `cache`.
+    #[cfg(feature = "pkinit")]
+    pub fn kinit_anonymous(&self, cache: &CacheName) -> Result<Credentials> {
+        let (creds, info) = self.anonymous(&self.realm)?;
+        write_kinit_cache(cache, &creds, &info)?;
+        Ok(creds)
+    }
+
+    #[cfg(feature = "pkinit")]
+    fn anonymous(&self, realm: &str) -> Result<(Credentials, AsInfo)> {
+        self.as_exchange(
+            &pkinit::anonymous_principal(realm),
+            Secret::Pkinit(None),
+            self.tkt_enctypes.clone(),
+        )
+    }
+
+    /// PKINIT with a certificate (RFC 4556), `kinit -X
+    /// X509_user_identity=FILE:cert.pem,key.pem client`: the KDC checks
+    /// the client's certificate and its signature, and maps the
+    /// certificate to `client`; the client checks the KDC's in turn.
+    #[cfg(feature = "pkinit")]
+    pub fn login_with_certificate(
+        &self,
+        client: &Principal,
+        identity: &pkinit::Identity,
+    ) -> Result<Credentials> {
+        self.as_exchange(
+            client,
+            Secret::Pkinit(Some(identity)),
+            self.tkt_enctypes.clone(),
+        )
+        .map(|(c, _)| c)
+    }
+
+    /// [`KdcClient::login_with_certificate`], written to `cache` as
+    /// `kinit` writes it.
+    #[cfg(feature = "pkinit")]
+    pub fn kinit_with_certificate(
+        &self,
+        client: &Principal,
+        identity: &pkinit::Identity,
+        cache: &CacheName,
+    ) -> Result<Credentials> {
+        let (creds, info) = self.as_exchange(
+            client,
+            Secret::Pkinit(Some(identity)),
+            self.tkt_enctypes.clone(),
+        )?;
+        write_kinit_cache(cache, &creds, &info)?;
+        Ok(creds)
     }
 
     /// A ticket for `service` through the credential cache `cache`, as
@@ -990,6 +1138,31 @@ impl KdcClient {
         enctypes: Vec<i32>,
     ) -> Result<(Credentials, AsInfo)> {
         let krbtgt = Principal::krbtgt(&client.realm);
+        #[allow(unused_mut)]
+        let mut kdc_options = self.as_options();
+        #[cfg(feature = "pkinit")]
+        let anonymous = matches!(secret, Secret::Pkinit(None));
+        #[cfg(feature = "pkinit")]
+        {
+            if anonymous {
+                kdc_options |= pkinit::KDC_OPT_REQUEST_ANONYMOUS;
+            }
+            // MIT's auto_fast_armor: armor with an anonymous PKINIT TGT
+            // good for an hour, unless armor was given.
+            if self.fast_armor.is_none() && self.pkinit.auto_fast_armor && !anonymous {
+                debug!("auto_fast_armor: getting armor by anonymous PKINIT");
+                let armor = self
+                    .clone()
+                    .with_lifetime(Duration::from_secs(3600))
+                    .with_renew_lifetime(None)
+                    .anonymous(&client.realm)?
+                    .0;
+                return self
+                    .clone()
+                    .with_fast_armor(armor)
+                    .as_exchange(client, secret, enctypes);
+            }
+        }
         // MIT's state: whether we armor, whether we may still upgrade to
         // FAST or drop the informational PA-DATA (each once), and the
         // pre-authentication chosen.
@@ -1000,6 +1173,12 @@ impl KdcClient {
         let mut preauth_key: Option<Key> = None;
         let mut pa_type: Option<i32> = None;
         let mut armor: Option<fast::Armor> = None;
+        #[allow(unused_mut)]
+        let mut pk = PkState::default();
+        #[cfg(feature = "pkinit")]
+        {
+            pk.dh_bits = self.pkinit.dh_min_bits;
+        }
 
         for _ in 0..4 {
             if armored && armor.is_none() {
@@ -1012,17 +1191,31 @@ impl KdcClient {
             }
             let (now, usec) = now();
             let nonce = random_nonce();
-            let body = self.req_body_with(
-                Some(client),
-                &krbtgt,
-                nonce,
-                now,
-                &enctypes,
-                self.as_options(),
-            );
+            let body =
+                self.req_body_with(Some(client), &krbtgt, nonce, now, &enctypes, kdc_options);
+            let mut padata = preauth.clone();
+            #[cfg(feature = "pkinit")]
+            if let Secret::Pkinit(identity) = &secret {
+                if pk.pending {
+                    let (value, request) = pkinit::request(&pkinit::RequestInput {
+                        identity: *identity,
+                        rfc6112_kdc: pk.rfc6112_kdc,
+                        body: &body,
+                        nonce,
+                        now,
+                        usec,
+                        freshness: pk.freshness.as_deref(),
+                        dh_bits: pk.dh_bits,
+                    })?;
+                    padata.insert(0, (pkinit::PA_PK_AS_REQ, value));
+                    pk.request = Some(request);
+                } else if info_pa {
+                    // RFC 8070: ask for a freshness token.
+                    padata.push((pkinit::PA_AS_FRESHNESS, Vec::new()));
+                }
+            }
             // RFC 6806 §11: ask for the KDC's checksum over this request
             // and its FAST support in the encrypted reply.
-            let mut padata = preauth.clone();
             if info_pa {
                 padata.push((PA_REQ_ENC_PA_REP, Vec::new()));
             }
@@ -1072,18 +1265,53 @@ impl KdcClient {
                         preauth.clear();
                         preauth_key = None;
                         pa_type = None;
+                        pk = PkState {
+                            #[cfg(feature = "pkinit")]
+                            dh_bits: pk.dh_bits,
+                            ..PkState::default()
+                        };
                         continue;
                     }
                     // A pre-1.7 MIT KDC rejects the informational PA-DATA
                     // as failed pre-authentication: retry without it.
                     if e.code == KDC_ERR_PREAUTH_FAILED
                         && preauth.is_empty()
+                        && !pk.pending
                         && info_pa
                         && !restarted
                     {
                         debug!("KDC refused PA-REQ-ENC-PA-REP; retrying without it");
                         info_pa = false;
                         restarted = true;
+                        continue;
+                    }
+                    #[cfg(feature = "pkinit")]
+                    if let Secret::Pkinit(_) = &secret {
+                        // MIT tries the next larger group once when the
+                        // KDC wants more than it was offered.
+                        if e.code == pkinit::KDC_ERR_DH_KEY_PARAMETERS_NOT_ACCEPTED
+                            && pk.request.as_ref().is_some_and(|r| r.dh_bits() < 4096)
+                        {
+                            debug!("KDC refused the DH group; retrying with 4096 bits");
+                            pk.dh_bits = 4096;
+                            pk.request = None;
+                            continue;
+                        }
+                        if e.code != KDC_ERR_PREAUTH_REQUIRED || pk.pending {
+                            return Err(e.into_error());
+                        }
+                        if !methods.iter().any(|(t, _)| *t == pkinit::PA_PK_AS_REQ) {
+                            return Err(ClientError::NoKey("the KDC does not offer PKINIT".into()));
+                        }
+                        debug!("pre-authenticating with PKINIT");
+                        pk.freshness = methods
+                            .iter()
+                            .find(|(t, v)| *t == pkinit::PA_AS_FRESHNESS && !v.is_empty())
+                            .map(|(_, v)| v.clone());
+                        pk.rfc6112_kdc = methods.iter().any(|(t, _)| *t == pkinit::PA_PKINIT_KX);
+                        pk.pending = true;
+                        pa_type = Some(pkinit::PA_PK_AS_REQ);
+                        preauth = fast::cookie(&methods).into_iter().collect();
                         continue;
                     }
                     if e.code != KDC_ERR_PREAUTH_REQUIRED || !preauth.is_empty() {
@@ -1148,11 +1376,41 @@ impl KdcClient {
                 .as_ref()
                 .map_or(&rep.padata, |(_, fr, _)| &fr.padata);
 
+            #[cfg(feature = "pkinit")]
+            let kx: Vec<(i32, Vec<u8>)> = reply_padata
+                .iter()
+                .filter(|(t, _)| *t == pkinit::PA_PKINIT_KX)
+                .cloned()
+                .collect();
             // The reply key is the long-term key for the enctype the KDC
             // chose; reuse the pre-auth key when it matches, otherwise
-            // take the salt from the reply's own PA-DATA.
-            let long_term = match preauth_key.take() {
-                Some(k) if k.enctype() == rep.enc_etype => k,
+            // take the salt from the reply's own PA-DATA. With PKINIT it
+            // comes from the DH exchange.
+            let long_term = match (&secret, preauth_key.take()) {
+                #[cfg(feature = "pkinit")]
+                (Secret::Pkinit(_), _) => {
+                    let Some(state) = &pk.request else {
+                        return Err(ClientError::NoKey(
+                            "the KDC answered without PKINIT pre-authentication".into(),
+                        ));
+                    };
+                    let Some((_, value)) = reply_padata
+                        .iter()
+                        .find(|(t, _)| *t == pkinit::PA_PK_AS_REP)
+                    else {
+                        return protocol("the KDC's reply has no PA-PK-AS-REP");
+                    };
+                    state.reply_key(&pkinit::ReplyInput {
+                        settings: &self.pkinit,
+                        pa_value: value,
+                        realm: &client.realm,
+                        client,
+                        as_req: &req,
+                        enctype: rep.enc_etype,
+                        now,
+                    })?
+                }
+                (_, Some(k)) if k.enctype() == rep.enc_etype => k,
                 _ => {
                     let info = choose_salt(reply_padata, &[rep.enc_etype]).unwrap_or(SaltInfo {
                         etype: rep.enc_etype,
@@ -1187,7 +1445,7 @@ impl KdcClient {
                         "cannot decrypt AS-REP (wrong password?): {}",
                         e.0
                     ))),
-                    Secret::Keytab(_) => ClientError::Crypto(e),
+                    _ => ClientError::Crypto(e),
                 })?;
             let fast_avail = verify_enc_pa_rep(&plain, &key, &req)?;
             let mut rep = rep;
@@ -1196,6 +1454,10 @@ impl KdcClient {
                 rep.client = client;
             }
             let creds = rep.into_credentials(&plain, nonce)?;
+            #[cfg(feature = "pkinit")]
+            if anonymous {
+                pkinit::verify_anonymous(&kx, &long_term, &creds.session_key)?;
+            }
             return Ok((
                 creds,
                 AsInfo {
@@ -1443,6 +1705,10 @@ fn derive_key(secret: &Secret<'_>, client: &Principal, info: &SaltInfo) -> Resul
                 info.etype
             ))
         }),
+        #[cfg(feature = "pkinit")]
+        Secret::Pkinit(_) => Err(ClientError::NoKey(
+            "PKINIT has no long-term key to derive".into(),
+        )),
     }
 }
 

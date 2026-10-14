@@ -15,6 +15,7 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain }}
       - run: cargo test
+      - run: cargo test --features pkinit
   doc:
     runs-on: ubuntu-latest
     steps:
@@ -26,6 +27,9 @@ jobs:
       - run: cargo doc --no-deps --document-private-items
         env:
           RUSTDOCFLAGS: -D warnings
+      - run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
   lint:
     runs-on: ubuntu-latest
     steps:
@@ -35,6 +39,7 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --features pkinit -- -D warnings
   live-kdc:
     # The client against a real MIT KDC, and its GSS tokens against MIT's
     # own acceptor. Pinned: it depends on the distro's MIT krb5 and
@@ -45,10 +50,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: |
           sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq krb5-kdc krb5-admin-server krb5-user python3-gssapi
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq krb5-kdc krb5-admin-server krb5-user krb5-pkinit python3-gssapi
       - run: scripts/test-kdc.sh "$RUNNER_TEMP/krb5test"
       - run: cat "$RUNNER_TEMP/krb5test/test.env" >> "$GITHUB_ENV"
-      - run: cargo test --test kdc -- --nocapture
+      # PKINIT must be set up here, not skipped.
+      - run: test "$KRB5_TEST_PKINIT" = 1
+      - run: cargo test --features pkinit --test kdc -- --nocapture
         env:
           # Also compare the DNS resolver with dig on public realms' records.
           KRB5_TEST_DNS: "1"

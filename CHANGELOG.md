@@ -7,6 +7,33 @@ may break the API).
 
 ## [Unreleased]
 
+### Added
+
+- PKINIT, behind the new `pkinit` feature (the default build's
+  dependencies are unchanged; the feature adds only crypto-bigint):
+  - `KdcClient::login_with_certificate` / `kinit_with_certificate`: an X.509
+    certificate and RSA key (`pkinit::Identity`, loaded from PEM as
+    `X509_user_identity = FILE:cert,key` names them) sign the AuthPack in a
+    CMS SignedData (RFC 4556).
+  - `KdcClient::login_anonymous` / `kinit_anonymous`: anonymous PKINIT
+    (RFC 8062), `kinit -n`. The session key is checked to come from the
+    KDC's PA-PKINIT-KX contribution, as MIT checks it.
+  - `auto_fast_armor` (`[realms]`, or `KdcClient::with_auto_fast_armor`):
+    every login is FAST-armored with an anonymous PKINIT TGT.
+  - Diffie-Hellman over MODP groups 14 and 16 (`pkinit_dh_min_bits`), with
+    the KDC's group retried once; the RFC 8636 KDFs (SHA-1/256/512) and
+    octetstring2key; freshness tokens (RFC 8070).
+  - The KDC's reply is verified: its CMS signature, its certificate's
+    chain to `pkinit_anchors` (`pkinit::TrustAnchors`, `FILE:` or `DIR:`;
+    validity, CA flags, key usage, path length, critical extensions), its
+    name (a PKINIT subjectAltName of `krbtgt/REALM@REALM`, or a dNSName in
+    `pkinit_kdc_hostname` with the KDC key purpose), and its nonce.
+  - All in pure Rust: X.509, CMS, PKCS #1 v1.5 RSA (verification compares
+    the whole encoded block; signing is constant-time) and DH on
+    crypto-bigint. Not supported yet: elliptic-curve keys and ECDH,
+    PKCS #11/#12 identities, revocation checking.
+- `ClientError::Pkinit`, and names for the PKINIT KDC error codes.
+
 ## [0.6.2] - 2026-10-14
 
 ### Added

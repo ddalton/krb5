@@ -1356,3 +1356,307 @@ fn an_armor_cache_upgrades_or_starts_armored() {
     let _ = std::fs::remove_file(with);
     let _ = std::fs::remove_file(without);
 }
+
+// ------------------------------------------------------------------ PKINIT
+
+/// PKINIT against the KDC `scripts/test-kdc.sh` sets up when openssl and
+/// MIT's pkinit plugin are there (`KRB5_TEST_PKINIT=1`): a CA in
+/// `pki/ca.pem`, the KDC's certificate, and one for alice.
+#[cfg(feature = "pkinit")]
+mod pkinit {
+    use super::*;
+    use krb5::CacheName;
+    use krb5::pkinit::{Identity, TrustAnchors};
+
+    macro_rules! pk {
+        () => {{
+            let e = live!();
+            if std::env::var("KRB5_TEST_PKINIT").ok().as_deref() != Some("1") {
+                eprintln!("KRB5_TEST_PKINIT not set; skipping PKINIT test");
+                return;
+            }
+            e
+        }};
+    }
+
+    fn conf(e: &Env, extra: &str) -> krb5::Krb5Conf {
+        let base = std::fs::read_to_string(format!("{}/krb5.conf", e.dir)).unwrap();
+        krb5::Krb5Conf::parse(&format!("{base}\n{extra}\n")).unwrap()
+    }
+
+    /// A client from the realm's krb5.conf, whose pkinit_anchors is the
+    /// test CA.
+    fn client(e: &Env) -> KdcClient {
+        KdcClient::from_config(&conf(e, ""), &e.realm).unwrap()
+    }
+
+    fn alice(e: &Env) -> Identity {
+        Identity::load(&format!(
+            "FILE:{0}/pki/alice.pem,{0}/pki/alice-key.pem",
+            e.dir
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn anonymous_pkinit_gives_an_anonymous_tgt_that_works() {
+        let e = pk!();
+        let tgt = client(&e).login_anonymous().unwrap();
+        assert_eq!(
+            tgt.client.to_string(),
+            "WELLKNOWN/ANONYMOUS@WELLKNOWN:ANONYMOUS"
+        );
+        assert_eq!(tgt.server, Principal::krbtgt(&e.realm));
+        let st = e
+            .client
+            .service_ticket(&tgt, &e.p("host/svc.krb5.test"))
+            .unwrap();
+        establish(&e, &st);
+    }
+
+    #[test]
+    fn certificate_login_then_a_service_ticket() {
+        let e = pk!();
+        let id = alice(&e);
+        assert_eq!(id.principals(), [e.p("alice")]);
+        for bits in [2048, 4096] {
+            let tgt = client(&e)
+                .with_pkinit_dh_min_bits(bits)
+                .login_with_certificate(&e.p("alice"), &id)
+                .unwrap();
+            assert_eq!(tgt.client, e.p("alice"));
+            let st = e
+                .client
+                .service_ticket(&tgt, &e.p("host/svc.krb5.test"))
+                .unwrap();
+            establish(&e, &st);
+        }
+    }
+
+    /// PKINIT inside FAST armor: the AuthPack's checksum is over the inner
+    /// body, the KDF over the whole armored request.
+    #[test]
+    fn certificate_login_inside_fast_armor() {
+        let e = pk!();
+        let tgt = client(&e)
+            .with_fast_armor(armor_tgt(&e))
+            .login_with_certificate(&e.p("alice"), &alice(&e))
+            .unwrap();
+        assert_eq!(tgt.client, e.p("alice"));
+    }
+
+    #[test]
+    fn the_kdc_refuses_a_certificate_for_someone_else() {
+        let e = pk!();
+        let err = client(&e)
+            .login_with_certificate(&e.p("robot"), &alice(&e))
+            .unwrap_err();
+        // KDC_ERR_CLIENT_NAME_MISMATCH
+        assert_eq!(err.kdc_code(), Some(75), "{err}");
+        // bob needs no pre-authentication: the KDC answers in bob's
+        // password key, which a certificate holder cannot have, so the
+        // reply is refused rather than half-trusted.
+        let err = client(&e)
+            .login_with_certificate(&e.p("bob"), &alice(&e))
+            .unwrap_err();
+        assert!(matches!(err, krb5::ClientError::NoKey(_)), "{err}");
+    }
+
+    #[test]
+    fn a_kdc_certificate_from_an_untrusted_ca_is_refused() {
+        let e = pk!();
+        let other =
+            TrustAnchors::from_pem(include_bytes!("../src/pkinit/testdata/other-ca.pem")).unwrap();
+        for c in [
+            client(&e).with_pkinit_anchors(other),
+            KdcClient::new(e.realm.clone(), [std::env::var("KRB5_TEST_KDC").unwrap()]),
+        ] {
+            let err = c.login_anonymous().unwrap_err();
+            assert!(matches!(err, krb5::ClientError::Pkinit(_)), "{err}");
+            let err = c
+                .login_with_certificate(&e.p("alice"), &alice(&e))
+                .unwrap_err();
+            assert!(matches!(err, krb5::ClientError::Pkinit(_)), "{err}");
+        }
+    }
+
+    /// Our kinit -n and kinit -X caches, read by MIT's klist and used by
+    /// MIT's kvno.
+    #[test]
+    fn mit_tools_use_pkinit_caches_we_wrote() {
+        let e = pk!();
+        let path = scratch(&e, "pk-anon");
+        let cache = CacheName::File(path.clone());
+        client(&e).kinit_anonymous(&cache).unwrap();
+        let ccname = format!("FILE:{}", path.display());
+        if let Some(out) = mit(&e, &ccname, "klist", &[], None) {
+            assert!(
+                out.contains("WELLKNOWN/ANONYMOUS@WELLKNOWN:ANONYMOUS"),
+                "{out}"
+            );
+        }
+        let path = scratch(&e, "pk-cert");
+        let cache = CacheName::File(path.clone());
+        client(&e)
+            .kinit_with_certificate(&e.p("alice"), &alice(&e), &cache)
+            .unwrap();
+        // pa_type 16: PA-PK-AS-REQ, as MIT's kinit records it.
+        let cc = cache.read().unwrap();
+        assert_eq!(
+            cc.config("pa_type", Some(&Principal::krbtgt(&e.realm))),
+            Some(&b"16"[..])
+        );
+        let ccname = format!("FILE:{}", path.display());
+        if let Some(out) = mit(&e, &ccname, "kvno", &["host/svc.krb5.test"], None) {
+            assert!(out.contains("host/svc.krb5.test"), "{out}");
+        }
+    }
+
+    /// A relay in front of the KDC, over UDP and TCP, that passes every
+    /// reply through `tamper`.
+    fn tampering_relay(tamper: fn(&mut [u8])) -> String {
+        use std::io::{Read, Write};
+        let kdc: std::net::SocketAddr = std::env::var("KRB5_TEST_KDC").unwrap().parse().unwrap();
+        let u = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = u.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 65535];
+            while let Ok((n, from)) = u.recv_from(&mut buf) {
+                let up = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+                up.connect(kdc).unwrap();
+                up.send(&buf[..n]).unwrap();
+                let mut r = [0u8; 65535];
+                let m = up.recv(&mut r).unwrap();
+                let mut rep = r[..m].to_vec();
+                tamper(&mut rep);
+                u.send_to(&rep, from).unwrap();
+            }
+        });
+        let t = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        std::thread::spawn(move || {
+            for c in t.incoming() {
+                let mut c = c.unwrap();
+                let mut up = std::net::TcpStream::connect(kdc).unwrap();
+                let mut len = [0u8; 4];
+                c.read_exact(&mut len).unwrap();
+                let mut req = vec![0u8; u32::from_be_bytes(len) as usize];
+                c.read_exact(&mut req).unwrap();
+                up.write_all(&len).unwrap();
+                up.write_all(&req).unwrap();
+                up.read_exact(&mut len).unwrap();
+                let mut rep = vec![0u8; u32::from_be_bytes(len) as usize];
+                up.read_exact(&mut rep).unwrap();
+                tamper(&mut rep);
+                c.write_all(&len).unwrap();
+                c.write_all(&rep).unwrap();
+            }
+        });
+        format!("127.0.0.1:{port}")
+    }
+
+    /// Flip the last octet of an AS-REP's PA-PKINIT-KX (type 147) value,
+    /// the end of its ciphertext: `[1] INTEGER 147, [2] OCTET STRING`.
+    /// (KRB-ERRORs advertise PA-PKINIT-KX empty, and pass untouched.)
+    fn corrupt_pkinit_kx(rep: &mut [u8]) {
+        if rep.first() != Some(&0x6B) {
+            return;
+        }
+        let pat = [0xA1, 0x04, 0x02, 0x02, 0x00, 0x93, 0xA2];
+        let Some(at) = rep.windows(pat.len()).position(|w| w == pat) else {
+            return;
+        };
+        let mut i = at + pat.len();
+        let len = match rep[i] {
+            n if n < 0x80 => {
+                i += 1;
+                n as usize
+            }
+            0x81 => {
+                i += 2;
+                rep[i - 1] as usize
+            }
+            _ => {
+                i += 3;
+                (rep[i - 2] as usize) << 8 | rep[i - 1] as usize
+            }
+        };
+        rep[i + len - 1] ^= 1;
+    }
+
+    /// A man in the middle who alters the KDC's PA-PKINIT-KX cannot get
+    /// an anonymous login accepted: the session key must come from it.
+    #[test]
+    fn an_altered_pkinit_kx_fails_the_anonymous_login() {
+        let e = pk!();
+        let addr = tampering_relay(corrupt_pkinit_kx);
+        let anchors = TrustAnchors::load(&format!("FILE:{}/pki/ca.pem", e.dir)).unwrap();
+        let c = KdcClient::new(e.realm.clone(), [addr]).with_pkinit_anchors(anchors.clone());
+        let err = c.login_anonymous().unwrap_err();
+        assert!(matches!(err, krb5::ClientError::Crypto(_)), "{err}");
+        // Untouched, the same relay path works.
+        let clean = tampering_relay(|_| {});
+        KdcClient::new(e.realm.clone(), [clean])
+            .with_pkinit_anchors(anchors)
+            .login_anonymous()
+            .unwrap();
+    }
+
+    /// MIT's `kinit -n` cache is FAST armor for us.
+    #[test]
+    fn mits_anonymous_cache_is_our_fast_armor() {
+        let e = pk!();
+        let path = scratch(&e, "pk-mit-anon");
+        let ccname = format!("FILE:{}", path.display());
+        if mit(
+            &e,
+            &ccname,
+            "kinit",
+            &["-n", &format!("@{}", e.realm)],
+            None,
+        )
+        .is_none()
+        {
+            return;
+        }
+        let kdc = e
+            .client
+            .clone()
+            .with_fast_armor_cache(&CacheName::File(path))
+            .unwrap();
+        let out = scratch(&e, "pk-armored");
+        let out = CacheName::File(out);
+        kdc.kinit_with_password(&e.p("alice"), "alicepw", &out)
+            .unwrap();
+        // PA-ENCRYPTED-CHALLENGE: only possible inside FAST.
+        assert_eq!(
+            out.read()
+                .unwrap()
+                .config("pa_type", Some(&Principal::krbtgt(&e.realm))),
+            Some(&b"138"[..])
+        );
+    }
+
+    /// `auto_fast_armor = true`: an anonymous PKINIT TGT first, then the
+    /// login inside its armor.
+    #[test]
+    fn auto_fast_armor_from_krb5_conf() {
+        let e = pk!();
+        let conf = conf(
+            &e,
+            &format!("[realms]\n {} = {{\n  auto_fast_armor = true\n }}", e.realm),
+        );
+        let anon_before = as_requests(&e, "WELLKNOWN/ANONYMOUS");
+        let out = CacheName::File(scratch(&e, "pk-auto"));
+        KdcClient::from_config(&conf, &e.realm)
+            .unwrap()
+            .kinit_with_password(&e.p("alice"), "alicepw", &out)
+            .unwrap();
+        assert!(as_requests(&e, "WELLKNOWN/ANONYMOUS") > anon_before);
+        assert_eq!(
+            out.read()
+                .unwrap()
+                .config("pa_type", Some(&Principal::krbtgt(&e.realm))),
+            Some(&b"138"[..])
+        );
+    }
+}

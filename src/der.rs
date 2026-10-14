@@ -137,6 +137,12 @@ impl<'a> Reader<'a> {
         self.data.is_empty()
     }
 
+    /// What is left unread.
+    #[cfg(feature = "pkinit")]
+    pub fn rest(&self) -> &'a [u8] {
+        self.data
+    }
+
     /// Read the next TLV, returning its tag and content.
     pub fn next(&mut self) -> Result<(u8, &'a [u8])> {
         let d = self.data;

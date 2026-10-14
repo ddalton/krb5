@@ -15,6 +15,11 @@
 # .far.test map to them ([domain_realm]), which is what makes the KDC
 # answer a host-based request with a referral.
 #
+# If openssl is installed and MIT's PKINIT plugin is present (Debian:
+# krb5-pkinit), KRB5.TEST also does PKINIT: a CA, a KDC certificate and a
+# client certificate for alice made as MIT's PKINIT guide makes them, and
+# WELLKNOWN/ANONYMOUS for anonymous PKINIT. KRB5_TEST_PKINIT=1 then.
+#
 # Writes <dir>/test.env with the KRB5_TEST_* variables the tests read.
 # The keys are random and the passwords are fixed strings: nothing here
 # protects anything.
@@ -62,6 +67,66 @@ cat >"$DIR/krb5.conf" <<EOF
     }
 EOF
 
+# PKINIT: on when openssl and MIT's pkinit plugin are both there.
+PKINIT=
+KDCBIN=$(command -v krb5kdc || true)
+for p in "${KDCBIN%/sbin/krb5kdc}/lib/krb5/plugins/preauth/pkinit.so" \
+         /usr/lib/*/krb5/plugins/preauth/pkinit.so /usr/lib*/krb5/plugins/preauth/pkinit.so; do
+    if [ -f "$p" ] && command -v openssl >/dev/null; then PKINIT=1; fi
+done
+if [ -n "$PKINIT" ]; then
+    P="$DIR/pki"
+    mkdir -p "$P"
+    cat >"$P/ext.cnf" <<EXT
+[kdc_cert]
+basicConstraints=CA:FALSE
+keyUsage=nonRepudiation,digitalSignature,keyEncipherment,keyAgreement
+extendedKeyUsage=1.3.6.1.5.2.3.5
+subjectKeyIdentifier=hash
+authorityKeyIdentifier=keyid,issuer
+subjectAltName=otherName:1.3.6.1.5.2.2;SEQUENCE:kdc_princ_name
+[kdc_princ_name]
+realm=EXP:0,GeneralString:$REALM
+principal_name=EXP:1,SEQUENCE:kdc_principal_seq
+[kdc_principal_seq]
+name_type=EXP:0,INTEGER:2
+name_string=EXP:1,SEQUENCE:kdc_principals
+[kdc_principals]
+princ1=GeneralString:krbtgt
+princ2=GeneralString:$REALM
+[client_cert]
+basicConstraints=CA:FALSE
+keyUsage=digitalSignature,keyEncipherment,keyAgreement
+extendedKeyUsage=1.3.6.1.5.2.3.4
+subjectKeyIdentifier=hash
+authorityKeyIdentifier=keyid,issuer
+subjectAltName=otherName:1.3.6.1.5.2.2;SEQUENCE:princ_name
+[princ_name]
+realm=EXP:0,GeneralString:$REALM
+principal_name=EXP:1,SEQUENCE:principal_seq
+[principal_seq]
+name_type=EXP:0,INTEGER:1
+name_string=EXP:1,SEQUENCE:principals
+[principals]
+princ1=GeneralString:alice
+EXT
+    o() { openssl "$@" 2>/dev/null; }
+    o req -x509 -newkey rsa:2048 -nodes -keyout "$P/ca-key.pem" -out "$P/ca.pem" \
+        -days 3650 -subj "/CN=Test PKINIT CA"
+    o req -newkey rsa:2048 -nodes -keyout "$P/kdc-key.pem" -out "$P/kdc.req" -subj "/CN=kdc"
+    o x509 -req -in "$P/kdc.req" -CA "$P/ca.pem" -CAkey "$P/ca-key.pem" \
+        -CAcreateserial -out "$P/kdc.pem" -days 365 -extfile "$P/ext.cnf" -extensions kdc_cert
+    o req -newkey rsa:2048 -nodes -keyout "$P/alice-key.pem" -out "$P/alice.req" -subj "/CN=alice"
+    o x509 -req -in "$P/alice.req" -CA "$P/ca.pem" -CAkey "$P/ca-key.pem" \
+        -CAcreateserial -out "$P/alice.pem" -days 365 -extfile "$P/ext.cnf" -extensions client_cert
+    cat >>"$DIR/krb5.conf" <<EOF
+[realms]
+    $REALM = {
+        pkinit_anchors = FILE:$P/ca.pem
+    }
+EOF
+fi
+
 cat >"$DIR/kdc.conf" <<EOF
 [kdcdefaults]
     kdc_ports = $PORT
@@ -76,6 +141,7 @@ $(for r in $REALM $XREALM $FREALM; do cat <<REALM
         default_principal_flags = +preauth
         max_life = 1d
         max_renewable_life = 7d
+$( [ -n "$PKINIT" ] && [ "$r" = "$REALM" ] && printf '        pkinit_identity = FILE:%s/pki/kdc.pem,%s/pki/kdc-key.pem\n        pkinit_anchors = FILE:%s/pki/ca.pem\n' "$DIR" "$DIR" "$DIR")
     }
 REALM
 done)
@@ -125,6 +191,10 @@ k ktadd -k "$DIR/service.keytab" host/svc.krb5.test
 k addprinc -randkey robot
 k ktadd -k "$DIR/robot.keytab" robot
 
+if [ -n "$PKINIT" ]; then
+    k addprinc -randkey WELLKNOWN/ANONYMOUS
+fi
+
 # Cross-realm trust: the same krbtgt/B@A, with the same password (so the
 # same keys), in both realms' databases.
 trust() {
@@ -152,5 +222,6 @@ KRB5_TEST_KDC=$HOST:$PORT
 KRB5_TEST_REALM=$REALM
 KRB5_TEST_DIR=$DIR
 KRB5_TEST_CROSS_REALMS="$XREALM $FREALM"
+KRB5_TEST_PKINIT=$PKINIT
 EOF
 echo "KDC for $REALM listening on port $PORT (pid $(cat "$DIR/kdc.pid")); env in $DIR/test.env"

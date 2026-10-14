@@ -21,6 +21,14 @@ tickets without shelling out to `kinit`.
   `kinit -T`: the encrypted challenge, armored errors and replies, TGS
   requests too); UDP and TCP, chosen as MIT chooses. KDCs come from `krb5.conf`, from DNS
   (URI and SRV records, as MIT looks them up), or are passed in directly.
+- **PKINIT** (optional `pkinit` feature) — login with an X.509
+  certificate and RSA key (RFC 4556, `kinit -X X509_user_identity=...`),
+  anonymous PKINIT (RFC 8062, `kinit -n`), and FAST armor from an
+  anonymous TGT (`auto_fast_armor`). Diffie-Hellman over MODP groups 14
+  and 16 with the RFC 8636 KDFs; the KDC's signature, certificate chain
+  (`pkinit_anchors`) and name are checked as MIT checks them. Pure Rust,
+  on crypto-bigint's constant-time arithmetic; no OpenSSL. Not yet:
+  elliptic-curve keys and ECDH, PKCS #11 and PKCS #12 identities.
 - **Credential caches** — MIT's `FILE:` format (versions 1-4), `DIR:`
   collections, and `KCM:` (sssd-kcm, the Fedora/RHEL default, or
   Heimdal's `kcm`, over its Unix socket), so tickets move both ways between this crate and
@@ -41,7 +49,7 @@ tickets without shelling out to `kinit`.
   (`aes128-cts-hmac-sha256-128`, `aes256-cts-hmac-sha384-192`).
 - **Per-message tokens** — RFC 4121 §4.2 Wrap and MIC.
 
-Not implemented: a KDC, PKINIT, `KEYRING:` and `API:`
+Not implemented: a KDC, `KEYRING:` and `API:`
 caches, and macOS's KCM, which is reached over Mach IPC rather than a
 socket (point `KRB5CCNAME` at a `FILE:` cache there).
 

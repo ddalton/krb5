@@ -13,6 +13,9 @@
 //!   keytab, including PA-ENC-TIMESTAMP pre-authentication) and the TGS
 //!   exchange (service tickets, across realms by referral and
 //!   `[capaths]`), over UDP and TCP as MIT chooses between them.
+//! * `pkinit` (with the `pkinit` feature) — PKINIT: login with an X.509
+//!   certificate (`kinit -X`), anonymous PKINIT (`kinit -n`), and FAST
+//!   armor from it (`auto_fast_armor`), in pure Rust.
 //! * [`CCache`] / [`CacheName`] — MIT `FILE:`, `DIR:` and `KCM:`
 //!   credential caches, read and written, for tickets shared with `kinit`
 //!   and `klist`; [`KdcClient::service_ticket_cached`] is `kvno`.
@@ -27,8 +30,8 @@
 //! Supported enctypes are the four AES ones: 17/18
 //! (`aes{128,256}-cts-hmac-sha1-96`, RFC 3962) and 19/20
 //! (`aes128-cts-hmac-sha256-128`, `aes256-cts-hmac-sha384-192`, RFC 8009).
-//! Not implemented: a KDC, PKINIT, KEYRING and API
-//! credential caches, and macOS's Mach-based KCM.
+//! Not implemented: a KDC, KEYRING and API credential caches, and
+//! macOS's Mach-based KCM.
 //!
 //! # Evidence
 //!
@@ -91,6 +94,8 @@ pub mod initiator;
 pub mod kdf; // RFC 3961 §5.1 DR/DK, RFC 3962 §4, RFC 8009 §3
 pub mod key;
 pub mod nfold; // RFC 3961 §5.1 n-fold
+#[cfg(feature = "pkinit")]
+pub mod pkinit; // RFC 4556 PKINIT, RFC 8062 anonymous PKINIT
 pub mod profile; // RFC 3961 §5.3 simplified profile (confounder + HMAC)
 pub mod token; // RFC 4121 §4.2 per-message Wrap and MIC tokens
 
