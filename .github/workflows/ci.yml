@@ -10,7 +10,7 @@ jobs:
         toolchain: ["1.85", stable]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.toolchain }}
@@ -18,7 +18,7 @@ jobs:
   doc:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo doc --no-deps
         env:
@@ -26,20 +26,22 @@ jobs:
       - run: cargo doc --no-deps --document-private-items
         env:
           RUSTDOCFLAGS: -D warnings
-  fmt:
+  lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
       - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
   live-kdc:
     # The client against a real MIT KDC, and its GSS tokens against MIT's
-    # own acceptor.
-    runs-on: ubuntu-latest
+    # own acceptor. Pinned: it depends on the distro's MIT krb5 and
+    # python3-gssapi packages, so a new image is a deliberate upgrade.
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - run: |
           sudo apt-get update -qq
