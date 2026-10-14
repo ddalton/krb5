@@ -39,7 +39,7 @@
 //! On macOS, `/etc/resolv.conf` reflects only the primary resolver, not
 //! per-domain (VPN) resolvers configured with `scutil`.
 
-use crate::config::{Krb5Conf, parse_host_string};
+use crate::config::{Krb5Conf, conf_boolean, parse_host_string};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
@@ -231,26 +231,17 @@ fn bad(msg: impl Into<String>) -> io::Error {
 
 // ----------------------------------------------------------- KDC lookup
 
-/// MIT's `_krb5_conf_boolean`: one of its "yes" words is true, anything
-/// else (not just its "no" words) is false.
-fn conf_bool(v: &str) -> bool {
-    matches!(
-        v.to_ascii_lowercase().as_str(),
-        "y" | "yes" | "true" | "t" | "1" | "on"
-    )
-}
-
 /// `dns_lookup_kdc`, else `dns_fallback`, else true (MIT's default).
 pub fn dns_lookup_kdc(conf: &Krb5Conf) -> bool {
     conf.get(&["libdefaults", "dns_lookup_kdc"])
         .or_else(|| conf.get(&["libdefaults", "dns_fallback"]))
-        .is_none_or(conf_bool)
+        .is_none_or(conf_boolean)
 }
 
 /// `dns_uri_lookup`, default true.
 pub fn dns_uri_lookup(conf: &Krb5Conf) -> bool {
     conf.get(&["libdefaults", "dns_uri_lookup"])
-        .is_none_or(conf_bool)
+        .is_none_or(conf_boolean)
 }
 
 /// MIT's `make_lookup_name`: `service.[protocol.]realm`, made absolute.

@@ -74,6 +74,8 @@ $(for r in $REALM $XREALM $FREALM; do cat <<REALM
         acl_file = $DIR/kadm5.acl
         supported_enctypes = $(for e in $ENCTYPES; do printf '%s:normal ' "$e"; done)
         default_principal_flags = +preauth
+        max_life = 1d
+        max_renewable_life = 7d
     }
 REALM
 done)

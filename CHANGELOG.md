@@ -7,6 +7,32 @@ may break the API).
 
 ## [Unreleased]
 
+### Added
+
+- The `[libdefaults]` settings MIT's clients read, applied by
+  `KdcClient::from_config` and `discover` (`Krb5Conf::client_defaults`):
+  `default_tkt_enctypes` and `default_tgs_enctypes` (falling back to
+  `permitted_enctypes`, then `DEFAULT`), `ticket_lifetime`,
+  `renew_lifetime`, `forwardable` and `proxiable`, the last four also per
+  realm in a `[libdefaults] REALM = { ... }` subsection.
+- `config::parse_enctype_list` and `config::parse_duration`, MIT's
+  enctype-list syntax (names, aliases, families, `DEFAULT`, `+`/`-`) and
+  `krb5_string_to_deltat`, checked against MIT's own functions on 96
+  strings (`testdata/mit-settings.tsv`, `scripts/record-mit-settings.sh`).
+- `KdcClient::with_tkt_enctypes`, `with_tgs_enctypes`,
+  `with_renew_lifetime`, `with_forwardable`, `with_proxiable` and
+  `with_defaults`. AS requests carry the forwardable, proxiable and
+  renewable options (and `rtime`) these ask for.
+- `Krb5Conf::libdefault` and `ConfigError::BadValue`.
+
+### Changed
+
+- `from_config` and `discover` apply the settings above, so a
+  `krb5.conf` that sets them now changes what is asked for, and one whose
+  value does not parse, or leaves no AES enctype, is an error.
+- TGS requests ask again for the TGT's forwardable, proxiable,
+  may-postdate and renewable flags, as MIT's do (`KDC_TKT_COMMON_MASK`).
+
 ## [0.5.0] - 2026-10-14
 
 ### Added

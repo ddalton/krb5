@@ -26,8 +26,10 @@ tickets without shelling out to `kinit`.
   MIT resolves it (`KRB5CCNAME`, `default_ccache_name`,
   `/tmp/krb5cc_%{uid}`).
 - **krb5.conf** — MIT's profile format, parsed as MIT does (includes,
-  final flags, `KRB5_CONFIG` lists): default realm, a realm's KDCs, and
-  `[domain_realm]` host-to-realm mapping.
+  final flags, `KRB5_CONFIG` lists): default realm, a realm's KDCs,
+  `[domain_realm]` host-to-realm mapping, and the client `[libdefaults]`
+  (enctype lists, `ticket_lifetime`, `renew_lifetime`, `forwardable`,
+  `proxiable`).
 - **Initiator** — the AP-REQ context token (subkey, sequence number,
   RFC 4121 checksum) and AP-REP verification, including acceptor subkeys.
 - **Crypto** — RFC 3961 n-fold and DR/DK, RFC 3962

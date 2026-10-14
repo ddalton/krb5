@@ -94,3 +94,16 @@ scripts/record-dns-fixtures.py testdata/dns [nameserver]
 
 The script builds its queries itself, so the fixtures do not depend on the
 Rust encoder they are used to test.
+
+## `mit-settings.tsv` — MIT's reading of durations and enctype lists
+
+Each line is an input (`D` for a `ticket_lifetime`-style duration, `E` for
+a `permitted_enctypes`-style list), a tab, and what MIT krb5's own
+`krb5_string_to_deltat` or `krb5int_parse_enctype_list` made of it:
+seconds, enctype numbers, or `ERR`. `src/config.rs` must agree on every
+line. Recorded by compiling `scripts/record-mit-settings.c` against MIT's
+libkrb5; MIT 1.20 (Ubuntu) and 1.21 (Homebrew) give identical output:
+
+```sh
+scripts/record-mit-settings.sh [path/to/krb5-config]
+```

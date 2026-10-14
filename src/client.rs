@@ -15,7 +15,7 @@ use crate::ccache::{CCache, CacheError, CacheName, same_principal};
 use std::collections::HashMap;
 
 mod xrealm;
-use crate::config::{self, ConfigError, Krb5Conf};
+use crate::config::{self, ClientDefaults, ConfigError, Krb5Conf};
 use crate::der::{self, Fields, Reader, app};
 use crate::dns::{self, Resolver};
 use crate::key::{Key, KeyError};
@@ -283,6 +283,23 @@ impl Credentials {
 /// TicketFlags ok-as-delegate (bit 13).
 const TKT_FLG_OK_AS_DELEGATE: u32 = 1 << 18;
 
+// KDCOptions (RFC 4120 §5.4.1; bit 0 is the MSB). Forwardable, proxiable,
+// allow-postdate and renewable share their bit with the ticket flag.
+const KDC_OPT_FORWARDABLE: u32 = 1 << 30;
+const KDC_OPT_PROXIABLE: u32 = 1 << 28;
+const KDC_OPT_RENEWABLE: u32 = 1 << 23;
+/// MIT's KDC_TKT_COMMON_MASK: the ticket flags a TGS request asks for again.
+const KDC_TKT_COMMON_MASK: u32 = 0x5480_0000;
+
+/// The enctypes this crate can use, in the order given.
+fn supported(enctypes: &[i32]) -> Vec<i32> {
+    enctypes
+        .iter()
+        .copied()
+        .filter(|e| (17..=20).contains(e))
+        .collect()
+}
+
 /// Cross-realm TGTs from a credential cache, and the ones fetched on the
 /// way, to be written back with the ticket.
 struct CacheStore<'a> {
@@ -337,8 +354,13 @@ pub struct KdcClient {
     realm: String,
     kdcs: Vec<String>,
     timeout: Duration,
-    enctypes: Vec<i32>,
+    /// Enctypes asked for in the AS exchange and in TGS exchanges.
+    tkt_enctypes: Vec<i32>,
+    tgs_enctypes: Vec<i32>,
     lifetime: Duration,
+    renew_lifetime: Option<Duration>,
+    forwardable: bool,
+    proxiable: bool,
     /// For locating other realms' KDCs.
     conf: Krb5Conf,
     resolver: Option<Resolver>,
@@ -357,8 +379,12 @@ impl KdcClient {
             realm: realm.into(),
             kdcs: kdcs.into_iter().map(Into::into).collect(),
             timeout: Duration::from_secs(10),
-            enctypes: DEFAULT_ENCTYPES.to_vec(),
+            tkt_enctypes: DEFAULT_ENCTYPES.to_vec(),
+            tgs_enctypes: DEFAULT_ENCTYPES.to_vec(),
             lifetime: Duration::from_secs(24 * 3600),
+            renew_lifetime: None,
+            forwardable: false,
+            proxiable: false,
             conf: Krb5Conf::empty(),
             resolver: None,
             realm_kdcs: HashMap::new(),
@@ -398,9 +424,11 @@ impl KdcClient {
     /// A client for `realm`, finding its KDCs as MIT does: the `kdc`
     /// entries in `conf` (`[realms] REALM kdc`), else, if `dns_lookup_kdc`
     /// allows, DNS URI and SRV records through the system resolver (see
-    /// [`crate::dns`]).
+    /// [`crate::dns`]). Enctypes, lifetimes and ticket flags come from
+    /// `conf` too ([`Krb5Conf::client_defaults`]); `with_*` calls made
+    /// afterwards override them.
     pub fn from_config(conf: &Krb5Conf, realm: &str) -> config::Result<Self> {
-        Self::locate(conf, realm, None)
+        Ok(Self::locate(conf, realm, None)?.with_defaults(&conf.client_defaults(realm)?))
     }
 
     /// [`KdcClient::from_config`] with DNS queries sent to `resolver`
@@ -410,7 +438,7 @@ impl KdcClient {
         realm: &str,
         resolver: &Resolver,
     ) -> config::Result<Self> {
-        Self::locate(conf, realm, Some(resolver))
+        Ok(Self::locate(conf, realm, Some(resolver))?.with_defaults(&conf.client_defaults(realm)?))
     }
 
     fn locate(conf: &Krb5Conf, realm: &str, resolver: Option<&Resolver>) -> config::Result<Self> {
@@ -448,6 +476,21 @@ impl KdcClient {
         })
     }
 
+    /// KDC options for the AS request (MIT get_in_tkt.c).
+    fn as_options(&self) -> u32 {
+        let mut o = 0;
+        if self.forwardable {
+            o |= KDC_OPT_FORWARDABLE;
+        }
+        if self.proxiable {
+            o |= KDC_OPT_PROXIABLE;
+        }
+        if self.renew_lifetime.is_some() {
+            o |= KDC_OPT_RENEWABLE;
+        }
+        o
+    }
+
     fn remembering(mut self, conf: &Krb5Conf, resolver: Option<&Resolver>) -> Self {
         self.conf = conf.clone();
         self.resolver = resolver.cloned();
@@ -466,15 +509,52 @@ impl KdcClient {
         self
     }
 
-    /// Enctypes to request, most preferred first. Unsupported ones are
-    /// dropped.
-    pub fn with_enctypes(mut self, enctypes: &[i32]) -> Self {
-        self.enctypes = enctypes
-            .iter()
-            .copied()
-            .filter(|e| (17..=20).contains(e))
-            .collect();
+    /// Enctypes to request, most preferred first, for initial and service
+    /// tickets alike. Unsupported ones are dropped.
+    pub fn with_enctypes(self, enctypes: &[i32]) -> Self {
+        self.with_tkt_enctypes(enctypes).with_tgs_enctypes(enctypes)
+    }
+
+    /// Enctypes for the AS exchange (`default_tkt_enctypes`).
+    pub fn with_tkt_enctypes(mut self, enctypes: &[i32]) -> Self {
+        self.tkt_enctypes = supported(enctypes);
         self
+    }
+
+    /// Enctypes for TGS exchanges (`default_tgs_enctypes`).
+    pub fn with_tgs_enctypes(mut self, enctypes: &[i32]) -> Self {
+        self.tgs_enctypes = supported(enctypes);
+        self
+    }
+
+    /// Ask for a renewable TGT, renewable for this long (`renew_lifetime`;
+    /// `None`, the default, asks for none).
+    pub fn with_renew_lifetime(mut self, renew: Option<Duration>) -> Self {
+        self.renew_lifetime = renew.filter(|d| !d.is_zero());
+        self
+    }
+
+    /// Ask for a forwardable TGT (`forwardable`; `kinit -f`).
+    pub fn with_forwardable(mut self, yes: bool) -> Self {
+        self.forwardable = yes;
+        self
+    }
+
+    /// Ask for a proxiable TGT (`proxiable`; `kinit -p`).
+    pub fn with_proxiable(mut self, yes: bool) -> Self {
+        self.proxiable = yes;
+        self
+    }
+
+    /// Take every setting `[libdefaults]` has for this client (see
+    /// [`Krb5Conf::client_defaults`]).
+    pub fn with_defaults(self, d: &ClientDefaults) -> Self {
+        self.with_tkt_enctypes(&d.tkt_enctypes)
+            .with_tgs_enctypes(&d.tgs_enctypes)
+            .with_lifetime(d.ticket_lifetime)
+            .with_renew_lifetime(d.renew_lifetime)
+            .with_forwardable(d.forwardable)
+            .with_proxiable(d.proxiable)
     }
 
     /// Requested ticket lifetime (default 24 h; the KDC may shorten it).
@@ -494,7 +574,11 @@ impl KdcClient {
 
     /// AS exchange with a password-derived key: `kinit`.
     pub fn login_with_password(&self, client: &Principal, password: &str) -> Result<Credentials> {
-        self.as_exchange(client, Secret::Password(password), self.enctypes.clone())
+        self.as_exchange(
+            client,
+            Secret::Password(password),
+            self.tkt_enctypes.clone(),
+        )
     }
 
     /// AS exchange with a long-term key from a keytab: `kinit -k`.
@@ -503,7 +587,7 @@ impl KdcClient {
     /// KDC cannot pick one the client has no key for.
     pub fn login_with_keytab(&self, client: &Principal, keytab: &Keytab) -> Result<Credentials> {
         let have: Vec<i32> = self
-            .enctypes
+            .tkt_enctypes
             .iter()
             .copied()
             .filter(|&e| keytab_key(keytab, client, e).is_some())
@@ -574,7 +658,10 @@ impl KdcClient {
         let kdc = self.for_realm(tgt_realm(tgt))?;
         let (now, usec) = now();
         let nonce = random_nonce();
-        let body = kdc.req_body_with(None, server, nonce, now, &kdc.enctypes, kdc_options);
+        // MIT's FLAGS2OPTS: the TGT's forwardable, proxiable, may-postdate
+        // and renewable flags carry over as options (KDC_TKT_COMMON_MASK).
+        let kdc_options = kdc_options | (tgt.flags & KDC_TKT_COMMON_MASK);
+        let body = kdc.req_body_with(None, server, nonce, now, &kdc.tgs_enctypes, kdc_options);
 
         let cksum = tgt.session_key.checksum(KU_TGS_REQ_AUTH_CKSUM, &body)?;
         let authenticator = encode_authenticator(
@@ -646,7 +733,14 @@ impl KdcClient {
         for round in 0..2 {
             let (now, usec) = now();
             let nonce = random_nonce();
-            let body = self.req_body_with(Some(client), &krbtgt, nonce, now, &enctypes, 0);
+            let body = self.req_body_with(
+                Some(client),
+                &krbtgt,
+                nonce,
+                now,
+                &enctypes,
+                self.as_options(),
+            );
             let req = encode_kdc_req(10, &padata, body);
 
             let rep = match parse_reply(&self.exchange(&req)?, 11)? {
@@ -714,7 +808,7 @@ impl KdcClient {
         nonce: u32,
         now: i64,
     ) -> Vec<u8> {
-        self.req_body_with(cname, sname, nonce, now, &self.enctypes, 0)
+        self.req_body_with(cname, sname, nonce, now, &self.tkt_enctypes, 0)
     }
 
     fn req_body_with(
@@ -736,6 +830,11 @@ impl KdcClient {
             5,
             der::time(now + self.lifetime.as_secs() as i64),
         ));
+        // rtime, for a renewable AS request (TGS requests leave it to the
+        // KDC, which renews up to the TGT's own renew-till, as MIT does).
+        if let (Some(renew), Some(_)) = (self.renew_lifetime, cname) {
+            parts.push(der::field(6, der::time(now + renew.as_secs() as i64)));
+        }
         parts.push(der::field(7, der::int(nonce as i64)));
         parts.push(der::field(
             8,

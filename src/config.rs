@@ -64,6 +64,13 @@ pub enum ConfigError {
         realm: String,
         source: std::io::Error,
     },
+    /// A `[libdefaults]` value that does not parse or leaves nothing usable.
+    #[error("[libdefaults] {tag} = {value:?}: {why}")]
+    BadValue {
+        tag: String,
+        value: String,
+        why: String,
+    },
 }
 
 fn origin(path: &Option<PathBuf>) -> String {
@@ -256,6 +263,310 @@ impl Krb5Conf {
                 None => &p[p.find('.')?..],
             };
         }
+    }
+}
+
+/// What `[libdefaults]` says about the tickets a client asks for, for one
+/// realm (see [`Krb5Conf::client_defaults`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientDefaults {
+    /// Enctypes for initial tickets (`default_tkt_enctypes`), AES only.
+    pub tkt_enctypes: Vec<i32>,
+    /// Enctypes for service tickets (`default_tgs_enctypes`), AES only.
+    pub tgs_enctypes: Vec<i32>,
+    /// `ticket_lifetime`, default one day.
+    pub ticket_lifetime: std::time::Duration,
+    /// `renew_lifetime`; `None` (the default, or zero) asks for no
+    /// renewable ticket.
+    pub renew_lifetime: Option<std::time::Duration>,
+    /// `forwardable`, default false.
+    pub forwardable: bool,
+    /// `proxiable`, default false.
+    pub proxiable: bool,
+}
+
+impl Krb5Conf {
+    /// MIT's `krb5int_libdefault_string`: `[libdefaults] REALM = { tag }`
+    /// first, then `[libdefaults] tag`.
+    pub fn libdefault(&self, realm: &str, tag: &str) -> Option<&str> {
+        self.get(&["libdefaults", realm, tag])
+            .or_else(|| self.get(&["libdefaults", tag]))
+    }
+
+    /// The settings MIT's `krb5_get_init_creds` and `krb5_get_credentials`
+    /// read for a client of `realm`:
+    ///
+    /// * `default_tkt_enctypes` / `default_tgs_enctypes`, each falling back
+    ///   to `permitted_enctypes` and then `DEFAULT`, in MIT's enctype-list
+    ///   syntax (see [`parse_enctype_list`]). Entries this crate cannot use
+    ///   are dropped; a list with no AES enctype left is an error. These
+    ///   are not realm-specific, as in MIT.
+    /// * `ticket_lifetime` and `renew_lifetime`, in MIT's duration syntax
+    ///   (see [`parse_duration`]).
+    /// * `forwardable` and `proxiable`, MIT booleans.
+    ///
+    /// The last four may be set per realm, in `[libdefaults] REALM = {...}`.
+    pub fn client_defaults(&self, realm: &str) -> Result<ClientDefaults> {
+        let enctypes = |tag: &str| -> Result<Vec<i32>> {
+            let (key, value) = match self.get(&["libdefaults", tag]) {
+                Some(v) => (tag, v),
+                None => (
+                    "permitted_enctypes",
+                    self.get(&["libdefaults", "permitted_enctypes"])
+                        .unwrap_or("DEFAULT"),
+                ),
+            };
+            let bad = |why: &str| ConfigError::BadValue {
+                tag: key.to_string(),
+                value: value.to_string(),
+                why: why.to_string(),
+            };
+            let all = parse_enctype_list(value);
+            if all.is_empty() {
+                return Err(bad("no known enctypes (KRB5_CONFIG_ETYPE_NOSUPP)"));
+            }
+            let usable: Vec<i32> = all.into_iter().filter(|e| (17..=20).contains(e)).collect();
+            if usable.is_empty() {
+                return Err(bad("no AES enctype left; this crate supports only 17-20"));
+            }
+            Ok(usable)
+        };
+        let seconds = |tag: &str, default: i64| -> Result<i64> {
+            match self.libdefault(realm, tag) {
+                None => Ok(default),
+                Some(v) => {
+                    parse_duration(v)
+                        .filter(|&s| s >= 0)
+                        .ok_or_else(|| ConfigError::BadValue {
+                            tag: tag.to_string(),
+                            value: v.to_string(),
+                            why: "not a duration (10h, 1d2h30m, 36:00, 1-02:00:00, 3600)".into(),
+                        })
+                }
+            }
+        };
+        let boolean = |tag: &str| self.libdefault(realm, tag).is_some_and(conf_boolean);
+        let renew = seconds("renew_lifetime", 0)?;
+        Ok(ClientDefaults {
+            tkt_enctypes: enctypes("default_tkt_enctypes")?,
+            tgs_enctypes: enctypes("default_tgs_enctypes")?,
+            ticket_lifetime: std::time::Duration::from_secs(
+                seconds("ticket_lifetime", 24 * 3600)? as u64
+            ),
+            renew_lifetime: (renew > 0).then(|| std::time::Duration::from_secs(renew as u64)),
+            forwardable: boolean("forwardable"),
+            proxiable: boolean("proxiable"),
+        })
+    }
+}
+
+/// MIT's `_krb5_conf_boolean`: only its "yes" words are true.
+pub(crate) fn conf_boolean(v: &str) -> bool {
+    matches!(
+        v.to_ascii_lowercase().as_str(),
+        "y" | "yes" | "true" | "t" | "1" | "on"
+    )
+}
+
+/// MIT's enctype names and aliases (lib/crypto/krb/etypes.c), matched
+/// case-insensitively as `krb5_string_to_enctype` does.
+const ENCTYPE_NAMES: &[(i32, &[&str])] = &[
+    (6, &["des3-cbc-raw"]),
+    (16, &["des3-cbc-sha1", "des3-hmac-sha1", "des3-cbc-sha1-kd"]),
+    (23, &["arcfour-hmac", "rc4-hmac", "arcfour-hmac-md5"]),
+    (
+        24,
+        &["arcfour-hmac-exp", "rc4-hmac-exp", "arcfour-hmac-md5-exp"],
+    ),
+    (
+        17,
+        &["aes128-cts-hmac-sha1-96", "aes128-cts", "aes128-sha1"],
+    ),
+    (
+        18,
+        &["aes256-cts-hmac-sha1-96", "aes256-cts", "aes256-sha1"],
+    ),
+    (25, &["camellia128-cts-cmac", "camellia128-cts"]),
+    (26, &["camellia256-cts-cmac", "camellia256-cts"]),
+    (19, &["aes128-cts-hmac-sha256-128", "aes128-sha2"]),
+    (20, &["aes256-cts-hmac-sha384-192", "aes256-sha2"]),
+];
+
+/// MIT's `default_enctype_list` (init_ctx.c): what `DEFAULT` means.
+const MIT_DEFAULT_ENCTYPES: &[i32] = &[18, 17, 20, 19, 16, 23, 25, 26];
+
+/// MIT's `krb5int_parse_enctype_list`: words separated by blanks or
+/// commas, each optionally prefixed `+` (add, the default) or `-`
+/// (remove), naming an enctype or alias, a family (`aes`, `des3`, `rc4`,
+/// `camellia`) or `DEFAULT`. Returns MIT enctype numbers in order without
+/// duplicates; unknown words are ignored, as in MIT.
+pub fn parse_enctype_list(value: &str) -> Vec<i32> {
+    let mut list: Vec<i32> = Vec::new();
+    for word in value
+        .split([' ', '\t', '\r', '\n', ','])
+        .filter(|w| !w.is_empty())
+    {
+        let (add, name) = match word.as_bytes()[0] {
+            b'+' => (true, &word[1..]),
+            b'-' => (false, &word[1..]),
+            _ => (true, word),
+        };
+        let lower = name.to_ascii_lowercase();
+        let etypes: Vec<i32> = match lower.as_str() {
+            "default" => MIT_DEFAULT_ENCTYPES.to_vec(),
+            "des3" => vec![16],
+            "aes" => vec![18, 17, 20, 19],
+            "rc4" => vec![23],
+            "camellia" => vec![26, 25],
+            _ => ENCTYPE_NAMES
+                .iter()
+                .find(|(_, names)| names.contains(&lower.as_str()))
+                .map(|(e, _)| vec![*e])
+                .unwrap_or_default(),
+        };
+        for e in etypes {
+            if !add {
+                list.retain(|&x| x != e);
+            } else if !list.contains(&e) {
+                list.push(e);
+            }
+        }
+    }
+    list
+}
+
+/// MIT's `krb5_string_to_deltat` (x-deltat.y), in seconds:
+///
+/// ```text
+///   N d [N h] [N m] [N s]     a suffixed sequence, largest unit first,
+///   N h [N m] [N s]           any unit after the first optional:
+///   N m [N s]                 1d, 2h30m, 1d 4s, 90s
+///   N s
+///   N-HH:MM:SS                days-hours:minutes:seconds
+///   N:MM:SS   N:MM            hours:minutes[:seconds]
+///   N                         seconds
+/// ```
+///
+/// Blanks may precede a number, which may be negative, and may follow
+/// only the suffixed forms. The fields after `-` and `:` are one or two
+/// digits, as MIT's lexer makes them. As in MIT, the first character the
+/// lexer does not know (anything but digits, `-`, `:`, `d`, `h`, `m`, `s`
+/// and blanks) ends the input, so `1.5h` is one second and `10H` ten. A
+/// result outside a signed 32-bit count of seconds is refused.
+///
+/// Checked against MIT's own `krb5_string_to_deltat` on every case in
+/// `testdata/mit-settings.tsv`.
+pub fn parse_duration(s: &str) -> Option<i64> {
+    let max = i64::from(i32::MAX);
+    let known = |c: u8| c.is_ascii_digit() || b"-:dhms \t\n".contains(&c);
+    let end = s.bytes().position(|c| !known(c)).unwrap_or(s.len());
+    let mut p = DeltatParser {
+        b: &s.as_bytes()[..end],
+        i: 0,
+    };
+    let first = p.num()?;
+    let total = match p.peek() {
+        None => first,
+        Some(b'-') => {
+            p.i += 1;
+            let h = p.field()?;
+            p.expect(b':')?;
+            let m = p.field()?;
+            p.expect(b':')?;
+            let total = first * 86400 + h * 3600 + m * 60 + p.field()?;
+            p.at_end().then_some(total)?
+        }
+        Some(b':') => {
+            p.i += 1;
+            let m = p.field()?;
+            let sec = if p.peek() == Some(b':') {
+                p.i += 1;
+                p.field()?
+            } else {
+                0
+            };
+            p.at_end().then_some(first * 3600 + m * 60 + sec)?
+        }
+        Some(c) => {
+            const UNITS: [(u8, i64); 4] = [(b'd', 86400), (b'h', 3600), (b'm', 60), (b's', 1)];
+            let mut at = UNITS.iter().position(|&(u, _)| u == c)?;
+            p.i += 1;
+            let mut total = first * UNITS[at].1;
+            // Each further number takes a strictly smaller unit.
+            while at < UNITS.len() - 1 && !p.at_end_after_ws() {
+                let n = p.num()?;
+                let c = p.peek()?;
+                let next = UNITS[at + 1..].iter().position(|&(u, _)| u == c)?;
+                at += 1 + next;
+                p.i += 1;
+                total += n * UNITS[at].1;
+            }
+            p.at_end_after_ws().then_some(total)?
+        }
+    };
+    (-max..=max).contains(&total).then_some(total)
+}
+
+struct DeltatParser<'a> {
+    b: &'a [u8],
+    i: usize,
+}
+
+impl DeltatParser<'_> {
+    fn peek(&self) -> Option<u8> {
+        self.b.get(self.i).copied()
+    }
+
+    fn at_end(&self) -> bool {
+        self.i == self.b.len()
+    }
+
+    fn skip_ws(&mut self) {
+        while self.peek().is_some_and(|c| b" \t\n".contains(&c)) {
+            self.i += 1;
+        }
+    }
+
+    fn at_end_after_ws(&mut self) -> bool {
+        self.skip_ws();
+        self.i == self.b.len()
+    }
+
+    fn digits(&mut self) -> Option<(i64, usize)> {
+        let start = self.i;
+        while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+            self.i += 1;
+        }
+        let n = self.i - start;
+        if n == 0 || n > 10 {
+            return None;
+        }
+        let v: i64 = std::str::from_utf8(&self.b[start..self.i])
+            .ok()?
+            .parse()
+            .ok()?;
+        (v <= i64::from(i32::MAX)).then_some((v, n))
+    }
+
+    /// Blanks, an optional '-', digits.
+    fn num(&mut self) -> Option<i64> {
+        self.skip_ws();
+        let neg = self.peek() == Some(b'-');
+        if neg {
+            self.i += 1;
+        }
+        let (v, _) = self.digits()?;
+        Some(if neg { -v } else { v })
+    }
+
+    /// One or two digits, nothing before them.
+    fn field(&mut self) -> Option<i64> {
+        let (v, n) = self.digits()?;
+        (n <= 2).then_some(v)
+    }
+
+    fn expect(&mut self, c: u8) -> Option<()> {
+        (self.peek() == Some(c)).then(|| self.i += 1)
     }
 }
 
@@ -634,6 +945,96 @@ mod tests {
     mit.edu = ATHENA.MIT.EDU
     special.mit.edu = EXAMPLE.COM
 ";
+
+    /// testdata/mit-settings.tsv: MIT's own krb5_string_to_deltat and
+    /// krb5int_parse_enctype_list on each string
+    /// (scripts/record-mit-settings.sh).
+    #[test]
+    fn durations_and_enctype_lists_parse_as_mit_parses_them() {
+        let tsv = include_str!("../testdata/mit-settings.tsv");
+        let mut checked = (0, 0);
+        for line in tsv.lines() {
+            let (input, mit) = line.split_once('\t').unwrap();
+            let (kind, arg) = (&input[..1], &input[2..]);
+            match kind {
+                "D" => {
+                    let want = (mit != "ERR").then(|| mit.parse::<i64>().unwrap());
+                    assert_eq!(parse_duration(arg), want, "duration {arg:?}");
+                    checked.0 += 1;
+                }
+                "E" => {
+                    let got = parse_enctype_list(arg);
+                    let want: Vec<i32> = match mit {
+                        "ERR" => vec![],
+                        l => l.split(' ').map(|e| e.parse().unwrap()).collect(),
+                    };
+                    assert_eq!(got, want, "enctypes {arg:?}");
+                    checked.1 += 1;
+                }
+                _ => panic!("bad line {line:?}"),
+            }
+        }
+        assert!(checked.0 > 60 && checked.1 > 25, "{checked:?}");
+    }
+
+    #[test]
+    fn client_defaults_follow_mit() {
+        let d = Krb5Conf::empty().client_defaults("A.ORG").unwrap();
+        assert_eq!(d.tkt_enctypes, [18, 17, 20, 19]);
+        assert_eq!(d.tgs_enctypes, [18, 17, 20, 19]);
+        assert_eq!(d.ticket_lifetime.as_secs(), 86400);
+        assert_eq!(
+            (d.renew_lifetime, d.forwardable, d.proxiable),
+            (None, false, false)
+        );
+
+        let c = conf(
+            "[libdefaults]\n\
+             permitted_enctypes = aes256-sha2 aes256-cts\n\
+             default_tgs_enctypes = aes128-cts rc4-hmac\n\
+             ticket_lifetime = 10h\n\
+             renew_lifetime = 7d\n\
+             forwardable = true\n\
+             proxiable = maybe\n\
+             A.ORG = {\n\
+               ticket_lifetime = 1h30m\n\
+               forwardable = no\n\
+             }\n",
+        );
+        let a = c.client_defaults("A.ORG").unwrap();
+        // tkt falls back to permitted; tgs has its own, non-AES dropped.
+        assert_eq!(a.tkt_enctypes, [20, 18]);
+        assert_eq!(a.tgs_enctypes, [17]);
+        // The realm's own subsection wins; the rest come from the top.
+        assert_eq!(a.ticket_lifetime.as_secs(), 5400);
+        assert_eq!(a.renew_lifetime.unwrap().as_secs(), 7 * 86400);
+        assert!(!a.forwardable);
+        assert!(!a.proxiable, "not one of MIT's yes words");
+        let b = c.client_defaults("B.ORG").unwrap();
+        assert_eq!(b.ticket_lifetime.as_secs(), 36000);
+        assert!(b.forwardable);
+        assert_eq!(
+            conf("[libdefaults]\n renew_lifetime = 0\n")
+                .client_defaults("X")
+                .unwrap()
+                .renew_lifetime,
+            None
+        );
+    }
+
+    #[test]
+    fn unusable_client_defaults_are_errors() {
+        let err = |t: &str| {
+            conf(&format!("[libdefaults]\n{t}\n"))
+                .client_defaults("X")
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(err("default_tkt_enctypes = des3 rc4").contains("no AES enctype"));
+        assert!(err("permitted_enctypes = bogus").contains("no known enctypes"));
+        assert!(err("ticket_lifetime = forever").contains("not a duration"));
+        assert!(err("renew_lifetime = -1d").contains("not a duration"));
+    }
 
     #[test]
     fn the_manual_page_shape_parses() {

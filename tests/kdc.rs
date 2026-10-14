@@ -739,3 +739,82 @@ fn cross_realm_through_a_credential_cache_shared_with_mit() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&mit_path);
 }
+
+// ------------------------------------------------- [libdefaults] settings
+
+/// The realm's krb5.conf plus `extra` [libdefaults] lines.
+fn conf_with(e: &Env, extra: &str) -> krb5::Krb5Conf {
+    let base = std::fs::read_to_string(format!("{}/krb5.conf", e.dir)).unwrap();
+    krb5::Krb5Conf::parse(&format!("{base}\n[libdefaults]\n{extra}\n")).unwrap()
+}
+
+/// TicketFlags (bit 0 = MSB).
+const FORWARDABLE: u32 = 1 << 30;
+const RENEWABLE: u32 = 1 << 23;
+
+/// ticket_lifetime, renew_lifetime, forwardable and the two enctype
+/// lists, as MIT's KDC honours them.
+#[test]
+fn libdefaults_shape_the_tickets_the_kdc_issues() {
+    let e = live!();
+    let conf = conf_with(
+        &e,
+        "ticket_lifetime = 2h\n renew_lifetime = 3d\n forwardable = true\n \
+         default_tkt_enctypes = aes128-sha2\n default_tgs_enctypes = aes128-cts",
+    );
+    let kdc = KdcClient::from_config(&conf, &e.realm).unwrap();
+    let tgt = kdc.login_with_password(&e.p("alice"), "alicepw").unwrap();
+    let start = tgt.starttime.unwrap_or(tgt.authtime);
+    assert_eq!(tgt.endtime - start, 2 * 3600, "ticket_lifetime");
+    assert_eq!(
+        tgt.renew_till.expect("renewable") - start,
+        3 * 86400,
+        "renew_lifetime"
+    );
+    assert_eq!(
+        tgt.flags & (FORWARDABLE | RENEWABLE),
+        FORWARDABLE | RENEWABLE
+    );
+    assert_eq!(tgt.session_key.enctype(), 19, "default_tkt_enctypes");
+
+    // The service ticket: TGS enctypes, and the TGT's flags asked for again.
+    // (A service with keys of every enctype: the KDC picks the session key
+    // from those the service supports, so svc18's aes256-only key would
+    // turn an aes128 request into KDC_ERR_ETYPE_NOSUPP.)
+    let st = kdc
+        .service_ticket(&tgt, &e.p("host/svc.krb5.test"))
+        .unwrap();
+    assert_eq!(st.session_key.enctype(), 17, "default_tgs_enctypes");
+    assert_eq!(
+        st.flags & FORWARDABLE,
+        FORWARDABLE,
+        "forwardable carried over"
+    );
+    assert!(st.endtime <= tgt.endtime);
+    establish(&e, &st);
+
+    // Defaults, for comparison: one day, not renewable, not forwardable.
+    let plain = KdcClient::from_config(&conf_with(&e, ""), &e.realm).unwrap();
+    let tgt = plain.login_with_password(&e.p("alice"), "alicepw").unwrap();
+    assert_eq!(tgt.endtime - tgt.starttime.unwrap_or(tgt.authtime), 86400);
+    assert_eq!(tgt.flags & (FORWARDABLE | RENEWABLE), 0);
+    assert_eq!(tgt.renew_till, None);
+}
+
+/// A realm's own [libdefaults] subsection wins over the general value.
+#[test]
+fn a_realm_subsection_of_libdefaults_wins() {
+    let e = live!();
+    let conf = conf_with(
+        &e,
+        &format!(
+            "ticket_lifetime = 5h\n {} = {{\n ticket_lifetime = 45m\n }}",
+            e.realm
+        ),
+    );
+    let tgt = KdcClient::from_config(&conf, &e.realm)
+        .unwrap()
+        .login_with_password(&e.p("alice"), "alicepw")
+        .unwrap();
+    assert_eq!(tgt.endtime - tgt.starttime.unwrap_or(tgt.authtime), 45 * 60);
+}
