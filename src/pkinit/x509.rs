@@ -10,7 +10,7 @@
 //! by default.
 
 use super::asn1::{self, ReaderExt, implicit};
-use super::rsa::{self, Hash};
+use super::keys::{PublicKey, SigAlg};
 use crate::client::Principal;
 use crate::der::{self, DerError, Fields, Reader};
 
@@ -61,8 +61,10 @@ pub(crate) struct Cert {
     pub(crate) subject: Vec<u8>,
     not_before: i64,
     not_after: i64,
-    /// SubjectPublicKeyInfo: the algorithm OID and the BIT STRING content.
+    /// SubjectPublicKeyInfo: the algorithm OID, its parameters and the
+    /// BIT STRING content.
     key_alg: Vec<u8>,
+    key_params: Option<Vec<u8>>,
     key: Vec<u8>,
     extensions: Vec<Extension>,
 }
@@ -109,7 +111,7 @@ impl Cert {
         validity.done("Validity")?;
         let subject = t.next_raw()?.2.to_vec();
         let mut spki = t.seq()?;
-        let (key_alg, _) = spki.alg_id()?;
+        let (key_alg, key_params) = spki.alg_id()?;
         let key = spki.bits()?.to_vec();
         spki.done("SubjectPublicKeyInfo")?;
         // issuerUniqueID, subjectUniqueID: [1], [2] IMPLICIT BIT STRING.
@@ -154,6 +156,7 @@ impl Cert {
             not_before,
             not_after,
             key_alg: key_alg.to_vec(),
+            key_params: key_params.map(<[u8]>::to_vec),
             key,
             extensions,
         })
@@ -164,22 +167,19 @@ impl Cert {
         self.extensions.iter().find(|e| e.oid == oid)
     }
 
-    /// The subject's RSA key.
-    pub(crate) fn rsa_key(&self) -> Result<rsa::PublicKey> {
-        if self.key_alg != asn1::oid(rsa::RSA_ENCRYPTION) {
-            return err("the certificate's key is not RSA (only RSA keys are supported)");
-        }
-        rsa::PublicKey::from_der(&self.key)
+    /// The subject's public key, RSA or EC.
+    pub(crate) fn public_key(&self) -> Result<PublicKey> {
+        PublicKey::from_spki(&self.key_alg, self.key_params.as_deref(), &self.key)
     }
 
     /// Whether `issuer`'s key made this certificate's signature.
     fn signed_by(&self, issuer: &Cert) -> bool {
-        let Some(hash) = Hash::from_rsa_sig_oid(&self.sig_alg) else {
+        let Some(alg) = SigAlg::from_oid(&self.sig_alg) else {
             return false;
         };
         issuer
-            .rsa_key()
-            .is_ok_and(|k| k.verify(hash, &hash.digest(&self.tbs), &self.signature))
+            .public_key()
+            .is_ok_and(|k| k.verify(alg, &alg.hash().digest(&self.tbs), &self.signature))
     }
 
     /// `basicConstraints`: (cA, pathLenConstraint).
@@ -374,6 +374,8 @@ pub(crate) mod tests {
             "sub" => include_str!("testdata/sub.pem"),
             "subleaf" => include_str!("testdata/subleaf.pem"),
             "other-ca" => include_str!("testdata/other-ca.pem"),
+            "ec-ca" => include_str!("testdata/ec-ca.pem"),
+            "ec-kdc" => include_str!("testdata/ec-kdc.pem"),
             _ => unreachable!(),
         };
         parse_certs(pem.as_bytes()).unwrap().remove(0)

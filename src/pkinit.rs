@@ -4,7 +4,7 @@
 //! `pkinit` feature.
 //!
 //! The client sends, in PA-PK-AS-REQ, an ephemeral Diffie-Hellman public
-//! value (RFC 3526 MODP group 14 or 16) and a checksum binding it to the
+//! value (RFC 3526 MODP group 14 or 16, or a P-256/384/521 point) and a checksum binding it to the
 //! request, signed with its certificate's key, or, anonymously, unsigned.
 //! The KDC answers with its own DH value, signed with the KDC's key, and
 //! the reply key comes from the shared secret through the KDF the KDC
@@ -21,17 +21,21 @@
 //!   derives from the KDC's PA-PKINIT-KX contribution and the reply key,
 //!   so the KDC, and not a man in the middle, chose it.
 //!
-//! Supported: RSA certificates and keys (PKCS #1 v1.5 signatures with
-//! SHA-256/384/512), keys in unencrypted PEM files (`FILE:`). Not
-//! supported: elliptic-curve keys and ECDH (MIT 1.22), RSA key transport
-//! (which MIT's client also refuses), PKCS #11 and PKCS #12 identities,
-//! and revocation checking.
+//! Supported: RSA and elliptic-curve (P-256, P-384, P-521) certificates
+//! and keys, for the client and the KDC (PKCS #1 v1.5 and ECDSA
+//! signatures with SHA-256/384/512), in unencrypted PEM files (`FILE:`);
+//! key exchange by finite-field DH or, against MIT 1.22 and later, ECDH
+//! ([`DhGroup`]). Not supported: RSA key transport (which MIT's client
+//! also refuses), PKCS #11 and PKCS #12 identities, and revocation
+//! checking.
 
 mod asn1;
 mod bigint;
 mod cms;
 mod dh;
+mod ec;
 mod kdf;
+mod keys;
 mod pem;
 mod rsa;
 mod x509;
@@ -60,13 +64,160 @@ pub(crate) const KDC_OPT_REQUEST_ANONYMOUS: u32 = 1 << 15;
 /// RFC 4556 §3.1.3 KDC_ERR_DH_KEY_PARAMETERS_NOT_ACCEPTED.
 pub(crate) const KDC_ERR_DH_KEY_PARAMETERS_NOT_ACCEPTED: i32 = 65;
 
-/// The signature algorithms the client accepts from the KDC, for
-/// supportedCMSTypes.
-const CMS_TYPES: [&str; 3] = [
-    rsa::SHA512_WITH_RSA,
-    rsa::SHA384_WITH_RSA,
-    rsa::SHA256_WITH_RSA,
-];
+/// RFC 4556 §3.2.2 TD-DH-PARAMETERS: the groups a KDC accepts, in the
+/// e-data of KDC_ERR_DH_KEY_PARAMETERS_NOT_ACCEPTED.
+const TD_DH_PARAMETERS: i32 = 109;
+
+/// A key-exchange group: `pkinit_dh_min_bits`. Ordered by strength, by
+/// MIT's finite-field equivalents (P-256 ≈ 3072, P-384 ≈ 7680, P-521 ≈
+/// 15360 bits).
+///
+/// The default is MODP group 14, as for MIT's client. The curves need a
+/// KDC that supports them: MIT 1.22 or later.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum DhGroup {
+    /// RFC 3526 MODP group 14, 2048-bit finite-field DH.
+    #[default]
+    Modp2048,
+    /// ECDH on P-256 (RFC 5349).
+    P256,
+    /// RFC 3526 MODP group 16, 4096-bit finite-field DH.
+    Modp4096,
+    /// ECDH on P-384.
+    P384,
+    /// ECDH on P-521.
+    P521,
+}
+
+impl DhGroup {
+    /// A `pkinit_dh_min_bits` value, as MIT's `parse_dh_min_bits` reads
+    /// it: `P-256`, `P-384`, `P-521`, or a bit count (up to 2048 is group
+    /// 14, up to 4096 group 16). `None` for anything else, which MIT
+    /// takes as the default.
+    pub fn from_config(value: &str) -> Option<DhGroup> {
+        let v = value.trim();
+        match v.to_ascii_uppercase().as_str() {
+            "P-256" => return Some(DhGroup::P256),
+            "P-384" => return Some(DhGroup::P384),
+            "P-521" => return Some(DhGroup::P521),
+            _ => {}
+        }
+        match v.parse::<u32>().ok()? {
+            // MIT also takes 1024; this crate offers nothing that weak.
+            1024..=2048 => Some(DhGroup::Modp2048),
+            2049..=4096 => Some(DhGroup::Modp4096),
+            _ => None,
+        }
+    }
+
+    fn curve(self) -> Option<ec::Curve> {
+        match self {
+            DhGroup::P256 => Some(ec::Curve::P256),
+            DhGroup::P384 => Some(ec::Curve::P384),
+            DhGroup::P521 => Some(ec::Curve::P521),
+            DhGroup::Modp2048 | DhGroup::Modp4096 => None,
+        }
+    }
+
+    /// The group an AlgorithmIdentifier of TD-DH-PARAMETERS names.
+    fn from_alg_id(oid: &[u8], params: Option<&[u8]>) -> Option<DhGroup> {
+        if oid == asn1::oid(dh::DH_PUBLIC_NUMBER) {
+            match dh::Group::from_domain_parameters(params?)?.bits() {
+                2048 => Some(DhGroup::Modp2048),
+                4096 => Some(DhGroup::Modp4096),
+                _ => None,
+            }
+        } else if oid == asn1::oid(ec::ID_EC_PUBLIC_KEY) {
+            match ec::Curve::from_params(params).ok()? {
+                ec::Curve::P256 => Some(DhGroup::P256),
+                ec::Curve::P384 => Some(DhGroup::P384),
+                ec::Curve::P521 => Some(DhGroup::P521),
+            }
+        } else {
+            None
+        }
+    }
+}
+
+/// MIT's `pkinit_process_td_dh_params`: after the KDC refused `offered`,
+/// the first group in its TD-DH-PARAMETERS that this crate supports and
+/// that is stronger. `e_data` is the KRB-ERROR's, as METHOD-DATA or as
+/// TYPED-DATA (`[0]` type, `[1]` value).
+pub(crate) fn negotiate_group(e_data: &[u8], offered: DhGroup) -> Option<DhGroup> {
+    let mut seq = Reader::new(e_data).seq().ok()?;
+    while !seq.is_empty() {
+        let f = der::Fields::parse("TYPED-DATA", seq.expect(der::SEQUENCE).ok()?).ok()?;
+        let (ty, value) = match (f.opt(1), f.opt(2)) {
+            // PA-DATA: padata-type [1], padata-value [2].
+            (Some(mut t), Some(mut v)) => (t.i32().ok()?, v.octets().ok()?),
+            // TYPED-DATA: data-type [0], data-value [1].
+            _ => (f.get(0).ok()?.i32().ok()?, f.get(1).ok()?.octets().ok()?),
+        };
+        if ty != TD_DH_PARAMETERS {
+            continue;
+        }
+        let mut algs = Reader::new(value).seq().ok()?;
+        while !algs.is_empty() {
+            let (oid, params) = algs.alg_id().ok()?;
+            if let Some(g) = DhGroup::from_alg_id(oid, params) {
+                if g > offered {
+                    return Some(g);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The client's half of the key exchange.
+enum KeyExchange {
+    Modp(dh::KeyPair),
+    Ec(ec::Ecdh),
+}
+
+impl KeyExchange {
+    fn generate(group: DhGroup) -> KeyExchange {
+        match group.curve() {
+            Some(c) => KeyExchange::Ec(ec::Ecdh::generate(c)),
+            None => KeyExchange::Modp(dh::KeyPair::generate(dh::Group::at_least(
+                if group == DhGroup::Modp4096 {
+                    4096
+                } else {
+                    2048
+                },
+            ))),
+        }
+    }
+
+    fn group(&self) -> DhGroup {
+        match self {
+            KeyExchange::Modp(k) if k.group().bits() > 2048 => DhGroup::Modp4096,
+            KeyExchange::Modp(_) => DhGroup::Modp2048,
+            KeyExchange::Ec(e) => match e.curve() {
+                ec::Curve::P256 => DhGroup::P256,
+                ec::Curve::P384 => DhGroup::P384,
+                ec::Curve::P521 => DhGroup::P521,
+            },
+        }
+    }
+
+    fn spki(&self) -> Vec<u8> {
+        match self {
+            KeyExchange::Modp(k) => k.spki(),
+            KeyExchange::Ec(e) => e.spki(),
+        }
+    }
+
+    /// The shared secret for the KDC's public value (KDCDHKeyInfo's BIT
+    /// STRING: an INTEGER for MODP, the point itself for ECDH).
+    fn agree(&self, kdc_public: &[u8]) -> Option<Vec<u8>> {
+        match self {
+            KeyExchange::Modp(k) => k.agree(kdc_public),
+            KeyExchange::Ec(e) => e.agree(kdc_public),
+        }
+    }
+}
 
 fn pk_err<T>(msg: impl Into<String>) -> Result<T> {
     Err(ClientError::Pkinit(msg.into()))
@@ -154,7 +305,7 @@ pub struct Identity {
     /// The client's certificate first, then any others from its file
     /// (intermediate CAs), all sent to the KDC.
     certs: Vec<x509::Cert>,
-    key: rsa::PrivateKey,
+    key: keys::PrivateKey,
 }
 
 impl std::fmt::Debug for Identity {
@@ -176,14 +327,9 @@ impl Identity {
             return pk_err("no certificate found");
         }
         let blocks = pem::blocks(key).map_err(ClientError::Pkinit)?;
-        let Some((_, der)) = blocks
-            .iter()
-            .find(|(l, _)| l == "PRIVATE KEY" || l == "RSA PRIVATE KEY")
-        else {
-            return pk_err("no unencrypted RSA private key found");
-        };
-        let key = rsa::PrivateKey::from_der(der).map_err(|e| ClientError::Pkinit(e.0))?;
-        if certs[0].rsa_key().ok().as_ref() != Some(key.public()) {
+        let key =
+            keys::PrivateKey::from_pem_blocks(&blocks).map_err(|e| ClientError::Pkinit(e.0))?;
+        if certs[0].public_key().ok() != Some(key.public()) {
             return pk_err("the private key does not match the certificate");
         }
         Ok(Identity { certs, key })
@@ -215,27 +361,15 @@ impl Identity {
 // --------------------------------------------------------------- settings
 
 /// A client's PKINIT configuration for one realm.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct Settings {
     /// Anchors given in code, else the `pkinit_anchors` locations.
     pub(crate) anchors: Option<TrustAnchors>,
     pub(crate) anchor_specs: Vec<String>,
     pub(crate) kdc_hostnames: Vec<String>,
-    pub(crate) dh_min_bits: u32,
+    pub(crate) dh_group: DhGroup,
     /// `[realms] REALM auto_fast_armor`.
     pub(crate) auto_fast_armor: bool,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Settings {
-            anchors: None,
-            anchor_specs: Vec::new(),
-            kdc_hostnames: Vec::new(),
-            dh_min_bits: 2048,
-            auto_fast_armor: false,
-        }
-    }
 }
 
 impl Settings {
@@ -269,9 +403,9 @@ impl Settings {
             anchors: None,
             anchor_specs: Self::values(conf, realm, "pkinit_anchors"),
             kdc_hostnames: Self::values(conf, realm, "pkinit_kdc_hostname"),
-            dh_min_bits: one("pkinit_dh_min_bits")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(2048),
+            dh_group: one("pkinit_dh_min_bits")
+                .and_then(|v| DhGroup::from_config(&v))
+                .unwrap_or_default(),
             auto_fast_armor: truthy(conf.get(&["realms", realm, "auto_fast_armor"])),
         }
     }
@@ -297,7 +431,7 @@ impl Settings {
 
 /// The state between a PA-PK-AS-REQ and its reply.
 pub(crate) struct Request {
-    keys: dh::KeyPair,
+    keys: KeyExchange,
     nonce: u32,
 }
 
@@ -315,7 +449,7 @@ pub(crate) struct RequestInput<'a> {
     pub(crate) now: i64,
     pub(crate) usec: u32,
     pub(crate) freshness: Option<&'a [u8]>,
-    pub(crate) dh_bits: u32,
+    pub(crate) group: DhGroup,
 }
 
 /// The PA-PK-AS-REQ value for `input`, and the state to read the reply.
@@ -332,7 +466,7 @@ pub(crate) struct RequestInput<'a> {
 ///     paChecksum2 [5] SEQUENCE { checksum [0], algorithmIdentifier [1] } }  -- SHA-256
 /// ```
 pub(crate) fn request(input: &RequestInput<'_>) -> Result<(Vec<u8>, Request)> {
-    let keys = dh::KeyPair::generate(dh::Group::at_least(input.dh_bits));
+    let keys = KeyExchange::generate(input.group);
     let mut authenticator = vec![
         der::field(0, der::int(i64::from(input.usec))),
         der::field(1, der::time(input.now)),
@@ -346,13 +480,16 @@ pub(crate) fn request(input: &RequestInput<'_>) -> Result<(Vec<u8>, Request)> {
         5,
         der::seq(&[
             der::field(0, der::octets(&Sha256::digest(input.body))),
-            der::field(1, asn1::alg_id(rsa::Hash::Sha256.oid(), None)),
+            der::field(1, asn1::alg_id(keys::Hash::Sha256.oid(), None)),
         ]),
     ));
     let auth_pack = der::seq(&[
         der::field(0, der::seq(&authenticator)),
         der::field(1, keys.spki()),
-        der::field(2, der::seq(&CMS_TYPES.map(|t| asn1::alg_id(t, None)))),
+        der::field(
+            2,
+            der::seq(&keys::SigAlg::ALL.map(|a| asn1::alg_id(a.oid(), None))),
+        ),
         der::field(
             4,
             der::seq(&kdf::OFFERED.map(|k| der::seq(&[der::field(0, asn1::oid_tlv(k))]))),
@@ -396,8 +533,8 @@ pub(crate) struct ReplyInput<'a> {
 }
 
 impl Request {
-    pub(crate) fn dh_bits(&self) -> u32 {
-        self.keys.group().bits()
+    pub(crate) fn group(&self) -> DhGroup {
+        self.keys.group()
     }
 
     /// The reply key from a PA-PK-AS-REP, after checking the KDC.
@@ -560,7 +697,24 @@ mod tests {
             now: NOW,
             usec: 7,
             freshness: Some(b"fresh"),
-            dh_bits: 2048,
+            group: DhGroup::Modp2048,
+        }
+    }
+
+    /// The KDC's half of the exchange `req` opened: its public value (the
+    /// BIT STRING's content) and the shared secret.
+    fn kdc_side(req: &Request) -> (Vec<u8>, Vec<u8>) {
+        match &req.keys {
+            KeyExchange::Modp(k) => {
+                let kdc = dh::KeyPair::generate(k.group().clone());
+                let z = kdc.agree(&k.public_value()).unwrap();
+                (kdc.public_value(), z)
+            }
+            KeyExchange::Ec(e) => {
+                let kdc = ec::Ecdh::generate(e.curve());
+                let z = kdc.agree(e.point()).unwrap();
+                (kdc.point().to_vec(), z)
+            }
         }
     }
 
@@ -579,10 +733,9 @@ mod tests {
         kdf: Option<&str>,
         signed: impl Fn(&[u8]) -> Vec<u8>,
     ) -> Kdc {
-        let kdc = dh::KeyPair::generate(dh::Group::at_least(2048));
-        let z = kdc.agree(&req.keys.public_value()).unwrap();
+        let (kdc_public, z) = kdc_side(req);
         let key_info = der::seq(&[
-            der::field(0, asn1::bit_string(&kdc.public_value())),
+            der::field(0, asn1::bit_string(&kdc_public)),
             der::field(1, der::int(i64::from(nonce))),
         ]);
         let mut info = vec![der::tlv(asn1::implicit(0), &signed(&key_info))];
@@ -855,9 +1008,165 @@ mod tests {
         let a = Settings::from_config(&conf, "A.ORG");
         assert_eq!(a.anchor_specs, ["FILE:/a1", "DIR:/a2"]);
         assert!(a.auto_fast_armor);
-        assert_eq!(a.dh_min_bits, 4096);
+        assert_eq!(a.dh_group, DhGroup::Modp4096);
         let b = Settings::from_config(&conf, "B.ORG");
         assert_eq!(b.anchor_specs, ["FILE:/lib"]);
         assert!(!b.auto_fast_armor);
+    }
+
+    #[test]
+    fn dh_min_bits_is_read_as_mit_reads_it() {
+        for (v, g) in [
+            ("2048", Some(DhGroup::Modp2048)),
+            ("1024", Some(DhGroup::Modp2048)),
+            ("3072", Some(DhGroup::Modp4096)),
+            ("4096", Some(DhGroup::Modp4096)),
+            ("p-256", Some(DhGroup::P256)),
+            ("P-384", Some(DhGroup::P384)),
+            ("P-521", Some(DhGroup::P521)),
+            ("8192", None),
+            ("X25519", None),
+        ] {
+            assert_eq!(DhGroup::from_config(v), g, "{v}");
+        }
+        assert!(DhGroup::Modp2048 < DhGroup::P256 && DhGroup::P256 < DhGroup::Modp4096);
+        assert!(DhGroup::Modp4096 < DhGroup::P384 && DhGroup::P384 < DhGroup::P521);
+    }
+
+    /// Every group, a signed reply, the same key on both sides.
+    #[test]
+    fn the_reply_key_matches_the_kdcs_for_each_group() {
+        let client = Principal::new(1, ["alice"], REALM);
+        for group in [
+            DhGroup::Modp2048,
+            DhGroup::Modp4096,
+            DhGroup::P256,
+            DhGroup::P384,
+            DhGroup::P521,
+        ] {
+            let mut inp = input(b"body", None);
+            inp.group = group;
+            let (pa, req) = request(&inp).unwrap();
+            assert_eq!(req.group(), group);
+            // The AuthPack's clientPublicValue names the group.
+            let mut r = Reader::new(&pa).seq().unwrap();
+            let mut ci = Reader::new(r.expect(asn1::implicit(0)).unwrap())
+                .seq()
+                .unwrap();
+            ci.oid().unwrap();
+            let ap = Reader::new(ci.expect(der::ctx(0)).unwrap())
+                .octets()
+                .unwrap()
+                .to_vec();
+            let ap = der::Fields::parse_tagged("AuthPack", der::SEQUENCE, &ap).unwrap();
+            let mut spki = ap.get(1).unwrap().seq().unwrap();
+            let (oid, params) = spki.alg_id().unwrap();
+            assert_eq!(DhGroup::from_alg_id(oid, params), Some(group));
+            let kdc = kdc_reply(
+                &req,
+                &client,
+                b"the AS-REQ",
+                12345,
+                Some(kdf::KDF_SHA256),
+                signed_by_kdc,
+            );
+            assert_eq!(
+                reply_key(&req, &settings(), &kdc, &client).unwrap(),
+                kdc.key,
+                "{group:?}"
+            );
+        }
+    }
+
+    /// TD-DH-PARAMETERS as MIT 1.22's KDC sends it, in METHOD-DATA and in
+    /// TYPED-DATA.
+    #[test]
+    fn a_refused_group_moves_to_the_kdcs_next_stronger_one() {
+        let p256 = ec::Curve::P256.alg_id();
+        let p384 = ec::Curve::P384.alg_id();
+        let modp4096 = {
+            let k = dh::KeyPair::generate(dh::Group::at_least(4096));
+            let spki = k.spki();
+            let mut s = Reader::new(&spki).seq().unwrap();
+            s.next_raw().unwrap().2.to_vec()
+        };
+        let algs = der::seq(&[p256, modp4096, p384, asn1::alg_id("1.2.3", None)]);
+        let method_data = der::seq(&[der::seq(&[
+            der::field(1, der::int(i64::from(TD_DH_PARAMETERS))),
+            der::field(2, der::octets(&algs)),
+        ])]);
+        let typed_data = der::seq(&[der::seq(&[
+            der::field(0, der::int(i64::from(TD_DH_PARAMETERS))),
+            der::field(1, der::octets(&algs)),
+        ])]);
+        for e_data in [&method_data, &typed_data] {
+            assert_eq!(
+                negotiate_group(e_data, DhGroup::Modp2048),
+                Some(DhGroup::P256)
+            );
+            assert_eq!(
+                negotiate_group(e_data, DhGroup::P256),
+                Some(DhGroup::Modp4096)
+            );
+            assert_eq!(
+                negotiate_group(e_data, DhGroup::Modp4096),
+                Some(DhGroup::P384)
+            );
+            assert_eq!(
+                negotiate_group(e_data, DhGroup::P384),
+                None,
+                "nothing stronger"
+            );
+        }
+        assert_eq!(negotiate_group(&[], DhGroup::Modp2048), None);
+        assert_eq!(negotiate_group(b"junk", DhGroup::Modp2048), None);
+    }
+
+    /// The KDC signs with an EC key under an EC root (ECDSA all the way).
+    #[test]
+    fn an_ecdsa_signed_reply_from_an_ec_kdc_verifies() {
+        let client = Principal::new(1, ["alice"], REALM);
+        let (_, req) = request(&input(b"body", None)).unwrap();
+        let ec_signed = |c: &[u8]| {
+            let key = keys::PrivateKey::from_pem_blocks(
+                &pem::blocks(include_bytes!("pkinit/testdata/ec-kdc-key.pem")).unwrap(),
+            )
+            .unwrap();
+            let certs = [fixture("ec-kdc")];
+            cms::signed_data(
+                cms::ID_PKINIT_DHKEY_DATA,
+                c,
+                Some(cms::Signer {
+                    key: &key,
+                    certs: &certs,
+                }),
+            )
+            .unwrap()
+        };
+        let kdc = kdc_reply(&req, &client, b"the AS-REQ", 12345, None, ec_signed);
+        let ec_anchor = Settings {
+            anchors: Some(TrustAnchors {
+                certs: vec![fixture("ec-ca")],
+            }),
+            ..Settings::default()
+        };
+        assert_eq!(reply_key(&req, &ec_anchor, &kdc, &client).unwrap(), kdc.key);
+        // The RSA root does not vouch for it.
+        assert!(reply_key(&req, &settings(), &kdc, &client).is_err());
+    }
+
+    #[test]
+    fn ec_identities_load_from_sec1_and_pkcs8() {
+        let cert = include_bytes!("pkinit/testdata/ec-kdc.pem");
+        let sec1 = include_bytes!("pkinit/testdata/ec-kdc-key.pem");
+        let id = Identity::from_pem(cert, sec1).unwrap();
+        assert!(matches!(id.key, keys::PrivateKey::Ec(_)));
+        // The same key as PKCS #8.
+        let b = pem::blocks(sec1).unwrap();
+        let pkcs8 = der::seq(&[der::int(0), ec::Curve::P256.alg_id(), der::octets(&b[0].1)]);
+        let key = keys::PrivateKey::from_pem_blocks(&[("PRIVATE KEY".into(), pkcs8)]).unwrap();
+        assert_eq!(key.public(), id.key.public());
+        // An EC key with an RSA certificate does not pair.
+        assert!(Identity::from_pem(include_bytes!("pkinit/testdata/kdc.pem"), sec1).is_err());
     }
 }

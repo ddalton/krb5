@@ -12,6 +12,8 @@
 # leafsigned.pem a "CA" signed by kdc.pem's key, which is not a CA
 # sub.pem       a CA under inter, beyond inter's path length; subleaf.pem under it
 # other-ca.pem  an unrelated root
+# ec-ca.pem     a P-384 root; ec-kdc.pem, a P-256 KDC certificate under it
+#               (as kdc.pem, ECDSA throughout), key ec-kdc-key.pem (SEC1)
 #
 # All are valid from when they are made for a century; the tests check
 # them at a fixed time inside that window.
@@ -71,4 +73,11 @@ o x509 -req -in kdc.req -CA sub.pem -CAkey inter-key.pem -set_serial 7 -out subl
 o genrsa -out other-key.pem 2048
 o req -x509 -new -key other-key.pem -out other-ca.pem -days 36500 -subj "/CN=PKINIT Test Root" \
     -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign
-rm -f ext.cnf ./*.req inter-key.pem other-key.pem ./*.srl
+o ecparam -name secp384r1 -genkey -noout -out ec-ca-key.pem
+o req -x509 -new -key ec-ca-key.pem -out ec-ca.pem -days 36500 -subj "/CN=PKINIT Test EC Root" \
+    -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign
+o ecparam -name prime256v1 -genkey -noout -out ec-kdc-key.pem
+o req -new -key ec-kdc-key.pem -out ec-kdc.req -subj "/CN=ec-kdc"
+o x509 -req -in ec-kdc.req -CA ec-ca.pem -CAkey ec-ca-key.pem -set_serial 8 -out ec-kdc.pem \
+    -days 36500 -sha384 -extfile ext.cnf -extensions kdc
+rm -f ec-ca-key.pem ext.cnf ./*.req inter-key.pem other-key.pem ./*.srl

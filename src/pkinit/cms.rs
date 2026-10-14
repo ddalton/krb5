@@ -17,7 +17,8 @@
 //! ```
 
 use super::asn1::{self, ReaderExt};
-use super::rsa::{self, Hash, PrivateKey};
+use super::keys::{Hash, PrivateKey, PublicKey, SigAlg};
+use super::rsa;
 use super::x509::{self, Cert};
 use crate::der::{self, DerError, Reader};
 
@@ -74,7 +75,8 @@ pub(crate) fn signed_data(
             .certs
             .first()
             .ok_or_else(|| DerError("no signing certificate".into()))?;
-        let hash = Hash::Sha256;
+        let alg = s.key.sig_alg();
+        let hash = alg.hash();
         let digest_alg = asn1::alg_id(hash.oid(), Some(asn1::null()));
         let attrs = vec![
             der::seq(&[
@@ -87,7 +89,7 @@ pub(crate) fn signed_data(
             ]),
         ];
         let signed_attrs = asn1::set_of(attrs);
-        let sig = s.key.sign(hash, &hash.digest(&signed_attrs))?;
+        let sig = s.key.sign(&hash.digest(&signed_attrs))?;
         // The same SET, IMPLICIT [0] in place of the SET tag.
         let mut implicit_attrs = signed_attrs;
         implicit_attrs[0] = der::ctx(0);
@@ -96,7 +98,7 @@ pub(crate) fn signed_data(
             der::seq(&[me.issuer.clone(), der::tlv(der::INTEGER, &me.serial)]),
             digest_alg.clone(),
             implicit_attrs,
-            asn1::alg_id(rsa::SHA256_WITH_RSA, Some(asn1::null())),
+            alg.alg_id(),
             der::octets(&sig),
         ]));
         digest_algs.push(digest_alg);
@@ -182,12 +184,14 @@ pub(crate) fn verify(
     let attrs = si
         .optional(der::ctx(0))?
         .ok_or_else(|| DerError("SignedData without signed attributes".into()))?;
+    // The signature algorithm names its own hash, which must be the
+    // digest algorithm's; bare rsaEncryption takes the digest algorithm's.
     let (sig_oid, _) = si.alg_id()?;
-    match Hash::from_rsa_sig_oid(sig_oid) {
-        Some(h) if h == hash => {}
-        None if sig_oid == asn1::oid(rsa::RSA_ENCRYPTION) => {}
+    let alg = match SigAlg::from_oid(sig_oid) {
+        Some(a) if a.hash() == hash => a,
+        None if sig_oid == asn1::oid(rsa::RSA_ENCRYPTION) => SigAlg::Rsa(hash),
         _ => return err("unsupported or inconsistent SignedData signature algorithm"),
-    }
+    };
     let signature = si.octets()?;
     si.optional(der::ctx(1))?; // unsignedAttrs
     si.done("SignerInfo")?;
@@ -219,10 +223,15 @@ pub(crate) fn verify(
         .find(|c| c.issuer == issuer && c.serial == serial)
         .ok_or_else(|| DerError("SignedData does not include the signer's certificate".into()))?;
     let signed = der::tlv(asn1::SET, attrs);
-    if !signer
-        .rsa_key()?
-        .verify(hash, &hash.digest(&signed), signature)
-    {
+    let key = signer.public_key()?;
+    // MIT's KDC before 1.22 labels ECDSA signatures sha256WithRSAEncryption;
+    // OpenSSL goes by the signer's key, and so does this. The signature
+    // must still verify under that key.
+    let alg = match (&key, alg) {
+        (PublicKey::Ec(_), SigAlg::Rsa(h)) => SigAlg::Ecdsa(h),
+        _ => alg,
+    };
+    if !key.verify(alg, &hash.digest(&signed), signature) {
         return err("SignedData signature does not verify");
     }
     x509::verify_chain(signer, &certs, anchors, now)?;
@@ -239,8 +248,8 @@ pub(crate) mod tests {
     use crate::pkinit::x509::tests::{NOW, fixture};
 
     pub(crate) fn kdc_key() -> PrivateKey {
-        let b = pem::blocks(include_bytes!("testdata/kdc-key.pem")).unwrap();
-        PrivateKey::from_der(&b[0].1).unwrap()
+        PrivateKey::from_pem_blocks(&pem::blocks(include_bytes!("testdata/kdc-key.pem")).unwrap())
+            .unwrap()
     }
 
     /// A SignedData as the test KDC would sign it, with its chain.
@@ -312,6 +321,26 @@ pub(crate) mod tests {
         for cut in [0, 10, sd.len() / 2, sd.len() - 1] {
             assert!(verify(&sd[..cut], ID_PKINIT_DHKEY_DATA, &ca, NOW).is_err());
         }
+    }
+
+    /// A reply recorded from MIT 1.21's KDC with a P-256 key: ECDSA
+    /// signed, but labelled sha256WithRSAEncryption, as MIT's KDC labels
+    /// every signature before 1.22. Checked at a time its 2026–2027
+    /// certificate is valid.
+    #[test]
+    fn mit_1_21s_mislabelled_ecdsa_signature_verifies_as_openssl_verifies_it() {
+        let sd = include_bytes!("testdata/mit121-ec-kdc-signeddata.der");
+        let ca =
+            crate::pkinit::x509::parse_certs(include_bytes!("testdata/mit121-ca.pem")).unwrap();
+        let rsa_label = der::tlv(asn1::OID, &asn1::oid("1.2.840.113549.1.1.11"));
+        assert!(sd.windows(rsa_label.len()).any(|w| w == rsa_label));
+        let v = verify(sd, ID_PKINIT_DHKEY_DATA, &ca, 1_792_100_000).unwrap();
+        assert!(matches!(v.signer.public_key().unwrap(), PublicKey::Ec(_)));
+        // Any alteration of the signed content still fails.
+        let mut bad = sd.to_vec();
+        let n = bad.len();
+        bad[n - 1] ^= 1;
+        assert!(verify(&bad, ID_PKINIT_DHKEY_DATA, &ca, 1_792_100_000).is_err());
     }
 
     #[test]

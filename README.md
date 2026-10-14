@@ -22,13 +22,16 @@ tickets without shelling out to `kinit`.
   requests too); UDP and TCP, chosen as MIT chooses. KDCs come from `krb5.conf`, from DNS
   (URI and SRV records, as MIT looks them up), or are passed in directly.
 - **PKINIT** (optional `pkinit` feature) — login with an X.509
-  certificate and RSA key (RFC 4556, `kinit -X X509_user_identity=...`),
-  anonymous PKINIT (RFC 8062, `kinit -n`), and FAST armor from an
-  anonymous TGT (`auto_fast_armor`). Diffie-Hellman over MODP groups 14
-  and 16 with the RFC 8636 KDFs; the KDC's signature, certificate chain
-  (`pkinit_anchors`) and name are checked as MIT checks them. Pure Rust,
-  on crypto-bigint's constant-time arithmetic; no OpenSSL. Not yet:
-  elliptic-curve keys and ECDH, PKCS #11 and PKCS #12 identities.
+  certificate and an RSA or elliptic-curve key (RFC 4556, `kinit -X
+  X509_user_identity=...`), anonymous PKINIT (RFC 8062, `kinit -n`), and
+  FAST armor from an anonymous TGT (`auto_fast_armor`). Key exchange by
+  Diffie-Hellman over MODP groups 14 and 16, or by ECDH on P-256, P-384
+  and P-521 against MIT 1.22 and later (RFC 5349), with the RFC 8636 KDFs
+  and MIT's group negotiation; the KDC's signature (RSA or ECDSA),
+  certificate chain (`pkinit_anchors`) and name are checked as MIT checks
+  them. Pure Rust, no OpenSSL: crypto-bigint's constant-time arithmetic
+  for DH and RSA, RustCrypto's `p256`/`p384`/`p521` for the curves. Not
+  yet: PKCS #11 and PKCS #12 identities.
 - **Credential caches** — MIT's `FILE:` format (versions 1-4), `DIR:`
   collections, and `KCM:` (sssd-kcm, the Fedora/RHEL default, or
   Heimdal's `kcm`, over its Unix socket), so tickets move both ways between this crate and

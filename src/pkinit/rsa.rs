@@ -10,62 +10,14 @@
 
 use super::asn1::{self, ReaderExt};
 use super::bigint::{less, modpow};
+pub(crate) use super::keys::Hash;
 use crate::der::{self, DerError, Reader};
-use sha2::{Digest, Sha256, Sha384, Sha512};
 
 pub(crate) const RSA_ENCRYPTION: &str = "1.2.840.113549.1.1.1";
-pub(crate) const SHA256_WITH_RSA: &str = "1.2.840.113549.1.1.11";
-pub(crate) const SHA384_WITH_RSA: &str = "1.2.840.113549.1.1.12";
-pub(crate) const SHA512_WITH_RSA: &str = "1.2.840.113549.1.1.13";
-
 /// Moduli outside this range are refused: below 2048 bits is weaker than
 /// OpenSSL's security level 2 allows; above 16384 only costs time.
 const MIN_BITS: usize = 2048;
 const MAX_BITS: usize = 16384;
-
-/// The digests a signature may use. SHA-1 is not among them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Hash {
-    Sha256,
-    Sha384,
-    Sha512,
-}
-
-impl Hash {
-    pub(crate) fn oid(self) -> &'static str {
-        match self {
-            Hash::Sha256 => "2.16.840.1.101.3.4.2.1",
-            Hash::Sha384 => "2.16.840.1.101.3.4.2.2",
-            Hash::Sha512 => "2.16.840.1.101.3.4.2.3",
-        }
-    }
-
-    pub(crate) fn from_oid(oid: &[u8]) -> Option<Hash> {
-        [Hash::Sha256, Hash::Sha384, Hash::Sha512]
-            .into_iter()
-            .find(|h| asn1::oid(h.oid()) == oid)
-    }
-
-    /// The hash of a `shaNNNWithRSAEncryption` signature algorithm.
-    pub(crate) fn from_rsa_sig_oid(oid: &[u8]) -> Option<Hash> {
-        [
-            (SHA256_WITH_RSA, Hash::Sha256),
-            (SHA384_WITH_RSA, Hash::Sha384),
-            (SHA512_WITH_RSA, Hash::Sha512),
-        ]
-        .into_iter()
-        .find(|(o, _)| asn1::oid(o) == oid)
-        .map(|(_, h)| h)
-    }
-
-    pub(crate) fn digest(self, data: &[u8]) -> Vec<u8> {
-        match self {
-            Hash::Sha256 => Sha256::digest(data).to_vec(),
-            Hash::Sha384 => Sha384::digest(data).to_vec(),
-            Hash::Sha512 => Sha512::digest(data).to_vec(),
-        }
-    }
-}
 
 /// EMSA-PKCS1-v1_5 for a `k`-octet modulus: `00 01 FF.. 00 DigestInfo`,
 /// the DigestInfo's AlgorithmIdentifier with NULL parameters or without.

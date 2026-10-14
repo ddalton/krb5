@@ -1366,7 +1366,7 @@ fn an_armor_cache_upgrades_or_starts_armored() {
 mod pkinit {
     use super::*;
     use krb5::CacheName;
-    use krb5::pkinit::{Identity, TrustAnchors};
+    use krb5::pkinit::{DhGroup, Identity, TrustAnchors};
 
     macro_rules! pk {
         () => {{
@@ -1414,14 +1414,89 @@ mod pkinit {
         establish(&e, &st);
     }
 
+    /// alice's P-256 certificate and key.
+    fn alice_ec(e: &Env) -> Identity {
+        Identity::load(&format!(
+            "FILE:{0}/pki/alice-ec.pem,{0}/pki/alice-ec-key.pem",
+            e.dir
+        ))
+        .unwrap()
+    }
+
+    /// An MIT 1.22+ KDC, which does ECDH.
+    fn ecdh() -> bool {
+        let yes = std::env::var("KRB5_TEST_PKINIT_ECDH").ok().as_deref() == Some("1");
+        if !yes {
+            eprintln!("KRB5_TEST_PKINIT_ECDH not set (KDC before MIT 1.22); skipping ECDH");
+        }
+        yes
+    }
+
+    /// An ECDSA client signature, which MIT's KDC verifies (1.20 too).
+    #[test]
+    fn ec_certificate_login() {
+        let e = pk!();
+        let id = alice_ec(&e);
+        assert_eq!(id.principals(), [e.p("alice")]);
+        let tgt = client(&e)
+            .login_with_certificate(&e.p("alice"), &id)
+            .unwrap();
+        assert_eq!(tgt.client, e.p("alice"));
+        let st = e
+            .client
+            .service_ticket(&tgt, &e.p("host/svc.krb5.test"))
+            .unwrap();
+        establish(&e, &st);
+    }
+
+    /// ECDH on each curve, anonymously and with RSA and EC certificates.
+    #[test]
+    fn ecdh_on_every_curve() {
+        let e = pk!();
+        if !ecdh() {
+            return;
+        }
+        for group in [DhGroup::P256, DhGroup::P384, DhGroup::P521] {
+            let c = client(&e).with_pkinit_dh_group(group);
+            c.login_anonymous()
+                .unwrap_or_else(|err| panic!("{group:?} anonymous: {err}"));
+            for id in [alice(&e), alice_ec(&e)] {
+                let tgt = c
+                    .login_with_certificate(&e.p("alice"), &id)
+                    .unwrap_or_else(|err| panic!("{group:?} certificate: {err}"));
+                assert_eq!(tgt.client, e.p("alice"));
+            }
+        }
+    }
+
+    /// CROSS.TEST's KDC wants more than MODP group 14 (P-384 with ECDH,
+    /// else 4096 bits): it refuses the default with TD-DH-PARAMETERS, and
+    /// the request is made again with its group.
+    #[test]
+    fn a_kdc_wanting_a_stronger_group_gets_it() {
+        let e = pk!();
+        let cross = KdcClient::from_config(&conf(&e, ""), "CROSS.TEST").unwrap();
+        let tgt = cross.login_anonymous().unwrap();
+        assert_eq!(tgt.server, Principal::krbtgt("CROSS.TEST"));
+        let strong = if ecdh() {
+            DhGroup::P384
+        } else {
+            DhGroup::Modp4096
+        };
+        cross
+            .with_pkinit_dh_group(strong)
+            .login_anonymous()
+            .unwrap();
+    }
+
     #[test]
     fn certificate_login_then_a_service_ticket() {
         let e = pk!();
         let id = alice(&e);
         assert_eq!(id.principals(), [e.p("alice")]);
-        for bits in [2048, 4096] {
+        for group in [DhGroup::Modp2048, DhGroup::Modp4096] {
             let tgt = client(&e)
-                .with_pkinit_dh_min_bits(bits)
+                .with_pkinit_dh_group(group)
                 .login_with_certificate(&e.p("alice"), &id)
                 .unwrap();
             assert_eq!(tgt.client, e.p("alice"));

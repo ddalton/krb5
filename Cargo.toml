@@ -23,10 +23,14 @@ rand = "0.8"
 thiserror = "1.0"
 tracing = "0.1"
 crypto-bigint = { version = "0.7.5", optional = true, default-features = false, features = ["alloc"] }
+p256 = { version = "0.14", optional = true, default-features = false, features = ["ecdh", "ecdsa"] }
+p384 = { version = "0.14", optional = true, default-features = false, features = ["ecdh", "ecdsa"] }
+p521 = { version = "0.14", optional = true, default-features = false, features = ["ecdh", "ecdsa"] }
 
 [features]
-# PKINIT (RFC 4556) and anonymous PKINIT (RFC 8062): `krb5::pkinit`.
-pkinit = ["dep:crypto-bigint"]
+# PKINIT (RFC 4556), anonymous PKINIT (RFC 8062) and ECDH/ECDSA (RFC 5349):
+# `krb5::pkinit`.
+pkinit = ["dep:crypto-bigint", "dep:p256", "dep:p384", "dep:p521"]
 
 [package.metadata.docs.rs]
 all-features = true

@@ -67,6 +67,17 @@ impl Group {
         }
     }
 
+    /// The known group whose X9.42 DomainParameters (or PKCS #3 DHParameter,
+    /// `{ p, g }`) these are.
+    pub(crate) fn from_domain_parameters(params: &[u8]) -> Option<Group> {
+        let mut s = Reader::new(params).seq().ok()?;
+        let p = s.uint().ok()?;
+        [2048, 4096]
+            .map(Group::at_least)
+            .into_iter()
+            .find(|g| g.p == p && s.uint().ok() == Some(&[2][..]))
+    }
+
     pub(crate) fn bits(&self) -> u32 {
         (self.p.len() * 8) as u32
     }

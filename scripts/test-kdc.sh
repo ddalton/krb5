@@ -16,9 +16,14 @@
 # answer a host-based request with a referral.
 #
 # If openssl is installed and MIT's PKINIT plugin is present (Debian:
-# krb5-pkinit), KRB5.TEST also does PKINIT: a CA, a KDC certificate and a
-# client certificate for alice made as MIT's PKINIT guide makes them, and
-# WELLKNOWN/ANONYMOUS for anonymous PKINIT. KRB5_TEST_PKINIT=1 then.
+# krb5-pkinit), KRB5.TEST and CROSS.TEST also do PKINIT: a CA, a KDC
+# certificate naming both realms, client certificates for alice (RSA, and
+# P-256 in pki/alice-ec.pem) made as MIT's PKINIT guide makes them, and
+# WELLKNOWN/ANONYMOUS for anonymous PKINIT. CROSS.TEST's KDC wants a
+# stronger group than the default (pkinit_dh_min_bits 4096, or P-384 where
+# the KDC has ECDH), so clients must negotiate. KRB5_TEST_PKINIT=1 then,
+# and KRB5_TEST_PKINIT_ECDH=1 for an MIT 1.22+ KDC. With
+# KRB5_TEST_PKINIT_EC_KDC=1 in the environment the KDC's key is P-256.
 #
 # Writes <dir>/test.env with the KRB5_TEST_* variables the tests read.
 # The keys are random and the passwords are fixed strings: nothing here
@@ -74,6 +79,16 @@ for p in "${KDCBIN%/sbin/krb5kdc}/lib/krb5/plugins/preauth/pkinit.so" \
          /usr/lib/*/krb5/plugins/preauth/pkinit.so /usr/lib*/krb5/plugins/preauth/pkinit.so; do
     if [ -f "$p" ] && command -v openssl >/dev/null; then PKINIT=1; fi
 done
+# ECDH: MIT 1.22 and later.
+ECDH=
+if [ -n "$PKINIT" ]; then
+    KLIST="${KDCBIN%/sbin/krb5kdc}/bin/klist"
+    [ -x "$KLIST" ] || KLIST=klist
+    v=$("$KLIST" -V 2>/dev/null | sed -n 's/^Kerberos 5 version \([0-9]*\)\.\([0-9]*\).*/\1 \2/p')
+    if [ -n "$v" ] && [ "${v% *}" -ge 1 ] && { [ "${v% *}" -gt 1 ] || [ "${v#* }" -ge 22 ]; }; then
+        ECDH=1
+    fi
+fi
 if [ -n "$PKINIT" ]; then
     P="$DIR/pki"
     mkdir -p "$P"
@@ -84,7 +99,7 @@ keyUsage=nonRepudiation,digitalSignature,keyEncipherment,keyAgreement
 extendedKeyUsage=1.3.6.1.5.2.3.5
 subjectKeyIdentifier=hash
 authorityKeyIdentifier=keyid,issuer
-subjectAltName=otherName:1.3.6.1.5.2.2;SEQUENCE:kdc_princ_name
+subjectAltName=otherName:1.3.6.1.5.2.2;SEQUENCE:kdc_princ_name,otherName:1.3.6.1.5.2.2;SEQUENCE:xkdc_princ_name
 [kdc_princ_name]
 realm=EXP:0,GeneralString:$REALM
 principal_name=EXP:1,SEQUENCE:kdc_principal_seq
@@ -94,6 +109,15 @@ name_string=EXP:1,SEQUENCE:kdc_principals
 [kdc_principals]
 princ1=GeneralString:krbtgt
 princ2=GeneralString:$REALM
+[xkdc_princ_name]
+realm=EXP:0,GeneralString:$XREALM
+principal_name=EXP:1,SEQUENCE:xkdc_principal_seq
+[xkdc_principal_seq]
+name_type=EXP:0,INTEGER:2
+name_string=EXP:1,SEQUENCE:xkdc_principals
+[xkdc_principals]
+princ1=GeneralString:krbtgt
+princ2=GeneralString:$XREALM
 [client_cert]
 basicConstraints=CA:FALSE
 keyUsage=digitalSignature,keyEncipherment,keyAgreement
@@ -113,19 +137,45 @@ EXT
     o() { openssl "$@" 2>/dev/null; }
     o req -x509 -newkey rsa:2048 -nodes -keyout "$P/ca-key.pem" -out "$P/ca.pem" \
         -days 3650 -subj "/CN=Test PKINIT CA"
-    o req -newkey rsa:2048 -nodes -keyout "$P/kdc-key.pem" -out "$P/kdc.req" -subj "/CN=kdc"
+    if [ -n "${KRB5_TEST_PKINIT_EC_KDC:-}" ]; then
+        kdckey=(-newkey ec -pkeyopt ec_paramgen_curve:P-256)
+    else
+        kdckey=(-newkey rsa:2048)
+    fi
+    o req "${kdckey[@]}" -nodes -keyout "$P/kdc-key.pem" -out "$P/kdc.req" -subj "/CN=kdc"
     o x509 -req -in "$P/kdc.req" -CA "$P/ca.pem" -CAkey "$P/ca-key.pem" \
         -CAcreateserial -out "$P/kdc.pem" -days 365 -extfile "$P/ext.cnf" -extensions kdc_cert
     o req -newkey rsa:2048 -nodes -keyout "$P/alice-key.pem" -out "$P/alice.req" -subj "/CN=alice"
     o x509 -req -in "$P/alice.req" -CA "$P/ca.pem" -CAkey "$P/ca-key.pem" \
         -CAcreateserial -out "$P/alice.pem" -days 365 -extfile "$P/ext.cnf" -extensions client_cert
+    o req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$P/alice-ec-key.pem" \
+        -out "$P/alice-ec.req" -subj "/CN=alice"
+    o x509 -req -in "$P/alice-ec.req" -CA "$P/ca.pem" -CAkey "$P/ca-key.pem" \
+        -CAcreateserial -out "$P/alice-ec.pem" -days 365 -extfile "$P/ext.cnf" -extensions client_cert
     cat >>"$DIR/krb5.conf" <<EOF
 [realms]
     $REALM = {
         pkinit_anchors = FILE:$P/ca.pem
     }
+    $XREALM = {
+        pkinit_anchors = FILE:$P/ca.pem
+    }
 EOF
 fi
+
+# The PKINIT lines of a realm's kdc.conf entry.
+pkinit_kdc_conf() {
+    [ -n "$PKINIT" ] || return 0
+    case $1 in
+        "$REALM" | "$XREALM") ;;
+        *) return 0 ;;
+    esac
+    printf '        pkinit_identity = FILE:%s/pki/kdc.pem,%s/pki/kdc-key.pem\n' "$DIR" "$DIR"
+    printf '        pkinit_anchors = FILE:%s/pki/ca.pem\n' "$DIR"
+    if [ "$1" = "$XREALM" ]; then
+        printf '        pkinit_dh_min_bits = %s\n' "$([ -n "$ECDH" ] && echo P-384 || echo 4096)"
+    fi
+}
 
 cat >"$DIR/kdc.conf" <<EOF
 [kdcdefaults]
@@ -141,7 +191,7 @@ $(for r in $REALM $XREALM $FREALM; do cat <<REALM
         default_principal_flags = +preauth
         max_life = 1d
         max_renewable_life = 7d
-$( [ -n "$PKINIT" ] && [ "$r" = "$REALM" ] && printf '        pkinit_identity = FILE:%s/pki/kdc.pem,%s/pki/kdc-key.pem\n        pkinit_anchors = FILE:%s/pki/ca.pem\n' "$DIR" "$DIR" "$DIR")
+$(pkinit_kdc_conf "$r")
     }
 REALM
 done)
@@ -193,6 +243,7 @@ k ktadd -k "$DIR/robot.keytab" robot
 
 if [ -n "$PKINIT" ]; then
     k addprinc -randkey WELLKNOWN/ANONYMOUS
+    kr "$XREALM" addprinc -randkey WELLKNOWN/ANONYMOUS
 fi
 
 # Cross-realm trust: the same krbtgt/B@A, with the same password (so the
@@ -223,5 +274,6 @@ KRB5_TEST_REALM=$REALM
 KRB5_TEST_DIR=$DIR
 KRB5_TEST_CROSS_REALMS="$XREALM $FREALM"
 KRB5_TEST_PKINIT=$PKINIT
+KRB5_TEST_PKINIT_ECDH=$ECDH
 EOF
 echo "KDC for $REALM listening on port $PORT (pid $(cat "$DIR/kdc.pid")); env in $DIR/test.env"

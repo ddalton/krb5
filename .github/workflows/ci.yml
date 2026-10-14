@@ -59,6 +59,15 @@ jobs:
         env:
           # Also compare the DNS resolver with dig on public realms' records.
           KRB5_TEST_DNS: "1"
+      # The PKINIT tests again with a P-256 KDC key: MIT's KDC signs with
+      # ECDSA (labelled RSA before 1.22).
+      - run: |
+          kill "$(cat "$KRB5_TEST_DIR/kdc.pid")"
+          KRB5_TEST_PKINIT_EC_KDC=1 scripts/test-kdc.sh "$RUNNER_TEMP/krb5ec"
+          set -a; . "$RUNNER_TEMP/krb5ec/test.env"; set +a
+          cargo test --features pkinit --test kdc pkinit -- --nocapture
+          kill "$(cat "$KRB5_TEST_DIR/kdc.pid")"
+          scripts/test-kdc.sh "$RUNNER_TEMP/krb5test"
       - run: cargo build --example gss_client
       - run: KRB5_CONFIG="$KRB5_TEST_DIR/krb5.conf" scripts/mit-acceptor.py "$KRB5_TEST_DIR" target/debug/examples/gss_client
       # KCM caches against sssd-kcm, the Fedora/RHEL default, with MIT's
@@ -71,3 +80,42 @@ jobs:
       - run: cargo test --test kdc kcm_ -- --nocapture
         env:
           KRB5_TEST_KCM: "1"
+  live-kdc-mit122:
+    # ECDH PKINIT needs MIT 1.22, newer than Ubuntu's package: built from
+    # the release tarball (checksum-pinned), cached between runs.
+    runs-on: ubuntu-24.04
+    env:
+      MIT: /home/runner/mit-krb5-1.22.2
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        id: mit
+        with:
+          path: /home/runner/mit-krb5-1.22.2
+          key: mit-krb5-1.22.2-ubuntu-24.04
+      - if: steps.mit.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq bison libssl-dev
+          cd "$RUNNER_TEMP"
+          curl -sSfO https://kerberos.org/dist/krb5/1.22/krb5-1.22.2.tar.gz
+          echo "3243ffbc8ea4d4ac22ddc7dd2a1dc54c57874c40648b60ff97009763554eaf13  krb5-1.22.2.tar.gz" | sha256sum -c
+          tar -xzf krb5-1.22.2.tar.gz
+          cd krb5-1.22.2/src
+          ./configure --prefix="$MIT" --disable-nls >/dev/null
+          make -j"$(nproc)" >/dev/null
+          make install >/dev/null
+      - run: |
+          echo "$MIT/bin" >> "$GITHUB_PATH"
+          echo "$MIT/sbin" >> "$GITHUB_PATH"
+      - run: klist -V
+      - run: scripts/test-kdc.sh "$RUNNER_TEMP/krb5test"
+      - run: cat "$RUNNER_TEMP/krb5test/test.env" >> "$GITHUB_ENV"
+      - run: test "$KRB5_TEST_PKINIT_ECDH" = 1
+      - run: cargo test --features pkinit --test kdc -- --nocapture
+      - run: |
+          kill "$(cat "$KRB5_TEST_DIR/kdc.pid")"
+          KRB5_TEST_PKINIT_EC_KDC=1 scripts/test-kdc.sh "$RUNNER_TEMP/krb5ec"
+          set -a; . "$RUNNER_TEMP/krb5ec/test.env"; set +a
+          cargo test --features pkinit --test kdc pkinit -- --nocapture

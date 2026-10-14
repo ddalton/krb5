@@ -471,7 +471,7 @@ struct PkState {
     #[cfg(feature = "pkinit")]
     rfc6112_kdc: bool,
     #[cfg(feature = "pkinit")]
-    dh_bits: u32,
+    group: pkinit::DhGroup,
 }
 
 /// Salt information from ETYPE-INFO2 / ETYPE-INFO / PW-SALT.
@@ -870,11 +870,14 @@ impl KdcClient {
         self
     }
 
-    /// The smallest DH group to offer, in bits, as `pkinit_dh_min_bits`:
-    /// 2048 (the default) or 4096.
+    /// The key-exchange group to offer, as `pkinit_dh_min_bits` sets it:
+    /// MODP group 14 by default, or 16, or ECDH on P-256, P-384 or P-521
+    /// (which needs MIT 1.22's KDC or later). A KDC that wants a stronger
+    /// group says so, and the request is made again with the first of its
+    /// groups this crate supports.
     #[cfg(feature = "pkinit")]
-    pub fn with_pkinit_dh_min_bits(mut self, bits: u32) -> Self {
-        self.pkinit.dh_min_bits = bits;
+    pub fn with_pkinit_dh_group(mut self, group: pkinit::DhGroup) -> Self {
+        self.pkinit.dh_group = group;
         self
     }
 
@@ -1177,7 +1180,7 @@ impl KdcClient {
         let mut pk = PkState::default();
         #[cfg(feature = "pkinit")]
         {
-            pk.dh_bits = self.pkinit.dh_min_bits;
+            pk.group = self.pkinit.dh_group;
         }
 
         for _ in 0..4 {
@@ -1205,7 +1208,7 @@ impl KdcClient {
                         now,
                         usec,
                         freshness: pk.freshness.as_deref(),
-                        dh_bits: pk.dh_bits,
+                        group: pk.group,
                     })?;
                     padata.insert(0, (pkinit::PA_PK_AS_REQ, value));
                     pk.request = Some(request);
@@ -1234,7 +1237,14 @@ impl KdcClient {
                     // with it, are inside the armored response.
                     let (e, methods) = match &armor {
                         None => {
-                            let m = outer.method_data()?;
+                            // Only PREAUTH_REQUIRED's e-data must be
+                            // METHOD-DATA; others may be TYPED-DATA (MIT's
+                            // TD-DH-PARAMETERS), read where they are used.
+                            let m = match outer.method_data() {
+                                Ok(m) => m,
+                                Err(_) if outer.code != KDC_ERR_PREAUTH_REQUIRED => Vec::new(),
+                                Err(e) => return Err(e),
+                            };
                             (outer, m)
                         }
                         Some(a) => match outer.method_data().and_then(|m| a.open(&m, nonce)) {
@@ -1267,7 +1277,7 @@ impl KdcClient {
                         pa_type = None;
                         pk = PkState {
                             #[cfg(feature = "pkinit")]
-                            dh_bits: pk.dh_bits,
+                            group: pk.group,
                             ..PkState::default()
                         };
                         continue;
@@ -1287,15 +1297,18 @@ impl KdcClient {
                     }
                     #[cfg(feature = "pkinit")]
                     if let Secret::Pkinit(_) = &secret {
-                        // MIT tries the next larger group once when the
-                        // KDC wants more than it was offered.
-                        if e.code == pkinit::KDC_ERR_DH_KEY_PARAMETERS_NOT_ACCEPTED
-                            && pk.request.as_ref().is_some_and(|r| r.dh_bits() < 4096)
-                        {
-                            debug!("KDC refused the DH group; retrying with 4096 bits");
-                            pk.dh_bits = 4096;
-                            pk.request = None;
-                            continue;
+                        // MIT's tryagain: the KDC lists the groups it takes;
+                        // ask again with the first stronger one we have.
+                        if e.code == pkinit::KDC_ERR_DH_KEY_PARAMETERS_NOT_ACCEPTED {
+                            let offered = pk.request.as_ref().map(|r| r.group());
+                            if let Some(g) = offered.and_then(|o| {
+                                pkinit::negotiate_group(e.e_data.as_deref().unwrap_or(&[]), o)
+                            }) {
+                                debug!(?g, "KDC refused the DH group; retrying");
+                                pk.group = g;
+                                pk.request = None;
+                                continue;
+                            }
                         }
                         if e.code != KDC_ERR_PREAUTH_REQUIRED || pk.pending {
                             return Err(e.into_error());
