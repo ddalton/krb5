@@ -243,10 +243,7 @@ impl Krb5Conf {
             }
             p = match p.strip_prefix('.') {
                 Some(rest) => rest,
-                None => match p.find('.') {
-                    Some(i) => &p[i..],
-                    None => return None,
-                },
+                None => &p[p.find('.')?..],
             };
         }
     }
