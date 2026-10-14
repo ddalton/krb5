@@ -283,6 +283,66 @@ impl Credentials {
     }
 }
 
+/// RFC 6806 §11 PA-REQ-ENC-PA-REP: sent empty, returned in the encrypted
+/// part as a checksum over the request.
+const PA_REQ_ENC_PA_REP: i32 = 149;
+/// RFC 6806 §11 key usage for that checksum (KRB5_KEYUSAGE_AS_REQ).
+const KU_AS_REQ: u32 = 56;
+/// TicketFlags enc-pa-rep (bit 15).
+const TKT_FLG_ENC_PA_REP: u32 = 1 << 16;
+
+/// What an AS exchange learned besides the TGT.
+struct AsInfo {
+    /// The KDC said, in the authenticated reply, that it supports FAST.
+    fast_avail: bool,
+    /// The pre-authentication used (PA-ENC-TIMESTAMP, PA-ENCRYPTED-CHALLENGE).
+    pa_type: Option<i32>,
+}
+
+/// MIT's `krb5int_fast_verify_nego` (RFC 6806 §11): if the reply sets
+/// enc-pa-rep, its encrypted PA-DATA must hold a checksum, in the reply
+/// key, over exactly the request we sent, which an attacker who altered
+/// the unprotected AS-REQ cannot forge. Then FAST is available if
+/// PA-FX-FAST is there too.
+fn verify_enc_pa_rep(plain: &[u8], reply_key: &Key, request: &[u8]) -> Result<bool> {
+    let tag = plain.first().copied().unwrap_or(0);
+    let f = Fields::parse_tagged("EncKDCRepPart", tag, plain)?;
+    if f.get(4)?.flags32()? & TKT_FLG_ENC_PA_REP == 0 {
+        return Ok(false);
+    }
+    let padata = match f.opt(12) {
+        Some(mut r) => parse_pa_data(r.seq()?)?,
+        None => Vec::new(),
+    };
+    let Some((_, ck)) = padata.iter().find(|(t, _)| *t == PA_REQ_ENC_PA_REP) else {
+        return protocol("enc-pa-rep set but no request checksum (KRB5_KDCREP_MODIFIED)");
+    };
+    let ck = Fields::parse_tagged("Checksum", der::SEQUENCE, ck)?;
+    let sum = ck.get(1)?.octets()?.to_vec();
+    if ck.get(0)?.i32()? != reply_key.checksum_type()
+        || !reply_key.verify_checksum(KU_AS_REQ, request, &sum)?
+    {
+        return protocol(
+            "the KDC's checksum does not match the request we sent (KRB5_KDCREP_MODIFIED)",
+        );
+    }
+    Ok(padata.iter().any(|(t, _)| *t == fast::PA_FX_FAST))
+}
+
+/// The cache `kinit` writes: the TGT, `fast_avail` if the KDC supports
+/// FAST, and `pa_type`, both associated with the TGT's server.
+fn write_kinit_cache(cache: &CacheName, tgt: &Credentials, info: &AsInfo) -> Result<()> {
+    let mut cc = CCache::with_credentials(tgt);
+    if info.fast_avail {
+        cc.set_config("fast_avail", Some(&tgt.server), b"yes");
+    }
+    if let Some(t) = info.pa_type {
+        cc.set_config("pa_type", Some(&tgt.server), t.to_string().as_bytes());
+    }
+    cache.resolved()?.write(&cc)?;
+    Ok(())
+}
+
 /// TicketFlags ok-as-delegate (bit 13).
 const TKT_FLG_OK_AS_DELEGATE: u32 = 1 << 18;
 
@@ -409,8 +469,10 @@ pub struct KdcClient {
     resolver: Option<Resolver>,
     /// Other realms' KDCs given explicitly, ahead of `conf` and DNS.
     realm_kdcs: HashMap<String, Vec<String>>,
-    /// A TGT to armor AS requests with (FAST).
+    /// A TGT to armor AS requests with (FAST), and whether FAST is
+    /// required from the first request or taken up when the KDC offers it.
     fast_armor: Option<Credentials>,
+    fast_required: bool,
 }
 
 impl KdcClient {
@@ -438,6 +500,7 @@ impl KdcClient {
             resolver: None,
             realm_kdcs: HashMap::new(),
             fast_armor: None,
+            fast_required: false,
         }
     }
 
@@ -449,7 +512,26 @@ impl KdcClient {
     /// client's key too. See the `fast` module docs.
     pub fn with_fast_armor(mut self, armor: Credentials) -> Self {
         self.fast_armor = Some(armor);
+        self.fast_required = true;
         self
+    }
+
+    /// FAST with an armor TGT from `cache` (a host's cache, say), as MIT
+    /// does with an armor ccache: if the cache records that this realm's
+    /// KDC supports FAST (its `fast_avail` entry, from RFC 6806
+    /// negotiation), every login is armored from the first request, so FAST
+    /// cannot be stripped; otherwise a login starts unarmored and turns
+    /// armored when the KDC's reply offers FAST (MIT `k5_upgrade_to_fast_p`),
+    /// and stays plain against a KDC that does not.
+    pub fn with_fast_armor_cache(mut self, cache: &CacheName) -> Result<Self> {
+        let cc = cache.read()?;
+        let tgt = cc.tgt(now().0).ok_or_else(|| ClientError::NoTgt {
+            principal: cc.principal.to_string(),
+            cache: cache.to_string(),
+        })?;
+        self.fast_required = cc.fast_avail(&self.realm);
+        self.fast_armor = Some(tgt);
+        Ok(self)
     }
 
     /// Use `kdcs` for `realm` when a cross-realm request needs its KDC,
@@ -655,6 +737,36 @@ impl KdcClient {
         &self.kdcs
     }
 
+    /// `kinit`: log in with a password and write the TGT to `cache` as
+    /// MIT's `kinit` does, with its `fast_avail` (if the KDC said it
+    /// supports FAST) and `pa_type` config entries.
+    pub fn kinit_with_password(
+        &self,
+        client: &Principal,
+        password: &str,
+        cache: &CacheName,
+    ) -> Result<Credentials> {
+        let (creds, info) = self.as_exchange(
+            client,
+            Secret::Password(password),
+            self.tkt_enctypes.clone(),
+        )?;
+        write_kinit_cache(cache, &creds, &info)?;
+        Ok(creds)
+    }
+
+    /// `kinit -k`: as [`KdcClient::kinit_with_password`], from a keytab.
+    pub fn kinit_with_keytab(
+        &self,
+        client: &Principal,
+        keytab: &Keytab,
+        cache: &CacheName,
+    ) -> Result<Credentials> {
+        let tgt = self.login_with_keytab_info(client, keytab)?;
+        write_kinit_cache(cache, &tgt.0, &tgt.1)?;
+        Ok(tgt.0)
+    }
+
     /// AS exchange with a password-derived key: `kinit`.
     pub fn login_with_password(&self, client: &Principal, password: &str) -> Result<Credentials> {
         self.as_exchange(
@@ -662,6 +774,7 @@ impl KdcClient {
             Secret::Password(password),
             self.tkt_enctypes.clone(),
         )
+        .map(|(c, _)| c)
     }
 
     /// AS exchange with a long-term key from a keytab: `kinit -k`.
@@ -669,6 +782,14 @@ impl KdcClient {
     /// Only enctypes the keytab holds for `client` are requested, so the
     /// KDC cannot pick one the client has no key for.
     pub fn login_with_keytab(&self, client: &Principal, keytab: &Keytab) -> Result<Credentials> {
+        self.login_with_keytab_info(client, keytab).map(|(c, _)| c)
+    }
+
+    fn login_with_keytab_info(
+        &self,
+        client: &Principal,
+        keytab: &Keytab,
+    ) -> Result<(Credentials, AsInfo)> {
         let have: Vec<i32> = self
             .tkt_enctypes
             .iter()
@@ -867,19 +988,28 @@ impl KdcClient {
         client: &Principal,
         secret: Secret<'_>,
         enctypes: Vec<i32>,
-    ) -> Result<Credentials> {
+    ) -> Result<(Credentials, AsInfo)> {
         let krbtgt = Principal::krbtgt(&client.realm);
-        let mut padata: Vec<(i32, Vec<u8>)> = Vec::new();
+        // MIT's state: whether we armor, whether we may still upgrade to
+        // FAST or drop the informational PA-DATA (each once), and the
+        // pre-authentication chosen.
+        let mut armored = self.fast_armor.is_some() && self.fast_required;
+        let mut restarted = false;
+        let mut info_pa = true;
+        let mut preauth: Vec<(i32, Vec<u8>)> = Vec::new();
         let mut preauth_key: Option<Key> = None;
-        let armor = match &self.fast_armor {
-            Some(tgt) => {
-                let (now, usec) = now();
-                Some(fast::Armor::from_tgt(tgt, now, usec)?)
-            }
-            None => None,
-        };
+        let mut pa_type: Option<i32> = None;
+        let mut armor: Option<fast::Armor> = None;
 
-        for round in 0..2 {
+        for _ in 0..4 {
+            if armored && armor.is_none() {
+                let tgt = self
+                    .fast_armor
+                    .as_ref()
+                    .expect("armored only with an armor");
+                let (now, usec) = now();
+                armor = Some(fast::Armor::from_tgt(tgt, now, usec)?);
+            }
             let (now, usec) = now();
             let nonce = random_nonce();
             let body = self.req_body_with(
@@ -890,6 +1020,12 @@ impl KdcClient {
                 &enctypes,
                 self.as_options(),
             );
+            // RFC 6806 §11: ask for the KDC's checksum over this request
+            // and its FAST support in the encrypted reply.
+            let mut padata = preauth.clone();
+            if info_pa {
+                padata.push((PA_REQ_ENC_PA_REP, Vec::new()));
+            }
             let req = match &armor {
                 None => encode_kdc_req(10, &padata, body),
                 Some(a) => {
@@ -923,7 +1059,34 @@ impl KdcClient {
                             Err(_) => (outer, Vec::new()),
                         },
                     };
-                    if e.code != KDC_ERR_PREAUTH_REQUIRED || round != 0 {
+                    // MIT k5_upgrade_to_fast_p: an armor to hand and a KDC
+                    // that offers FAST: start again, armored.
+                    if armor.is_none()
+                        && self.fast_armor.is_some()
+                        && !restarted
+                        && methods.iter().any(|(t, _)| *t == fast::PA_FX_FAST)
+                    {
+                        debug!("KDC offers FAST; restarting armored");
+                        armored = true;
+                        restarted = true;
+                        preauth.clear();
+                        preauth_key = None;
+                        pa_type = None;
+                        continue;
+                    }
+                    // A pre-1.7 MIT KDC rejects the informational PA-DATA
+                    // as failed pre-authentication: retry without it.
+                    if e.code == KDC_ERR_PREAUTH_FAILED
+                        && preauth.is_empty()
+                        && info_pa
+                        && !restarted
+                    {
+                        debug!("KDC refused PA-REQ-ENC-PA-REP; retrying without it");
+                        info_pa = false;
+                        restarted = true;
+                        continue;
+                    }
+                    if e.code != KDC_ERR_PREAUTH_REQUIRED || !preauth.is_empty() {
                         return Err(e.into_error());
                     }
                     let info = choose_salt(&methods, &enctypes).ok_or_else(|| {
@@ -932,12 +1095,13 @@ impl KdcClient {
                         )
                     })?;
                     let key = derive_key(&secret, client, &info)?;
-                    padata = match &armor {
+                    preauth = match &armor {
                         None => {
                             debug!(
                                 etype = info.etype,
                                 "pre-authenticating with PA-ENC-TIMESTAMP"
                             );
+                            pa_type = Some(PA_ENC_TIMESTAMP);
                             vec![(PA_ENC_TIMESTAMP, encode_enc_timestamp(&key, now, usec)?)]
                         }
                         Some(a) => {
@@ -953,6 +1117,7 @@ impl KdcClient {
                                 etype = info.etype,
                                 "pre-authenticating with PA-ENCRYPTED-CHALLENGE"
                             );
+                            pa_type = Some(fast::PA_ENCRYPTED_CHALLENGE);
                             // MIT uses the KDC's time from the (armored)
                             // error, so the client's clock does not matter.
                             vec![(
@@ -964,7 +1129,7 @@ impl KdcClient {
                     // RFC 6113 §5.2: echo the cookie so a stateless KDC can
                     // continue the conversation.
                     if let Some(c) = fast::cookie(&methods) {
-                        padata.push(c);
+                        preauth.push(c);
                     }
                     preauth_key = Some(key);
                     continue;
@@ -1006,7 +1171,7 @@ impl KdcClient {
                     .find(|(t, _)| *t == fast::PA_ENCRYPTED_CHALLENGE)
                 {
                     a.verify_kdc_challenge(&long_term, ch)?;
-                } else if round > 0 {
+                } else if pa_type == Some(fast::PA_ENCRYPTED_CHALLENGE) {
                     return protocol(
                         "the KDC returned no encrypted challenge (KDC not authenticated)",
                     );
@@ -1024,12 +1189,20 @@ impl KdcClient {
                     ))),
                     Secret::Keytab(_) => ClientError::Crypto(e),
                 })?;
+            let fast_avail = verify_enc_pa_rep(&plain, &key, &req)?;
             let mut rep = rep;
             if let Some((_, _, client)) = fast_rep {
                 // MIT: the finished message names the client.
                 rep.client = client;
             }
-            return rep.into_credentials(&plain, nonce);
+            let creds = rep.into_credentials(&plain, nonce)?;
+            return Ok((
+                creds,
+                AsInfo {
+                    fast_avail,
+                    pa_type,
+                },
+            ));
         }
         Err(ClientError::Kdc {
             code: KDC_ERR_PREAUTH_REQUIRED,
@@ -1773,6 +1946,42 @@ mod tests {
 
     fn client(addr: &str) -> KdcClient {
         KdcClient::new("R", [addr]).with_timeout(Duration::from_secs(2))
+    }
+
+    /// A pre-1.7 MIT KDC answers PA-REQ-ENC-PA-REP with PREAUTH_FAILED:
+    /// the client tries once more without it, then reports the error.
+    #[test]
+    fn a_kdc_refusing_the_negotiation_padata_gets_one_retry_without_it() {
+        let u = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = format!("127.0.0.1:{}", u.local_addr().unwrap().port());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s = seen.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok((n, from)) = u.recv_from(&mut buf) {
+                let has = buf[..n].windows(4).any(|w| w == [0x02, 0x02, 0x00, 0x95]);
+                s.lock().unwrap().push(has);
+                let err = der::cons(
+                    app(30),
+                    &[der::seq(&[
+                        der::field(0, der::int(5)),
+                        der::field(1, der::int(30)),
+                        der::field(4, der::time(0)),
+                        der::field(5, der::int(0)),
+                        der::field(6, der::int(KDC_ERR_PREAUTH_FAILED as i64)),
+                        der::field(9, der::general_string("R")),
+                        der::field(10, Principal::krbtgt("R").encode_name()),
+                    ])],
+                );
+                u.send_to(&err, from).unwrap();
+            }
+        });
+        let err = client(&addr)
+            .login_with_password(&Principal::parse("a@R").unwrap(), "x")
+            .unwrap_err();
+        assert_eq!(err.kdc_code(), Some(KDC_ERR_PREAUTH_FAILED));
+        // padata-type 149 (INTEGER 02 02 00 95) the first time only.
+        assert_eq!(*seen.lock().unwrap(), [true, false]);
     }
 
     #[test]

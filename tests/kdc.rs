@@ -1215,3 +1215,144 @@ fn fast_armors_service_ticket_requests() {
         establish_with(&e, &st, "far.keytab");
     }
 }
+
+// ------------------------------------------------- FAST negotiation
+
+/// AS requests the test KDC has logged for `who`.
+fn as_requests(e: &Env, who: &str) -> usize {
+    std::fs::read_to_string(format!("{}/kdc.log", e.dir))
+        .unwrap()
+        .lines()
+        .filter(|l| l.contains("AS_REQ") && l.contains(&format!("{who}@{} for krbtgt", e.realm)))
+        .count()
+}
+
+/// RFC 6806 negotiation: the KDC's checksum over our request is verified,
+/// and kinit_with_* records fast_avail and pa_type as MIT's kinit does.
+#[test]
+fn kinit_records_fast_avail_as_mit_does() {
+    let e = live!();
+    let path = scratch(&e, "kinit-ours");
+    let cache = krb5::CacheName::File(path.clone());
+    let tgt = e
+        .client
+        .kinit_with_password(&e.p("alice"), "alicepw", &cache)
+        .unwrap();
+    assert_eq!(
+        tgt.flags & (1 << 16),
+        1 << 16,
+        "enc-pa-rep: the KDC answered the negotiation"
+    );
+    let cc = cache.read().unwrap();
+    assert!(cc.fast_avail(&e.realm), "MIT's KDC supports FAST");
+    let krbtgt = Principal::krbtgt(&e.realm);
+    assert_eq!(
+        cc.config("pa_type", Some(&krbtgt)),
+        Some(&b"2"[..]),
+        "PA-ENC-TIMESTAMP"
+    );
+    // The same entries MIT's kinit writes, in the same place.
+    if let Some(listed) = mit(&e, &format!("FILE:{}", path.display()), "klist", &[], None) {
+        assert!(
+            listed.contains(&format!("krbtgt/{0}@{0}", e.realm)),
+            "{listed}"
+        );
+        let mit_path = scratch(&e, "kinit-mit");
+        let mit_name = format!("FILE:{}", mit_path.display());
+        mit(&e, &mit_name, "kinit", &["alice"], Some("alicepw\n")).unwrap();
+        let theirs = krb5::CCache::read(&mit_path).unwrap();
+        let conf = |c: &krb5::CCache| -> Vec<Vec<String>> {
+            c.entries
+                .iter()
+                .filter(|e| e.is_config())
+                .map(|e| e.server.components.clone())
+                .collect()
+        };
+        assert_eq!(conf(&cc), conf(&theirs));
+        let _ = std::fs::remove_file(mit_path);
+    }
+    // FAST logins record the encrypted challenge.
+    let fast = e.client.clone().with_fast_armor(armor_tgt(&e));
+    fast.kinit_with_password(&e.p("alice"), "alicepw", &cache)
+        .unwrap();
+    assert_eq!(
+        cache.read().unwrap().config("pa_type", Some(&krbtgt)),
+        Some(&b"138"[..])
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+/// An armor cache that records fast_avail armors from the first request
+/// (two AS requests); one that does not upgrades when the KDC offers
+/// FAST (three: plain, then armored twice).
+#[test]
+fn an_armor_cache_upgrades_or_starts_armored() {
+    let e = live!();
+    let robot = e.p("robot");
+    let kt = e.keytab("robot.keytab");
+
+    // Our kinit -k: fast_avail recorded.
+    let with = scratch(&e, "armor-with-fast-avail");
+    e.client
+        .kinit_with_keytab(&robot, &kt, &krb5::CacheName::File(with.clone()))
+        .unwrap();
+    let kdc = e
+        .client
+        .clone()
+        .with_fast_armor_cache(&krb5::CacheName::File(with.clone()))
+        .unwrap();
+    let before = as_requests(&e, "alice");
+    kdc.login_with_password(&e.p("alice"), "alicepw").unwrap();
+    assert_eq!(
+        as_requests(&e, "alice") - before,
+        2,
+        "armored from the start"
+    );
+
+    // A bare cache with the same TGT and no fast_avail: upgrade.
+    let without = scratch(&e, "armor-without");
+    let tgt = krb5::CCache::read(&with).unwrap().tgt(0).unwrap();
+    krb5::CCache::with_credentials(&tgt)
+        .write(&without)
+        .unwrap();
+    let kdc = e
+        .client
+        .clone()
+        .with_fast_armor_cache(&krb5::CacheName::File(without.clone()))
+        .unwrap();
+    let before = as_requests(&e, "alice");
+    let tgt = kdc.login_with_password(&e.p("alice"), "alicepw").unwrap();
+    assert_eq!(as_requests(&e, "alice") - before, 3, "plain, then upgraded");
+    establish(
+        &e,
+        &e.client
+            .service_ticket(&tgt, &e.p("host/svc.krb5.test"))
+            .unwrap(),
+    );
+
+    // MIT's kinit -k writes fast_avail too.
+    if mit_tools_installed() {
+        let mit_cache = scratch(&e, "armor-mit-kinit");
+        let name = format!("FILE:{}", mit_cache.display());
+        mit(
+            &e,
+            &name,
+            "kinit",
+            &["-k", "-t", &format!("{}/robot.keytab", e.dir), "robot"],
+            None,
+        )
+        .unwrap();
+        assert!(krb5::CCache::read(&mit_cache).unwrap().fast_avail(&e.realm));
+        let kdc = e
+            .client
+            .clone()
+            .with_fast_armor_cache(&krb5::CacheName::File(mit_cache.clone()))
+            .unwrap();
+        let before = as_requests(&e, "alice");
+        kdc.login_with_password(&e.p("alice"), "alicepw").unwrap();
+        assert_eq!(as_requests(&e, "alice") - before, 2);
+        let _ = std::fs::remove_file(mit_cache);
+    }
+    let _ = std::fs::remove_file(with);
+    let _ = std::fs::remove_file(without);
+}

@@ -403,6 +403,50 @@ impl CCache {
         self.entries.push(Entry::from_credentials(creds));
     }
 
+    /// Set configuration entry `key` (optionally associated with
+    /// `principal`) to `value`, replacing any old one, laid out as MIT's
+    /// `krb5_cc_set_config` lays it out: client the cache's principal,
+    /// server `krb5_ccache_conf_data/key[/principal]@X-CACHECONF:`, the
+    /// value as the ticket, everything else zero. New ones go before the
+    /// credentials, where MIT's `kinit` puts them.
+    pub fn set_config(&mut self, key: &str, principal: Option<&Principal>, value: &[u8]) {
+        let mut comps = vec![CONF_NAME.to_string(), key.to_string()];
+        if let Some(p) = principal {
+            comps.push(p.to_string());
+        }
+        let server = Principal::new(1, comps, CONF_REALM);
+        self.entries
+            .retain(|e| !(e.is_config() && e.server.components == server.components));
+        let at = self.entries.iter().take_while(|e| e.is_config()).count();
+        self.entries.insert(
+            at,
+            Entry {
+                client: self.principal.clone(),
+                server,
+                enctype: 0,
+                key: Vec::new(),
+                authtime: 0,
+                starttime: 0,
+                endtime: 0,
+                renew_till: 0,
+                is_skey: false,
+                flags: 0,
+                addresses: Vec::new(),
+                authdata: Vec::new(),
+                ticket: value.to_vec(),
+                second_ticket: Vec::new(),
+            },
+        );
+    }
+
+    /// Whether the KDC of `realm` said it supports FAST when this cache's
+    /// TGT was obtained: the `fast_avail` config entry MIT's `kinit`
+    /// writes (RFC 6806 §11), associated with `krbtgt/REALM@REALM`.
+    pub fn fast_avail(&self, realm: &str) -> bool {
+        self.config("fast_avail", Some(&Principal::krbtgt(realm)))
+            .is_some_and(|v| !v.is_empty())
+    }
+
     /// The value of configuration entry `key`, optionally associated with
     /// `principal` (e.g. `pa_type` for the krbtgt).
     pub fn config(&self, key: &str, principal: Option<&Principal>) -> Option<&[u8]> {
