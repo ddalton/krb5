@@ -24,6 +24,9 @@ may break the API).
   `with_defaults`. AS requests carry the forwardable, proxiable and
   renewable options (and `rtime`) these ask for.
 - `Krb5Conf::libdefault` and `ConfigError::BadValue`.
+- `[libdefaults] clockskew` for the acceptor (`Krb5Conf::clockskew`,
+  `KerberosContext::accept_token_with_conf`), read as MIT reads it: a
+  plain integer, and the default (300) if it is not one.
 
 ### Changed
 

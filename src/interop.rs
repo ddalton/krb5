@@ -85,6 +85,24 @@ fn a_real_kdc_ticket_decrypts() {
     assert_eq!(checked, 4, "all four enctype fixtures must be exercised");
 }
 
+/// `[libdefaults] clockskew` decides whether a two-month-old capture is
+/// still acceptable: a year of skew lets it through, the default does not.
+#[test]
+fn clockskew_from_krb5_conf_is_applied() {
+    let kt = keytab();
+    let f = fixtures();
+    let ap_req = unhex(
+        f.as_object().unwrap().values().next().unwrap()["ap_req"]
+            .as_str()
+            .unwrap(),
+    );
+    let year = crate::Krb5Conf::parse("[libdefaults]\n clockskew = 31536000\n").unwrap();
+    assert!(KerberosContext::accept_token_with_conf(&kt, &ap_req, &year).is_ok());
+    assert!(
+        KerberosContext::accept_token_with_conf(&kt, &ap_req, &crate::Krb5Conf::empty()).is_err()
+    );
+}
+
 /// MIT signs; we verify. Exercises the RFC 4121 MIC framing, the
 /// per-message key usages, and the §2 base-key selection — MIT's
 /// initiator supplies a subkey, which an early version of the acceptor

@@ -1603,6 +1603,19 @@ impl KerberosContext {
         Self::accept_token_with_skew(keytab, token, DEFAULT_CLOCK_SKEW_SECS)
     }
 
+    /// As [`Self::accept_token`], with the clock-skew tolerance from
+    /// `conf`'s `[libdefaults] clockskew` ([`Krb5Conf::clockskew`]), as an
+    /// MIT acceptor applies it.
+    ///
+    /// [`Krb5Conf::clockskew`]: crate::Krb5Conf::clockskew
+    pub fn accept_token_with_conf(
+        keytab: &Keytab,
+        token: &[u8],
+        conf: &crate::Krb5Conf,
+    ) -> Result<(Self, Vec<u8>)> {
+        Self::accept_token_with_skew(keytab, token, conf.clockskew())
+    }
+
     /// As [`Self::accept_token`], with an explicit clock-skew tolerance.
     ///
     /// Exists because the interop fixtures are recorded, not live: a

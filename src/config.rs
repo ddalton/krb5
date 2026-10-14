@@ -360,6 +360,42 @@ impl Krb5Conf {
     }
 }
 
+/// MIT's default `clockskew`, RFC 4120 §5.3's five minutes.
+pub const DEFAULT_CLOCKSKEW: i64 = 300;
+
+impl Krb5Conf {
+    /// `[libdefaults] clockskew`, in seconds, as MIT's `krb5_init_context`
+    /// reads it: a base-10 integer (`strtol` with nothing after it) in the
+    /// range of a C `int`. As in MIT, a value that is not one is ignored
+    /// in favour of the default, 300.
+    pub fn clockskew(&self) -> i64 {
+        match self.get(&["libdefaults", "clockskew"]) {
+            None => DEFAULT_CLOCKSKEW,
+            Some(v) => parse_profile_int(v).unwrap_or_else(|| {
+                tracing::debug!(
+                    "[libdefaults] clockskew = {v:?} is not an integer; using {DEFAULT_CLOCKSKEW}"
+                );
+                DEFAULT_CLOCKSKEW
+            }),
+        }
+    }
+}
+
+/// MIT's profile `parse_int`: `strtol(value, &end, 10)` consuming the whole
+/// string (leading blanks and a sign allowed, nothing trailing), within
+/// `int` range.
+pub(crate) fn parse_profile_int(v: &str) -> Option<i64> {
+    let t = v.trim_start_matches([' ', '\t', '\n', '\r', '\x0b', '\x0c']);
+    let digits = t.strip_prefix(['+', '-']).unwrap_or(t);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: i64 = t.strip_prefix('+').unwrap_or(t).parse().ok()?;
+    (i64::from(i32::MIN)..=i64::from(i32::MAX))
+        .contains(&n)
+        .then_some(n)
+}
+
 /// MIT's `_krb5_conf_boolean`: only its "yes" words are true.
 pub(crate) fn conf_boolean(v: &str) -> bool {
     matches!(
@@ -975,6 +1011,20 @@ mod tests {
             }
         }
         assert!(checked.0 > 60 && checked.1 > 25, "{checked:?}");
+    }
+
+    #[test]
+    fn clockskew_is_read_as_mit_reads_it() {
+        let skew = |v: &str| conf(&format!("[libdefaults]\n clockskew = {v}\n")).clockskew();
+        assert_eq!(Krb5Conf::empty().clockskew(), 300);
+        assert_eq!(skew("600"), 600);
+        assert_eq!(skew("+60"), 60);
+        assert_eq!(skew("-5"), -5);
+        assert_eq!(skew("\"  42\""), 42, "leading blanks, as strtol");
+        // Not integers: MIT keeps the default.
+        for bad in ["5m", "10 ", "0x10", "", "1e3", "99999999999"] {
+            assert_eq!(skew(&format!("\"{bad}\"")), 300, "{bad:?}");
+        }
     }
 
     #[test]
