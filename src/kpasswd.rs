@@ -249,8 +249,15 @@ fn exchange(ticket: &Credentials, version: u16, data: &[u8], server: &str) -> Re
     let subkey = Key::random(ticket.session_key.enctype()).map_err(ClientError::from)?;
     let seq = rand::random::<u32>() & 0x3FFF_FFFF;
     let (ctime, cusec) = now();
-    let authenticator =
-        encode_authenticator(&ticket.client, None, cusec, ctime, Some(&subkey), Some(seq));
+    let authenticator = encode_authenticator(
+        &ticket.client,
+        None,
+        cusec,
+        ctime,
+        Some(&subkey),
+        Some(seq),
+        None,
+    );
     let enc_auth = ticket
         .session_key
         .encrypt(KU_AP_REQ_AUTH, &authenticator)

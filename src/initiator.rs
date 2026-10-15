@@ -12,6 +12,7 @@
 //! subkey in the AP-REP (MIT does for the AES enctypes), RFC 4121 §2 makes
 //! that the per-message key and sets the AcceptorSubkey token flag.
 
+use crate::bindings::ChannelBindings;
 use crate::client::krbcred;
 use crate::client::{
     ClientError, Credentials, KrbError, Result, decode_encrypted_data, decode_key, encode_ap_req,
@@ -30,9 +31,14 @@ pub const GSS_C_REPLAY_FLAG: u32 = 4;
 pub const GSS_C_SEQUENCE_FLAG: u32 = 8;
 pub const GSS_C_CONF_FLAG: u32 = 16;
 pub const GSS_C_INTEG_FLAG: u32 = 32;
+/// MIT's `GSS_C_CHANNEL_BOUND_FLAG` (MS-KILE `KERB_AP_OPTIONS_CBT`): asked
+/// for, the initiator tells the acceptor it sends channel bindings, so an
+/// acceptor that has bindings refuses a token without matching ones; set
+/// by an acceptor, the initiator's bindings matched its own.
+pub const GSS_C_CHANNEL_BOUND_FLAG: u32 = 0x800;
 
 /// DER of the Kerberos 5 mechanism OID 1.2.840.113554.1.2.2.
-const KRB5_MECH_OID: [u8; 11] = [
+pub(crate) const KRB5_MECH_OID: [u8; 11] = [
     0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x12, 0x01, 0x02, 0x02,
 ];
 
@@ -49,6 +55,25 @@ const KU_AP_REP_ENC_PART: u32 = 12;
 
 /// APOptions mutual-required, bit 2 counted from the MSB.
 const AP_OPTS_MUTUAL_REQUIRED: u32 = 0x2000_0000;
+
+/// RFC 4120 §7.5.4 AD-IF-RELEVANT, and MS-KILE's AD-AUTH-DATA-AP-OPTIONS
+/// with its KERB_AP_OPTIONS_CBT bit, as MIT's `make_ap_authdata` sends it.
+const AD_IF_RELEVANT: i64 = 1;
+const AD_AP_OPTIONS: i64 = 143;
+const KERB_AP_OPTIONS_CBT: u32 = 0x4000;
+
+/// What [`InitiatorContext::with_options`] takes besides the ticket and
+/// flags.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InitOptions<'a> {
+    /// A forwarded TGT to delegate (see
+    /// [`InitiatorContext::new_delegating`]).
+    pub delegate: Option<&'a Credentials>,
+    /// Channel bindings, hashed into the authenticator checksum (RFC 4121
+    /// §4.1.1.2). Without them the hash is all zero, which every
+    /// acceptor takes as "none".
+    pub channel_bindings: Option<&'a ChannelBindings>,
+}
 
 /// The initiator side of a Kerberos GSS-API security context.
 #[derive(Debug)]
@@ -71,7 +96,7 @@ impl InitiatorContext {
     /// there is no TGT to delegate; see [`InitiatorContext::new_delegating`].
     /// Returns the context and the token to send to the acceptor.
     pub fn new(creds: &Credentials, flags: u32) -> Result<(Self, Vec<u8>)> {
-        Self::build(creds, flags & !GSS_C_DELEG_FLAG, None)
+        Self::with_options(creds, flags & !GSS_C_DELEG_FLAG, InitOptions::default())
     }
 
     /// As [`InitiatorContext::new`], delegating `forwarded` (a forwarded
@@ -85,14 +110,31 @@ impl InitiatorContext {
         flags: u32,
         forwarded: &Credentials,
     ) -> Result<(Self, Vec<u8>)> {
-        Self::build(creds, flags | GSS_C_DELEG_FLAG, Some(forwarded))
+        let opts = InitOptions {
+            delegate: Some(forwarded),
+            ..Default::default()
+        };
+        Self::with_options(creds, flags, opts)
     }
 
-    fn build(
+    /// As [`InitiatorContext::new`], with delegation and channel bindings
+    /// as `opts` says. `GSS_C_DELEG_FLAG` is set exactly when `opts`
+    /// delegates. With [`GSS_C_CHANNEL_BOUND_FLAG`] in `flags`, the
+    /// authenticator also says (MS-KILE KERB_AP_OPTIONS_CBT, as MIT sends
+    /// it for `client_aware_channel_bindings`) that this initiator binds,
+    /// so an acceptor with bindings of its own requires them to match.
+    pub fn with_options(
         creds: &Credentials,
         flags: u32,
-        forwarded: Option<&Credentials>,
+        opts: InitOptions<'_>,
     ) -> Result<(Self, Vec<u8>)> {
+        let forwarded = opts.delegate;
+        let cbt = flags & GSS_C_CHANNEL_BOUND_FLAG != 0;
+        let flags = match forwarded {
+            Some(_) => flags | GSS_C_DELEG_FLAG,
+            None => flags & !GSS_C_DELEG_FLAG,
+        } & !GSS_C_CHANNEL_BOUND_FLAG;
+        // (MIT keeps GSS_C_CHANNEL_BOUND_FLAG off the wire.)
         let d = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
@@ -108,11 +150,15 @@ impl InitiatorContext {
 
         let authenticator = encode_authenticator(
             &creds.client,
-            Some((CKSUMTYPE_GSSAPI, gss_checksum(flags, deleg.as_deref())?)),
+            Some((
+                CKSUMTYPE_GSSAPI,
+                gss_checksum(flags, opts.channel_bindings, deleg.as_deref())?,
+            )),
             cusec,
             ctime,
             Some(&subkey),
             Some(seq_number),
+            cbt.then(cbt_authorization_data),
         );
         let enc_auth = creds.session_key.encrypt(KU_AP_REQ_AUTH, &authenticator)?;
         let mutual = flags & GSS_C_MUTUAL_FLAG != 0;
@@ -226,13 +272,30 @@ impl InitiatorContext {
     }
 }
 
+/// AuthorizationData holding one AD-IF-RELEVANT that holds
+/// AD-AUTH-DATA-AP-OPTIONS with KERB_AP_OPTIONS_CBT (little-endian).
+fn cbt_authorization_data() -> Vec<u8> {
+    let element = |ty: i64, data: &[u8]| {
+        der::seq(&[
+            der::field(0, der::int(ty)),
+            der::field(1, der::octets(data)),
+        ])
+    };
+    let inner = der::seq(&[element(AD_AP_OPTIONS, &KERB_AP_OPTIONS_CBT.to_le_bytes())]);
+    der::seq(&[element(AD_IF_RELEVANT, &inner)])
+}
+
 /// RFC 4121 §4.1.1 checksum: Lgth (16, little-endian), Bnd (MD5 of the
 /// channel bindings; all zero for none), Flags (little-endian), and, when
 /// delegating, DlgOpt (1), Dlgth and the KRB-CRED, both little-endian.
-fn gss_checksum(flags: u32, deleg: Option<&[u8]>) -> Result<Vec<u8>> {
+fn gss_checksum(
+    flags: u32,
+    bindings: Option<&ChannelBindings>,
+    deleg: Option<&[u8]>,
+) -> Result<Vec<u8>> {
     let mut c = Vec::with_capacity(28 + deleg.map_or(0, <[u8]>::len));
     c.extend_from_slice(&16u32.to_le_bytes());
-    c.extend_from_slice(&[0u8; 16]);
+    c.extend_from_slice(&bindings.map_or([0u8; 16], ChannelBindings::md5));
     c.extend_from_slice(&flags.to_le_bytes());
     if let Some(d) = deleg {
         // MIT's KRB5KRB_ERR_FIELD_TOOLONG: the checksum must fit an int16.
@@ -270,14 +333,14 @@ fn unframe(token: &[u8]) -> Result<([u8; 2], &[u8])> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::acceptor::{EncType, KerberosContext, Keytab, ServiceKey};
     use crate::client::{Principal, encode_encrypted_data, encode_key};
 
     /// Mint a service ticket as a KDC would: EncTicketPart sealed in the
     /// service key with usage 2.
-    fn mint(
+    pub(crate) fn mint(
         service_key: &Key,
         session_key: &Key,
         client: &Principal,
@@ -326,7 +389,7 @@ mod tests {
         }
     }
 
-    fn keytab_with(service: &Principal, key: &Key) -> Keytab {
+    pub(crate) fn keytab_with(service: &Principal, key: &Key) -> Keytab {
         Keytab::from_keys(vec![ServiceKey {
             principal: service.name(),
             realm: service.realm.clone(),
@@ -348,7 +411,7 @@ mod tests {
 
     #[test]
     fn the_gss_checksum_carries_a_krb_cred_after_the_flags() {
-        let c = gss_checksum(GSS_C_DELEG_FLAG | GSS_C_MUTUAL_FLAG, Some(b"KRBCRED")).unwrap();
+        let c = gss_checksum(GSS_C_DELEG_FLAG | GSS_C_MUTUAL_FLAG, None, Some(b"KRBCRED")).unwrap();
         let mut want = vec![16, 0, 0, 0];
         want.extend([0u8; 16]);
         want.extend((GSS_C_DELEG_FLAG | GSS_C_MUTUAL_FLAG).to_le_bytes());
@@ -356,14 +419,51 @@ mod tests {
         want.extend(b"KRBCRED");
         assert_eq!(c, want);
         assert!(
-            gss_checksum(GSS_C_DELEG_FLAG, Some(&vec![0; 32740])).is_err(),
+            gss_checksum(GSS_C_DELEG_FLAG, None, Some(&vec![0; 32740])).is_err(),
             "int16 limit"
         );
     }
 
+    /// The KERB_AP_OPTIONS_CBT element exactly as MIT's `make_ap_authdata`
+    /// encodes it (and MS-KILE lays it out): AD-IF-RELEVANT (1) holding
+    /// AD-AUTH-DATA-AP-OPTIONS (143) holding 0x4000 little-endian.
+    #[test]
+    fn the_cbt_authorization_data_is_mits() {
+        assert_eq!(
+            cbt_authorization_data(),
+            [
+                0x30, 0x1D, 0x30, 0x1B, // AuthorizationData, one element
+                0xA0, 0x03, 0x02, 0x01, 0x01, // ad-type 1, AD-IF-RELEVANT
+                0xA1, 0x14, 0x04, 0x12, // ad-data: AuthorizationData, DER
+                0x30, 0x10, 0x30, 0x0E, //
+                0xA0, 0x04, 0x02, 0x02, 0x00, 0x8F, // ad-type 143
+                0xA1, 0x06, 0x04, 0x04, 0x00, 0x40, 0x00, 0x00, // 0x4000 LE
+            ]
+        );
+    }
+
+    /// GSS_C_CHANNEL_BOUND_FLAG asks for the CBT element; it is not a
+    /// flag for the wire, which MIT also keeps it off.
+    #[test]
+    fn channel_bound_stays_off_the_wire() {
+        let service = Principal::parse("host/h@R").unwrap();
+        let key = Key::new(18, vec![1; 32]).unwrap();
+        let creds = mint(
+            &key,
+            &Key::random(18).unwrap(),
+            &Principal::parse("a@R").unwrap(),
+            &service,
+        );
+        let flags = GSS_C_MUTUAL_FLAG | GSS_C_CHANNEL_BOUND_FLAG;
+        let (ctx, token) = InitiatorContext::new(&creds, flags).unwrap();
+        assert_eq!(ctx.flags(), GSS_C_MUTUAL_FLAG);
+        let (acc, _) = KerberosContext::accept_token(&keytab_with(&service, &key), &token).unwrap();
+        assert_eq!(acc.gss_flags, GSS_C_MUTUAL_FLAG);
+    }
+
     #[test]
     fn the_gss_checksum_is_little_endian() {
-        let c = gss_checksum(GSS_C_MUTUAL_FLAG | GSS_C_INTEG_FLAG, None).unwrap();
+        let c = gss_checksum(GSS_C_MUTUAL_FLAG | GSS_C_INTEG_FLAG, None, None).unwrap();
         assert_eq!(c.len(), 24);
         assert_eq!(&c[..4], &[16, 0, 0, 0]);
         assert_eq!(&c[20..], &[0x22, 0, 0, 0]);

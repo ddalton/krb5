@@ -38,6 +38,14 @@ pub enum KerberosError {
     #[error("Ticket is not valid now: {0}")]
     TicketNotValid(String),
 
+    /// SPNEGO negotiation failed (GSS_S_BAD_MECH, GSS_S_DEFECTIVE_TOKEN).
+    #[error("SPNEGO: {0}")]
+    Negotiation(String),
+
+    /// GSS_S_BAD_BINDINGS: the channel bindings do not match.
+    #[error("Channel bindings do not match: {0}")]
+    BadBindings(String),
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -502,6 +510,45 @@ pub struct KerberosContext {
     /// [`KdcClient::service_ticket`](crate::KdcClient::service_ticket), or to
     /// store with [`CCache::with_credentials`](crate::CCache::with_credentials).
     pub delegated: Option<crate::Credentials>,
+    /// The initiator's initial sequence number, from the authenticator
+    /// (0 if it sent none): the first per-message token it emits.
+    pub initiator_seq: u32,
+    /// Ours: the first per-message token we emit uses it. 0, the
+    /// sequence number in our AP-REP, with mutual authentication; the
+    /// initiator's own without, as MIT does.
+    pub acceptor_seq: u32,
+    /// The mechanism OID (DER) the initiator's token was framed with:
+    /// Kerberos 5's, or the one Microsoft once got wrong
+    /// (1.2.840.48018.1.2.2), which its clients still send and MIT
+    /// accepts.
+    pub mech_oid: Vec<u8>,
+}
+
+/// What [`KerberosContext::accept_token_with`] takes besides the keytab
+/// and the token.
+#[derive(Debug, Clone)]
+pub struct AcceptOptions {
+    /// Clock-skew tolerance in seconds (default
+    /// [`DEFAULT_CLOCK_SKEW_SECS`]; [`Krb5Conf::clockskew`](crate::Krb5Conf::clockskew)).
+    pub max_skew_secs: i64,
+    /// The acceptor's channel bindings. As MIT checks them: an initiator
+    /// that sent bindings must have sent these (else
+    /// [`KerberosError::BadBindings`]); one that sent none is accepted
+    /// unless it said it binds ([`GSS_C_CHANNEL_BOUND_FLAG`]); matching
+    /// bindings set `GSS_C_CHANNEL_BOUND_FLAG` in `gss_flags`. `None`
+    /// ignores whatever the initiator sent.
+    ///
+    /// [`GSS_C_CHANNEL_BOUND_FLAG`]: crate::initiator::GSS_C_CHANNEL_BOUND_FLAG
+    pub channel_bindings: Option<crate::ChannelBindings>,
+}
+
+impl Default for AcceptOptions {
+    fn default() -> Self {
+        AcceptOptions {
+            max_skew_secs: DEFAULT_CLOCK_SKEW_SECS,
+            channel_bindings: None,
+        }
+    }
 }
 
 /// Kerberos key usage constants (RFC 4120 Section 7.5.1)
@@ -1000,6 +1047,9 @@ struct Authenticator {
     ctime: i64,
     subkey: Option<SessionKey>,
     seq_number: Option<u32>,
+    /// MS-KILE KERB_AP_OPTIONS_CBT in the authorization data: the
+    /// initiator binds to its channel.
+    client_binds: bool,
 }
 
 impl Authenticator {
@@ -1113,10 +1163,19 @@ impl Authenticator {
 
         // Parse optional seq-number[7]
         let seq_number = if !remaining.is_empty() && remaining[0] == 0xA7 {
-            let (seq_data, _) = extract_tagged_field(remaining, 0xA7)?;
+            let (seq_data, rest) = extract_tagged_field(remaining, 0xA7)?;
+            remaining = rest;
             Some(parse_asn1_integer(seq_data)? as u32)
         } else {
             None
+        };
+
+        // Optional authorization-data[8].
+        let client_binds = if !remaining.is_empty() && remaining[0] == 0xA8 {
+            let (ad, _) = extract_tagged_field(remaining, 0xA8)?;
+            ap_options_cbt(ad)?
+        } else {
+            false
         };
 
         Ok(Authenticator {
@@ -1127,6 +1186,7 @@ impl Authenticator {
             ctime,
             subkey,
             seq_number,
+            client_binds,
         })
     }
 
@@ -1689,14 +1749,25 @@ fn parse_der_tag_length(data: &[u8]) -> Result<(u8, usize, usize)> {
 /// Returns (value_bytes, remaining_bytes)
 /// GSS_C_DELEG_FLAG (RFC 2743).
 const GSS_C_DELEG_FLAG: u32 = 1;
+use crate::initiator::GSS_C_CHANNEL_BOUND_FLAG;
+
+/// DER of the Kerberos 5 mechanism OID, and of Microsoft's mistaken one.
+const KRB5_OID: [u8; 11] = crate::initiator::KRB5_MECH_OID;
+pub(crate) const MS_KRB5_OID: [u8; 11] = [
+    0x06, 0x09, 0x2A, 0x86, 0x48, 0x82, 0xF7, 0x12, 0x01, 0x02, 0x02,
+];
 /// RFC 4121 §4.1.1 DlgOpt for a KRB-CRED.
 const KRB5_GSS_FOR_CREDS_OPTION: u16 = 1;
+
+/// The flags, the channel-binding hash (Bnd) and any KRB-CRED.
+type GssChecksum<'a> = (u32, [u8; 16], Option<&'a [u8]>);
 
 /// RFC 4121 §4.1.1 checksum value: Lgth (16) and Bnd, then Flags; when
 /// GSS_C_DELEG_FLAG is set and more follows, DlgOpt (1), Dlgth and the
 /// KRB-CRED (all little-endian), as MIT's `kg_verify_checksum` reads it.
-/// Returns the flags, with GSS_C_DELEG_FLAG kept only if a KRB-CRED came.
-fn parse_gss_checksum(ck: &[u8]) -> Result<(u32, Option<&[u8]>)> {
+/// Returns the flags, with GSS_C_DELEG_FLAG kept only if a KRB-CRED came,
+/// and Bnd.
+fn parse_gss_checksum(ck: &[u8]) -> Result<GssChecksum<'_>> {
     let bad = |m: &str| KerberosError::InvalidAuthenticator(format!("GSS checksum: {m}"));
     if ck.len() < 24 {
         return Err(bad("shorter than 24 octets"));
@@ -1705,7 +1776,13 @@ fn parse_gss_checksum(ck: &[u8]) -> Result<(u32, Option<&[u8]>)> {
     if lgth != 16 {
         return Err(bad("channel-binding length is not 16"));
     }
-    let mut flags = u32::from_le_bytes(ck[20..24].try_into().unwrap());
+    // MIT's INITIATOR_FLAGS (integ, conf, mutual, replay, sequence,
+    // DCE style, identify, extended error), and deleg, checked below: a
+    // flag only the acceptor may set, GSS_C_CHANNEL_BOUND_FLAG above all,
+    // cannot be claimed from the wire.
+    const INITIATOR_FLAGS: u32 = 0x02 | 0x04 | 0x08 | 0x10 | 0x20 | 0x1000 | 0x2000 | 0x4000;
+    let mut flags =
+        u32::from_le_bytes(ck[20..24].try_into().unwrap()) & (INITIATOR_FLAGS | GSS_C_DELEG_FLAG);
     let mut deleg = None;
     if flags & GSS_C_DELEG_FLAG != 0 && ck.len() >= 28 {
         let opt = u16::from_le_bytes([ck[24], ck[25]]);
@@ -1721,7 +1798,51 @@ fn parse_gss_checksum(ck: &[u8]) -> Result<(u32, Option<&[u8]>)> {
     if deleg.is_none() {
         flags &= !GSS_C_DELEG_FLAG;
     }
-    Ok((flags, deleg))
+    let bnd = ck[4..20].try_into().unwrap();
+    Ok((flags, bnd, deleg))
+}
+
+/// MIT's `check_cbt`: whether AuthorizationData `ad` holds
+/// AD-AUTH-DATA-AP-OPTIONS (143), at the top or inside AD-IF-RELEVANT,
+/// with KERB_AP_OPTIONS_CBT (0x4000, little-endian) set. More than one,
+/// or one not four octets long, is an error as in MIT.
+fn ap_options_cbt(ad: &[u8]) -> Result<bool> {
+    const AD_IF_RELEVANT: i32 = 1;
+    const AD_AP_OPTIONS: i32 = 143;
+    let bad = |m: &str| KerberosError::InvalidAuthenticator(format!("authorization data: {m}"));
+    fn walk(ad: &[u8], found: &mut Vec<Vec<u8>>, depth: u8) -> std::result::Result<(), String> {
+        let mut seq = crate::der::Reader::new(ad)
+            .seq()
+            .map_err(|e| e.to_string())?;
+        while !seq.is_empty() {
+            let el = seq
+                .expect(crate::der::SEQUENCE)
+                .map_err(|e| e.to_string())?;
+            let f =
+                crate::der::Fields::parse("AuthorizationData", el).map_err(|e| e.to_string())?;
+            let ty = f
+                .get(0)
+                .and_then(|mut r| r.i32())
+                .map_err(|e| e.to_string())?;
+            let data = f
+                .get(1)
+                .and_then(|mut r| r.octets())
+                .map_err(|e| e.to_string())?;
+            match ty {
+                AD_AP_OPTIONS => found.push(data.to_vec()),
+                AD_IF_RELEVANT if depth == 0 => walk(data, found, 1)?,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+    let mut found = Vec::new();
+    walk(ad, &mut found, 0).map_err(|e| bad(&e))?;
+    match found.as_slice() {
+        [] => Ok(false),
+        [v] if v.len() == 4 => Ok(u32::from_le_bytes(v[..].try_into().unwrap()) & 0x4000 != 0),
+        _ => Err(bad("AD-AUTH-DATA-AP-OPTIONS is malformed")),
+    }
 }
 
 /// The delegated TGT in a KRB-CRED, sealed in the session key (RFC 4121)
@@ -1823,7 +1944,21 @@ impl KerberosContext {
         token: &[u8],
         max_skew_secs: i64,
     ) -> Result<(Self, Vec<u8>)> {
-        Self::accept_token_at(keytab, token, max_skew_secs, current_time())
+        let opts = AcceptOptions {
+            max_skew_secs,
+            ..Default::default()
+        };
+        Self::accept_token_with(keytab, token, &opts)
+    }
+
+    /// As [`Self::accept_token`], with the clock-skew tolerance and the
+    /// channel bindings in `opts`.
+    pub fn accept_token_with(
+        keytab: &Keytab,
+        token: &[u8],
+        opts: &AcceptOptions,
+    ) -> Result<(Self, Vec<u8>)> {
+        Self::accept_token_opts(keytab, token, opts, current_time())
     }
 
     /// As [`Self::accept_token_with_skew`], with the clock supplied.
@@ -1833,12 +1968,27 @@ impl KerberosContext {
     /// tomorrow, so the assertion would flip on its own. Injecting `now`
     /// makes "this real MIT ticket is refused once its endtime has
     /// passed" a deterministic statement about a committed fixture.
+    #[cfg(test)]
     pub(crate) fn accept_token_at(
         keytab: &Keytab,
         token: &[u8],
         max_skew_secs: i64,
         now: i64,
     ) -> Result<(Self, Vec<u8>)> {
+        let opts = AcceptOptions {
+            max_skew_secs,
+            ..Default::default()
+        };
+        Self::accept_token_opts(keytab, token, &opts, now)
+    }
+
+    fn accept_token_opts(
+        keytab: &Keytab,
+        token: &[u8],
+        opts: &AcceptOptions,
+        now: i64,
+    ) -> Result<(Self, Vec<u8>)> {
+        let max_skew_secs = opts.max_skew_secs;
         info!(
             "🔐 Accepting Kerberos GSS token with FULL CRYPTOGRAPHY: {} bytes",
             token.len()
@@ -1861,21 +2011,17 @@ impl KerberosContext {
         let (_total_len, len_bytes) = parse_der_length(&token[1..])?;
         let gss_content_start = 1 + len_bytes;
 
-        // Verify Kerberos OID (1.2.840.113554.1.2.2)
-        let krb5_oid = [
-            0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02,
-        ];
-        if token.len() < gss_content_start + krb5_oid.len() {
-            return Err(KerberosError::ParseError(
-                "Token too short for OID".to_string(),
-            ));
-        }
-
-        if token[gss_content_start..gss_content_start + krb5_oid.len()] != krb5_oid {
+        // The Kerberos 5 OID (1.2.840.113554.1.2.2), or Microsoft's
+        // (1.2.840.48018.1.2.2), which MIT accepts in its place.
+        let framed = &token[gss_content_start..];
+        let Some(krb5_oid) = [&KRB5_OID[..], &MS_KRB5_OID[..]]
+            .into_iter()
+            .find(|oid| framed.starts_with(oid))
+        else {
             return Err(KerberosError::ParseError(
                 "Not a Kerberos GSS token".to_string(),
             ));
-        }
+        };
 
         // RFC 4121 §4.1: between the mech OID and the Kerberos message
         // sits a 2-octet TOK_ID — 01 00 for AP-REQ, 02 00 for AP-REP,
@@ -1965,9 +2111,20 @@ impl KerberosContext {
             info!("   Adopting the initiator's subkey as the per-message base key");
         }
 
-        let (gss_flags, delegated) = match &authenticator.cksum {
+        let mut cb_match = false;
+        let (mut gss_flags, delegated) = match &authenticator.cksum {
             Some((0x8003, ck)) => {
-                let (flags, deleg) = parse_gss_checksum(ck)?;
+                let (flags, bnd, deleg) = parse_gss_checksum(ck)?;
+                // MIT's process_checksum: bindings sent must match ours;
+                // none sent (all zero) is not a mismatch.
+                if let Some(cb) = &opts.channel_bindings {
+                    cb_match = bnd == cb.md5();
+                    if bnd != [0; 16] && !cb_match {
+                        return Err(KerberosError::BadBindings(
+                            "the initiator's channel bindings are not ours".into(),
+                        ));
+                    }
+                }
                 let delegated = match deleg {
                     Some(d) => Some(decode_delegated(
                         d,
@@ -1983,6 +2140,18 @@ impl KerberosContext {
         if delegated.is_some() {
             info!("   Initiator delegated a TGT");
         }
+        if cb_match {
+            gss_flags |= GSS_C_CHANNEL_BOUND_FLAG;
+        }
+        // An initiator that says it binds (KERB_AP_OPTIONS_CBT) must have
+        // sent our bindings, if we have any.
+        if authenticator.client_binds && opts.channel_bindings.is_some() && !cb_match {
+            return Err(KerberosError::BadBindings(
+                "the initiator binds to a channel but sent no matching bindings".into(),
+            ));
+        }
+        let mutual = ap_options & AP_OPTS_MUTUAL_REQUIRED != 0;
+        let initiator_seq = authenticator.seq_number.unwrap_or(0);
 
         let context = KerberosContext {
             gss_flags,
@@ -1996,16 +2165,20 @@ impl KerberosContext {
             base_key,
             base_key_enctype,
             used_initiator_subkey,
+            initiator_seq,
+            acceptor_seq: if mutual { 0 } else { initiator_seq },
+            mech_oid: krb5_oid.to_vec(),
         };
 
         // RFC 4120 §3.2.4: an AP-REP is the answer to MUTUAL-REQUIRED and
         // to nothing else. Sending one unasked breaks the initiator, which
         // is already established and rejects the extra token.
-        let ap_rep = if ap_options & AP_OPTS_MUTUAL_REQUIRED != 0 {
+        let ap_rep = if mutual {
             Self::generate_ap_rep_with_crypto(
                 &session_key,
                 authenticator.ctime,
                 authenticator.cusec,
+                krb5_oid,
             )?
         } else {
             debug!("   No MUTUAL-REQUIRED in ap-options — replying with an empty token");
@@ -2126,6 +2299,7 @@ impl KerberosContext {
         session_key: &SessionKey,
         ctime: i64,
         cusec: u32,
+        krb5_oid: &[u8],
     ) -> Result<Vec<u8>> {
         debug!("   Generating AP-REP with encryption");
 
@@ -2160,14 +2334,12 @@ impl KerberosContext {
         // an initiator reading this reply expects 02 00 before the
         // AP-REP, and the emitter omitted it for the same reason the
         // parser ignored it on the way in.
-        let krb5_oid = [
-            0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02,
-        ];
+        // Framed with the mechanism OID the initiator used, as MIT does.
         let gss_content_len = krb5_oid.len() + TOK_ID_AP_REP.len() + ap_rep.len();
 
         let mut token = vec![0x60]; // APPLICATION 0
         Self::encode_length(&mut token, gss_content_len);
-        token.extend_from_slice(&krb5_oid);
+        token.extend_from_slice(krb5_oid);
         token.extend_from_slice(TOK_ID_AP_REP);
         token.extend_from_slice(&ap_rep);
 
@@ -2272,15 +2444,18 @@ mod tests {
         // Flags only.
         assert_eq!(
             parse_gss_checksum(&gss_ck(0x3e, &[])).unwrap(),
-            (0x3e, None)
+            (0x3e, [0; 16], None)
         );
         // DELEG set with a KRB-CRED.
         let ck = gss_ck(0x3f, &[1, 0, 3, 0, b'a', b'b', b'c']);
-        assert_eq!(parse_gss_checksum(&ck).unwrap(), (0x3f, Some(&b"abc"[..])));
+        assert_eq!(
+            parse_gss_checksum(&ck).unwrap(),
+            (0x3f, [0; 16], Some(&b"abc"[..]))
+        );
         // DELEG set but nothing after the flags: the flag is not reported.
         assert_eq!(
             parse_gss_checksum(&gss_ck(0x3f, &[])).unwrap(),
-            (0x3e, None)
+            (0x3e, [0; 16], None)
         );
         // Malformed.
         assert!(
@@ -2295,6 +2470,14 @@ mod tests {
         let mut lg = gss_ck(0, &[]);
         lg[0] = 17;
         assert!(parse_gss_checksum(&lg).is_err(), "Lgth not 16");
+        // Flags the initiator may not assert are dropped, channel-bound
+        // above all; MIT's INITIATOR_FLAGS pass.
+        assert_eq!(
+            parse_gss_checksum(&gss_ck(0x800 | 0x3e, &[])).unwrap().0,
+            0x3e
+        );
+        assert_eq!(parse_gss_checksum(&gss_ck(0x8000_0100, &[])).unwrap().0, 0);
+        assert_eq!(parse_gss_checksum(&gss_ck(0x7000, &[])).unwrap().0, 0x7000);
     }
 
     #[test]
@@ -2852,6 +3035,7 @@ mod tests {
             ctime: current_time(),
             subkey: None,
             seq_number: None,
+            client_binds: false,
         };
 
         let result = auth.validate(current_time(), 300);
@@ -2868,6 +3052,7 @@ mod tests {
             ctime: current_time() - 400, // 400 seconds ago
             subkey: None,
             seq_number: None,
+            client_binds: false,
         };
 
         let result = auth.validate(current_time(), 300); // 5 minute tolerance

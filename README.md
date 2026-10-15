@@ -57,6 +57,14 @@ tickets without shelling out to `kinit`.
   RFC 4121 checksum) and AP-REP verification, including acceptor subkeys;
   delegation of a forwarded TGT (`GSS_C_DELEG_FLAG`), which the acceptor
   receives and can use.
+- **SPNEGO** (RFC 4178) — both sides, for HTTP `Negotiate`, SMB, LDAP
+  and Windows peers: Kerberos 5 under its own OID or Microsoft's,
+  `mechListMIC`s exchanged when MIT would exchange them, and a bare
+  Kerberos token accepted too.
+- **Channel bindings** — RFC 4121 bindings on both sides, checked as MIT
+  checks them, with the TLS bindings built in (`tls-server-end-point`,
+  `tls-exporter`, `tls-unique`) and MS-KILE's KERB_AP_OPTIONS_CBT
+  (`GSS_C_CHANNEL_BOUND_FLAG`, `client_aware_channel_bindings`).
 - **Crypto** — RFC 3961 n-fold and DR/DK, RFC 3962
   (`aes128/256-cts-hmac-sha1-96`), RFC 8009
   (`aes128-cts-hmac-sha256-128`, `aes256-cts-hmac-sha384-192`).
@@ -80,7 +88,28 @@ let tokens = ctx.per_message_tokens()?; // Wrap / MIC for krb5i / krb5p
 ```
 
 `accept_token` allows the RFC 4120 recommended 5 minutes of clock skew;
-use `accept_token_with_skew` to apply your own policy.
+use `accept_token_with_skew` to apply your own policy, and
+`accept_token_with` for channel bindings too.
+
+An HTTP `Negotiate` server takes SPNEGO, bound to its TLS certificate:
+
+```rust
+use krb5::acceptor::AcceptOptions;
+use krb5::spnego::SpnegoAcceptor;
+use krb5::{ChannelBindings, Keytab};
+
+let keytab = Keytab::load("/etc/krb5.keytab")?;
+let opts = AcceptOptions {
+    channel_bindings: ChannelBindings::tls_server_end_point(&server_cert_der),
+    ..Default::default()
+};
+let mut acc = SpnegoAcceptor::with_options(&keytab, opts);
+// token: base64-decoded from "Authorization: Negotiate <token>"
+let reply = acc.step(&token)?; // base64 into "WWW-Authenticate: Negotiate <reply>"
+if acc.is_established() {
+    println!("authenticated {}", acc.context().unwrap().client_principal);
+}
+```
 
 ## Client
 
@@ -140,7 +169,8 @@ without mutual authentication (`testdata/`). The keytab in `testdata/`
 belongs to a throwaway test realm and protects nothing.
 
 The client is tested against a live MIT KDC, and its tokens against MIT's
-own GSS acceptor. On Debian/Ubuntu (`krb5-kdc krb5-admin-server
+own GSS acceptor; SPNEGO and channel bindings against MIT's initiator and
+acceptor both (`scripts/mit-gss.py`). On Debian/Ubuntu (`krb5-kdc krb5-admin-server
 python3-gssapi`):
 
 ```sh

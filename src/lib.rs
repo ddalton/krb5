@@ -31,7 +31,10 @@
 //! * [`InitiatorContext`] — `gss_init_sec_context`: the AP-REQ token and
 //!   verification of the acceptor's AP-REP.
 //!
-//! **Both**: [`token::PerMessageTokens`] — RFC 4121 §4.2 Wrap and MIC.
+//! **Both**: [`token::PerMessageTokens`] — RFC 4121 §4.2 Wrap and MIC;
+//! [`spnego`] — RFC 4178 SPNEGO, initiator and acceptor (HTTP
+//! `Negotiate`, SMB, Windows); [`ChannelBindings`] — RFC 4121 channel
+//! bindings, with the TLS ones (RFC 5929, RFC 9266).
 //!
 //! Supported enctypes are the four AES ones: 17/18
 //! (`aes{128,256}-cts-hmac-sha1-96`, RFC 3962) and 19/20
@@ -91,6 +94,7 @@
 //! ```
 
 pub mod acceptor;
+pub mod bindings; // GSS-API channel bindings (RFC 4121 §4.1.1.2, RFC 5929)
 pub mod ccache; // FILE: and DIR: credential caches, MIT format
 pub mod client;
 pub mod config; // krb5.conf: default realm, KDCs, [domain_realm]
@@ -101,10 +105,12 @@ pub mod kadmin; // kadmind's kadm5 RPC protocol: what kadmin does
 pub mod kdf; // RFC 3961 §5.1 DR/DK, RFC 3962 §4, RFC 8009 §3
 pub mod key;
 pub mod kpasswd; // password changes over the kpasswd protocol (RFC 3244)
+mod md5; // RFC 1321, for channel bindings only
 pub mod nfold; // RFC 3961 §5.1 n-fold
 #[cfg(feature = "pkinit")]
 pub mod pkinit; // RFC 4556 PKINIT, RFC 8062 anonymous PKINIT
 pub mod profile; // RFC 3961 §5.3 simplified profile (confounder + HMAC)
+pub mod spnego; // RFC 4178 SPNEGO, for HTTP Negotiate, SMB and Windows
 pub mod token; // RFC 4121 §4.2 per-message Wrap and MIC tokens
 
 #[cfg(test)]
@@ -115,6 +121,7 @@ mod mit_vectors; // MIT krb5's crypto_tests known answers, enctypes 17-20
 pub use acceptor::{
     DEFAULT_CLOCK_SKEW_SECS, EncType, KerberosContext, KerberosError, Keytab, Result, ServiceKey,
 };
+pub use bindings::ChannelBindings;
 pub use ccache::{CCache, CacheError, CacheName};
 pub use client::{ClientError, Credentials, KdcClient, Principal};
 pub use config::{ConfigError, Krb5Conf};

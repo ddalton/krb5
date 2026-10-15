@@ -1237,6 +1237,7 @@ impl KdcClient {
             now,
             subkey.as_ref(),
             None,
+            None,
         );
         let enc_auth = tgt.session_key.encrypt(KU_TGS_REQ_AUTH, &authenticator)?;
         let ap_req = encode_ap_req(0, &tgt.ticket, tgt.session_key.enctype(), &enc_auth);
@@ -2084,6 +2085,7 @@ pub(crate) fn encode_authenticator(
     ctime: i64,
     subkey: Option<&Key>,
     seq_number: Option<u32>,
+    authorization_data: Option<Vec<u8>>,
 ) -> Vec<u8> {
     let mut parts = vec![
         der::field(0, der::int(5)),
@@ -2106,6 +2108,9 @@ pub(crate) fn encode_authenticator(
     }
     if let Some(s) = seq_number {
         parts.push(der::field(7, der::int(s as i64)));
+    }
+    if let Some(ad) = authorization_data {
+        parts.push(der::field(8, ad));
     }
     der::cons(app(2), &[der::seq(&parts)])
 }

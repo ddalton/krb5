@@ -7,6 +7,50 @@ may break the API).
 
 ## [Unreleased]
 
+### Added
+
+- `spnego`: SPNEGO (RFC 4178), the negotiation wrapper for HTTP
+  `Negotiate`, SMB, LDAP SASL `GSS-SPNEGO` and Windows peers.
+  `SpnegoInitiator` and `SpnegoAcceptor` are stepped like
+  `gss_init_sec_context` and `gss_accept_sec_context`. The mechanism is
+  Kerberos 5, under its own OID or the one Microsoft uses (which Windows
+  lists first). The state machine is MIT's: an optimistic Kerberos token,
+  and `mechListMIC`s exchanged exactly when MIT exchanges them. A MIC is
+  required when the acceptor did not pick the initiator's first choice
+  (`request-mic`), and is answered whenever the peer sends one. The
+  acceptor also takes a bare Kerberos token, as MIT's does. `send_seq` and
+  `recv_seq` give the sequence numbers the MICs leave for per-message
+  tokens.
+- Channel bindings (RFC 4121 §4.1.1.2): `ChannelBindings`, with
+  `tls_server_end_point` (RFC 5929, hashed as the certificate's signature
+  algorithm says), `tls_exporter` (RFC 9266) and `tls_unique`.
+  `InitiatorContext::with_options` (`InitOptions`) sends them, and
+  `KerberosContext::accept_token_with` (`AcceptOptions`) checks them as
+  MIT does:
+  - bindings that differ are refused (`KerberosError::BadBindings`);
+  - an initiator that sent none is accepted;
+  - matching bindings set `GSS_C_CHANNEL_BOUND_FLAG`.
+- `GSS_C_CHANNEL_BOUND_FLAG` on the initiator adds MS-KILE's
+  KERB_AP_OPTIONS_CBT to the authenticator, as MIT 1.22 does, and the
+  acceptor then requires the bindings it has. MIT 1.19 to 1.21 send
+  KERB_AP_OPTIONS_CBT only when `client_aware_channel_bindings` is set,
+  which `Krb5Conf::client_aware_channel_bindings` reads.
+- `KerberosContext` gains `initiator_seq`, `acceptor_seq` and `mech_oid`.
+- The acceptor accepts tokens framed with Microsoft's Kerberos OID
+  (1.2.840.48018.1.2.2), and answers in kind, as MIT does.
+
+### Changed
+
+- Breaking: `KerberosError` has two new variants (`BadBindings`,
+  `Negotiation`), and `KerberosContext` has three new public fields.
+
+### Fixed
+
+- The acceptor keeps only the initiator flags MIT's acceptor keeps
+  (`INITIATOR_FLAGS`, and deleg when credentials came). Before, a flag
+  only an acceptor may set, such as `GSS_C_CHANNEL_BOUND_FLAG`, passed
+  straight through from the initiator's checksum.
+
 ## [0.8.1] - 2026-10-15
 
 ### Added

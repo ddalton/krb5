@@ -37,7 +37,7 @@ mod dh;
 mod ec;
 mod kdf;
 mod keys;
-mod pem;
+pub(crate) mod pem;
 mod pkcs12;
 mod rsa;
 mod x509;

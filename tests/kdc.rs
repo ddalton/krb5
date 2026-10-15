@@ -1086,6 +1086,365 @@ fn mit_delegates_to_our_acceptor() {
     let _ = std::fs::remove_file(&path);
 }
 
+// ------------------------------------------- SPNEGO and channel bindings
+
+/// MIT's GSS-API at the other end of a context: `scripts/mit-gss.py`,
+/// stepped token by token.
+struct MitPeer {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    lines: std::io::Lines<std::io::BufReader<std::process::ChildStdout>>,
+}
+
+impl MitPeer {
+    /// `None` if MIT's tools or python3-gssapi are missing.
+    fn spawn(e: &Env, ccache: &str, args: &[&str]) -> Option<Self> {
+        Self::spawn_with(e, ccache, None, args)
+    }
+
+    /// As [`MitPeer::spawn`], with `[libdefaults]` lines added to the
+    /// realm's krb5.conf.
+    fn spawn_with(e: &Env, ccache: &str, libdefaults: Option<&str>, args: &[&str]) -> Option<Self> {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+        if !mit_tools_installed() || !python_gssapi() {
+            eprintln!("MIT's tools or python3-gssapi missing; skipping");
+            return None;
+        }
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/mit-gss.py");
+        let mut conf = format!("{}/krb5.conf", e.dir);
+        if let Some(extra) = libdefaults {
+            // MIT reads a list of profiles; the first wins.
+            let path = format!("{}/extra-{}.conf", e.dir, std::process::id());
+            std::fs::write(&path, format!("[libdefaults]\n{extra}\n")).unwrap();
+            conf = format!("{path}:{conf}");
+        }
+        let mut child = Command::new("python3")
+            .arg(script)
+            .args(args)
+            .env("KRB5_CONFIG", conf)
+            .env("KRB5CCNAME", ccache)
+            .env("KRB5_KTNAME", format!("FILE:{}/service.keytab", e.dir))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        Some(MitPeer {
+            child,
+            stdin,
+            lines,
+        })
+    }
+
+    fn send(&mut self, token: &[u8]) {
+        use std::io::Write;
+        let hex: String = token.iter().map(|b| format!("{b:02x}")).collect();
+        writeln!(self.stdin, "{hex}").unwrap();
+    }
+
+    /// The next line, as (word, rest); `Err` with MIT's message on "err".
+    fn line(&mut self) -> Result<(String, String), String> {
+        let line = self.lines.next().expect("MIT's side hung up").unwrap();
+        let (word, rest) = line.split_once(' ').unwrap_or((&line, ""));
+        match word {
+            "err" => Err(rest.to_string()),
+            _ => Ok((word.to_string(), rest.to_string())),
+        }
+    }
+
+    /// The next "tok" line: `Some(token)`, or `None` for "tok -".
+    fn token(&mut self) -> Result<Option<Vec<u8>>, String> {
+        let (word, rest) = self.line()?;
+        assert_eq!(word, "tok", "expected a token, got {word} {rest}");
+        Ok((rest != "-").then(|| unhex(&rest)))
+    }
+
+    /// "done <flags> <name>".
+    fn done(&mut self) -> (u32, String) {
+        let (word, rest) = self.line().unwrap();
+        assert_eq!(word, "done", "{rest}");
+        let (flags, name) = rest.split_once(' ').unwrap();
+        (flags.parse().unwrap(), name.to_string())
+    }
+
+    fn wrap(&mut self) -> Vec<u8> {
+        let (word, rest) = self.line().unwrap();
+        assert_eq!(word, "wrap", "{rest}");
+        unhex(&rest)
+    }
+
+    fn ok(mut self) {
+        assert_eq!(self.line().unwrap().0, "ok");
+        assert!(self.child.wait().unwrap().success());
+    }
+}
+
+impl Drop for MitPeer {
+    /// A test done with MIT's side early ends it, quietly.
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn unhex(s: &str) -> Vec<u8> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+const GSS_C_REPLAY_FLAG: u32 = 4;
+const GSS_C_SEQUENCE_FLAG: u32 = 8;
+const GSS_C_CHANNEL_BOUND_FLAG: u32 = krb5::initiator::GSS_C_CHANNEL_BOUND_FLAG;
+const MUTUAL_INTEG_CONF: u32 = GSS_C_MUTUAL_FLAG | GSS_C_INTEG_FLAG | GSS_C_CONF_FLAG;
+
+fn alice_ticket_for_host(e: &Env) -> Credentials {
+    let tgt = e
+        .client
+        .login_with_password(&e.p("alice"), "alicepw")
+        .unwrap();
+    e.client
+        .service_ticket(&tgt, &e.p("host/svc.krb5.test"))
+        .unwrap()
+}
+
+/// Our SPNEGO initiator against MIT's acceptor: negotiation, then Wrap
+/// tokens both ways at the sequence numbers negotiation left. Mutual and
+/// not, with and without sequence checking.
+#[test]
+fn our_spnego_initiator_against_mits_acceptor() {
+    let e = live!();
+    let svc = alice_ticket_for_host(&e);
+    for flags in [
+        MUTUAL_INTEG_CONF,
+        MUTUAL_INTEG_CONF | GSS_C_REPLAY_FLAG | GSS_C_SEQUENCE_FLAG,
+        GSS_C_CONF_FLAG,
+    ] {
+        let Some(mut mit) = MitPeer::spawn(&e, "MEMORY:", &["accept"]) else {
+            return;
+        };
+        let (mut ini, token) = krb5::spnego::SpnegoInitiator::new(&svc, flags).unwrap();
+        mit.send(&token);
+        while !ini.is_established() {
+            let reply = mit.token().unwrap().expect("MIT answers a NegTokenInit");
+            if let Some(next) = ini.step(&reply).unwrap() {
+                mit.send(&next);
+            }
+        }
+        let (_, name) = mit.done();
+        assert_eq!(name, format!("alice@{}", e.realm));
+        let tokens = ini.per_message_tokens().unwrap();
+        mit.send(&tokens.emit_wrap(ini.send_seq(), b"ping").unwrap());
+        let got = tokens.unwrap(&mit.wrap()).unwrap();
+        assert_eq!(got.message, b"pong");
+        assert_eq!(got.seq, ini.recv_seq(), "flags {flags:#x}");
+        mit.ok();
+    }
+}
+
+/// MIT's SPNEGO initiator against ours, from a cache MIT's kinit wrote.
+#[test]
+fn mits_spnego_initiator_against_our_acceptor() {
+    let e = live!();
+    let path = scratch(&e, "spnego-mit");
+    let name = format!("FILE:{}", path.display());
+    if mit(&e, &name, "kinit", &["alice"], Some("alicepw\n")).is_none() {
+        eprintln!("MIT's krb5 tools not on PATH; skipping");
+        return;
+    }
+    let target = format!("host/svc.krb5.test@{}", e.realm);
+    let keytab = e.keytab("service.keytab");
+    for flags in [
+        MUTUAL_INTEG_CONF,
+        MUTUAL_INTEG_CONF | GSS_C_REPLAY_FLAG | GSS_C_SEQUENCE_FLAG,
+        GSS_C_INTEG_FLAG | GSS_C_CONF_FLAG,
+    ] {
+        let Some(mut mit) = MitPeer::spawn(
+            &e,
+            &name,
+            &[
+                "initiate",
+                &target,
+                "--spnego",
+                "--flags",
+                &flags.to_string(),
+            ],
+        ) else {
+            return;
+        };
+        let mut acc = krb5::spnego::SpnegoAcceptor::new(&keytab);
+        while let Some(token) = mit.token().unwrap() {
+            assert!(!acc.is_established(), "MIT sent a token after we finished");
+            if let Some(reply) = acc.step(&token).unwrap() {
+                mit.send(&reply);
+            }
+        }
+        assert!(acc.is_established() && acc.is_spnego());
+        let ctx = acc.context().unwrap();
+        assert_eq!(ctx.client_principal, format!("alice@{}", e.realm));
+        let (_, peer) = mit.done();
+        assert_eq!(peer, target);
+        let tokens = ctx.per_message_tokens().unwrap();
+        let got = tokens.unwrap(&mit.wrap()).unwrap();
+        assert_eq!(
+            (got.message.as_slice(), got.seq),
+            (&b"ping"[..], acc.recv_seq())
+        );
+        mit.send(&tokens.emit_wrap(acc.send_seq(), b"pong").unwrap());
+        mit.ok();
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Our initiator's channel bindings as MIT's acceptor checks them, raw
+/// Kerberos and under SPNEGO: matching ones set GSS_C_CHANNEL_BOUND_FLAG
+/// in MIT's flags, others are refused, and none are refused only when
+/// we said we bind (KERB_AP_OPTIONS_CBT in the authenticator, which MIT
+/// must find where it looks for it).
+#[test]
+fn mits_acceptor_checks_our_channel_bindings() {
+    let e = live!();
+    let svc = alice_ticket_for_host(&e);
+    let cb = krb5::ChannelBindings::new(b"tls-server-end-point:0123456789".to_vec());
+    let other = krb5::ChannelBindings::new(b"tls-server-end-point:9876543210".to_vec());
+    let cb_hex = hex(&cb.application_data);
+    // (our bindings, our extra flags, accepted, bound)
+    let cases = [
+        (Some(&cb), 0, true, true),
+        (Some(&other), 0, false, false),
+        (None, 0, true, false),
+        (None, GSS_C_CHANNEL_BOUND_FLAG, false, false),
+        (Some(&cb), GSS_C_CHANNEL_BOUND_FLAG, true, true),
+    ];
+    for spnego in [false, true] {
+        for (ours, extra, accepted, bound) in cases {
+            let Some(mut mit) = MitPeer::spawn(&e, "MEMORY:", &["accept", "--cb", &cb_hex]) else {
+                return;
+            };
+            let opts = krb5::initiator::InitOptions {
+                channel_bindings: ours,
+                ..Default::default()
+            };
+            let flags = MUTUAL_INTEG_CONF | extra;
+            let label = format!(
+                "spnego {spnego}, bindings {:?}, flags {extra:#x}",
+                ours.map(|c| String::from_utf8_lossy(&c.application_data).into_owned())
+            );
+            if spnego {
+                let (mut ini, token) =
+                    krb5::spnego::SpnegoInitiator::with_options(&svc, flags, opts).unwrap();
+                mit.send(&token);
+                // MIT refuses with an error token (a reject carrying a
+                // KRB-ERROR), which our side must take as the refusal.
+                let reply = mit.token().unwrap().expect("a reply");
+                match ini.step(&reply) {
+                    Ok(next) => {
+                        assert!(accepted, "{label}: MIT accepted");
+                        assert_eq!(next, None);
+                    }
+                    Err(err) => {
+                        assert!(!accepted, "{label}: {err}");
+                        assert!(err.kdc_code().is_some(), "{label}: {err}");
+                        continue;
+                    }
+                }
+            } else {
+                let (mut ini, token) = InitiatorContext::with_options(&svc, flags, opts).unwrap();
+                mit.send(&token);
+                let reply = mit.token().unwrap().expect("a reply");
+                match ini.step(&reply) {
+                    Ok(()) => assert!(accepted, "{label}: MIT accepted"),
+                    Err(err) => {
+                        assert!(!accepted, "{label}: {err}");
+                        // A KRB-ERROR: KRB_AP_ERR_BAD_INTEGRITY, as MIT maps
+                        // GSS_S_BAD_BINDINGS.
+                        assert!(err.kdc_code().is_some(), "{label}: {err}");
+                        continue;
+                    }
+                }
+            }
+            let (flags, _) = mit.done();
+            assert_eq!(
+                flags & GSS_C_CHANNEL_BOUND_FLAG != 0,
+                bound,
+                "{label}: {flags:#x}"
+            );
+        }
+    }
+}
+
+/// MIT's initiator's channel bindings as our acceptor checks them.
+#[test]
+fn our_acceptor_checks_mits_channel_bindings() {
+    let e = live!();
+    let path = scratch(&e, "cb-mit");
+    let name = format!("FILE:{}", path.display());
+    if mit(&e, &name, "kinit", &["alice"], Some("alicepw\n")).is_none() {
+        eprintln!("MIT's krb5 tools not on PATH; skipping");
+        return;
+    }
+    let target = format!("host/svc.krb5.test@{}", e.realm);
+    let keytab = e.keytab("service.keytab");
+    let ours =
+        krb5::ChannelBindings::new(b"tls-exporter:abcdefghijklmnopqrstuvwxyz012345".to_vec());
+    let ours_hex = hex(&ours.application_data);
+    // (MIT's arguments, whether MIT says it binds, accepted, bound).
+    // MIT 1.19 to 1.21 send KERB_AP_OPTIONS_CBT only for
+    // client_aware_channel_bindings, so that is how it is asked for.
+    let cases: [(&[&str], bool, bool, bool); 5] = [
+        (&["--cb", &ours_hex], false, true, true),
+        (&["--cb", "00ff"], false, false, false),
+        (&[], false, true, false),
+        (&[], true, false, false),
+        (&["--cb", &ours_hex], true, true, true),
+    ];
+    for spnego in [false, true] {
+        for (extra, cbt, accepted, bound) in cases {
+            let mut args = vec!["initiate", &target];
+            if spnego {
+                args.push("--spnego");
+            }
+            args.extend_from_slice(extra);
+            let cbt_conf = cbt.then_some("client_aware_channel_bindings = true");
+            let Some(mut mit) = MitPeer::spawn_with(&e, &name, cbt_conf, &args) else {
+                return;
+            };
+            let opts = krb5::acceptor::AcceptOptions {
+                channel_bindings: Some(ours.clone()),
+                ..Default::default()
+            };
+            let mut acc = krb5::spnego::SpnegoAcceptor::with_options(&keytab, opts);
+            let token = mit.token().unwrap().unwrap();
+            let label = format!("spnego {spnego}, MIT {extra:?}, CBT {cbt}");
+            match acc.step(&token) {
+                Ok(reply) => {
+                    assert!(accepted, "{label}: we accepted");
+                    let flags = acc.context().unwrap().gss_flags;
+                    assert_eq!(flags & GSS_C_CHANNEL_BOUND_FLAG != 0, bound, "{label}");
+                    mit.send(&reply.unwrap());
+                    assert_eq!(mit.token().unwrap(), None, "{label}");
+                    mit.done();
+                }
+                Err(err) => {
+                    assert!(!accepted, "{label}: {err}");
+                    assert!(
+                        matches!(err, krb5::KerberosError::BadBindings(_)),
+                        "{label}: {err}"
+                    );
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
 // ------------------------------------------------------------------ FAST
 
 /// An armor TGT, as a host would hold one from its keytab.

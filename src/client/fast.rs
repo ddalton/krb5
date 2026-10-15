@@ -63,7 +63,8 @@ impl Armor {
     /// subkey of its session key's enctype and no checksum.
     pub(crate) fn from_tgt(tgt: &Credentials, now: i64, usec: u32) -> Result<Self> {
         let subkey = Key::random(tgt.session_key.enctype())?;
-        let authenticator = encode_authenticator(&tgt.client, None, usec, now, Some(&subkey), None);
+        let authenticator =
+            encode_authenticator(&tgt.client, None, usec, now, Some(&subkey), None, None);
         let enc = tgt.session_key.encrypt(KU_AP_REQ_AUTH, &authenticator)?;
         let ap_req = encode_ap_req(0, &tgt.ticket, tgt.session_key.enctype(), &enc);
         let key = Key::cf2(&subkey, "subkeyarmor", &tgt.session_key, "ticketarmor")?;

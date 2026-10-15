@@ -401,6 +401,29 @@ impl Krb5Conf {
     }
 }
 
+impl Krb5Conf {
+    /// `[libdefaults] client_aware_channel_bindings` (MIT 1.19 and later),
+    /// default false: whether every initiator says it binds to its channel
+    /// (MS-KILE KERB_AP_OPTIONS_CBT), as if it asked for
+    /// [`GSS_C_CHANNEL_BOUND_FLAG`]. MIT reads it in its Kerberos library;
+    /// here the caller adds the flag:
+    ///
+    /// ```no_run
+    /// # use krb5::initiator::GSS_C_CHANNEL_BOUND_FLAG;
+    /// # let conf = krb5::Krb5Conf::load_default().unwrap();
+    /// # let mut flags = 0;
+    /// if conf.client_aware_channel_bindings() {
+    ///     flags |= GSS_C_CHANNEL_BOUND_FLAG;
+    /// }
+    /// ```
+    ///
+    /// [`GSS_C_CHANNEL_BOUND_FLAG`]: crate::initiator::GSS_C_CHANNEL_BOUND_FLAG
+    pub fn client_aware_channel_bindings(&self) -> bool {
+        self.get(&["libdefaults", "client_aware_channel_bindings"])
+            .is_some_and(conf_boolean)
+    }
+}
+
 /// MIT's profile `parse_int`: `strtol(value, &end, 10)` consuming the whole
 /// string (leading blanks and a sign allowed, nothing trailing), within
 /// `int` range.
@@ -1031,6 +1054,20 @@ mod tests {
             }
         }
         assert!(checked.0 > 60 && checked.1 > 25, "{checked:?}");
+    }
+
+    #[test]
+    fn client_aware_channel_bindings_is_an_mit_boolean() {
+        let conf = |v: &str| {
+            Krb5Conf::parse(&format!(
+                "[libdefaults]\n client_aware_channel_bindings = {v}\n"
+            ))
+            .unwrap()
+            .client_aware_channel_bindings()
+        };
+        assert!(conf("true") && conf("yes") && conf("1") && conf("on"));
+        assert!(!conf("false") && !conf("0") && !conf("maybe"));
+        assert!(!Krb5Conf::parse("").unwrap().client_aware_channel_bindings());
     }
 
     #[test]
