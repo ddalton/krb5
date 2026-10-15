@@ -1668,10 +1668,18 @@ fn every_signature_on_mits_pac_verifies() {
         "host/svc.krb5.test",
         svc.ticket_enctype,
     );
-    let all = krb5::pac::verify_ticket(&svc.ticket, &service_key, &krbtgt)
-        .unwrap()
-        .unwrap();
-    assert_eq!(all, pac);
+    pac.verify_server_signature(&service_key).unwrap();
+    pac.verify_kdc_signature(&krbtgt).unwrap();
+    let all = krb5::pac::verify_ticket(&svc.ticket, &service_key, &krbtgt);
+    if pac.buffer(krb5::pac::PAC_FULL_CHECKSUM).is_none() {
+        // MIT 1.20 signs the ticket but not the whole PAC; MIT 1.21's KDC
+        // refuses such a service ticket, and so do we.
+        eprintln!("no full PAC signature (MIT 1.20)");
+        // The ticket signature verified; only the full one is missing.
+        assert!(all.unwrap_err().to_string().contains("buffer 19"));
+        return;
+    }
+    assert_eq!(all.unwrap().unwrap(), pac);
 }
 
 // ------------------------------------------------------------------ FAST

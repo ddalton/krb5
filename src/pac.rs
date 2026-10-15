@@ -420,6 +420,9 @@ pub fn verify_ticket_signature(enc_ticket_part: &[u8], krbtgt: &Key) -> Result<(
 /// with that key, the KDC's with the `krbtgt` key, and for a service
 /// ticket (not a TGT, nor `kadmin/changepw`, MS-PAC 2.8.3) the ticket
 /// and full signatures too. The PAC, or `None` for a ticket without one.
+/// Like MIT 1.21 and later, a service ticket's PAC must carry the full
+/// signature (the CVE-2022-37967 fix); KDCs before it (MIT 1.20, Windows
+/// before November 2022) don't add one, and their tickets are refused.
 /// What a KDC (or a test of one) checks; a service has no `krbtgt` key.
 pub fn verify_ticket(ticket: &[u8], service_key: &Key, krbtgt: &Key) -> Result<Option<Pac>> {
     let bad = |e: der::DerError| PacError::Malformed(format!("Ticket: {}", e.0));
