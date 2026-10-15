@@ -16,6 +16,7 @@ use std::collections::HashMap;
 
 mod fast;
 pub(crate) mod krbcred;
+pub mod otp;
 mod s4u;
 mod u2u;
 mod xrealm;
@@ -480,6 +481,8 @@ enum Secret<'a> {
     /// PKINIT with a certificate, or anonymous PKINIT (`None`).
     #[cfg(feature = "pkinit")]
     Pkinit(Option<&'a pkinit::Identity>),
+    /// A one-time password, chosen once the KDC's challenge is known.
+    Otp(&'a dyn Fn(&otp::OtpChallenge) -> Result<otp::OtpAnswer>),
 }
 
 /// Where an AS exchange is with PKINIT.
@@ -1597,6 +1600,37 @@ impl KdcClient {
                         preauth = fast::cookie(&methods).into_iter().collect();
                         continue;
                     }
+                    if let Secret::Otp(answer) = &secret {
+                        if e.code != KDC_ERR_PREAUTH_REQUIRED || !preauth.is_empty() {
+                            return Err(e.into_error());
+                        }
+                        // MIT's KDC offers OTP only inside FAST.
+                        let Some(a) = &armor else {
+                            return Err(ClientError::NoKey(
+                                "OTP pre-authentication needs FAST armor (with_fast_armor)".into(),
+                            ));
+                        };
+                        let Some((_, value)) =
+                            methods.iter().find(|(t, _)| *t == otp::PA_OTP_CHALLENGE)
+                        else {
+                            return Err(ClientError::NoKey(
+                                "the KDC does not offer OTP pre-authentication".into(),
+                            ));
+                        };
+                        let (otp_nonce, challenge) = otp::parse_challenge(value)?;
+                        let reply = answer(&challenge)?;
+                        debug!(
+                            token = reply.token,
+                            "pre-authenticating with PA-OTP-REQUEST"
+                        );
+                        pa_type = Some(otp::PA_OTP_REQUEST);
+                        preauth = vec![(
+                            otp::PA_OTP_REQUEST,
+                            otp::request(&otp_nonce, &challenge, &reply, &a.key)?,
+                        )];
+                        preauth.extend(fast::cookie(&methods));
+                        continue;
+                    }
                     if e.code != KDC_ERR_PREAUTH_REQUIRED || !preauth.is_empty() {
                         return Err(e.into_error());
                     }
@@ -1694,6 +1728,15 @@ impl KdcClient {
                         now,
                     })?
                 }
+                // OTP: the KDC replaced the reply key with the armor key.
+                (Secret::Otp(_), _) => match &armor {
+                    Some(a) if pa_type == Some(otp::PA_OTP_REQUEST) => a.key.clone(),
+                    _ => {
+                        return Err(ClientError::NoKey(
+                            "the KDC answered without OTP pre-authentication".into(),
+                        ));
+                    }
+                },
                 (_, Some(k)) if k.enctype() == rep.enc_etype => k,
                 _ => {
                     let info = choose_salt(reply_padata, &[rep.enc_etype]).unwrap_or(SaltInfo {
@@ -2024,6 +2067,9 @@ fn derive_key(secret: &Secret<'_>, client: &Principal, info: &SaltInfo) -> Resul
         #[cfg(feature = "pkinit")]
         Secret::Pkinit(_) => Err(ClientError::NoKey(
             "PKINIT has no long-term key to derive".into(),
+        )),
+        Secret::Otp(_) => Err(ClientError::NoKey(
+            "the KDC asked for a password, not an OTP".into(),
         )),
     }
 }

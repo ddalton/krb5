@@ -17,7 +17,8 @@
 //!   keytab, including PA-ENC-TIMESTAMP pre-authentication) and the TGS
 //!   exchange (service tickets, across realms by referral and
 //!   `[capaths]`), over UDP and TCP as MIT chooses between them; ticket
-//!   renewal and postdated tickets (`kinit -R`, `-s`, `-v`); S4U2Self and
+//!   renewal and postdated tickets (`kinit -R`, `-s`, `-v`); one-time
+//!   passwords ([`KdcClient::login_with_otp`], RFC 6560); S4U2Self and
 //!   S4U2Proxy ([`KdcClient::s4u2self`], [`KdcClient::s4u2proxy`]):
 //!   protocol transition and constrained delegation, traditional and
 //!   resource-based; user-to-user tickets ([`KdcClient::user_to_user`],

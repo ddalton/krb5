@@ -7,6 +7,20 @@ may break the API).
 
 ## [Unreleased]
 
+### Added
+
+- OTP pre-authentication (RFC 6560): one-time passwords, as FreeIPA uses
+  them for two-factor login. `KdcClient::login_with_otp` answers the
+  KDC's PA-OTP-CHALLENGE inside FAST armor as MIT's `kinit` does: the
+  token the value fits, the PIN before the value or apart as the token
+  says, the nonce encrypted in the armor key, which becomes the reply key.
+  `login_with_otp_by` sees the challenge (`client::otp::OtpChallenge`)
+  and chooses the token and gives the PIN itself. Tokens MIT's client
+  cannot answer for are dropped the same way.
+  - Tested live against MIT 1.21 and 1.22, whose KDC checks the code with
+    a RADIUS server (`scripts/radius-test.py`, standard-library Python, in
+    the test realm): the right code logs in, a wrong one is refused.
+
 ## [0.11.0] - 2026-10-15
 
 ### Added

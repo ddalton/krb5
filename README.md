@@ -27,6 +27,10 @@ tickets without shelling out to `kinit`.
   `kinit -T`: the encrypted challenge, armored errors and replies, TGS
   requests too); UDP and TCP, chosen as MIT chooses. KDCs come from `krb5.conf`, from DNS
   (URI and SRV records, as MIT looks them up), or are passed in directly.
+- **OTP** — one-time-password login (RFC 6560, FreeIPA's two-factor
+  login): the KDC's challenge answered inside FAST, tokens chosen and
+  PINs handled as MIT's `kinit` does. Tested against MIT's KDC checking
+  codes with RADIUS.
 - **S4U** — S4U2Self (protocol transition, `kvno -U`) and S4U2Proxy
   (constrained delegation, traditional and resource-based), as MIT's
   client makes and checks them.

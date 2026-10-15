@@ -50,11 +50,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: |
           sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq krb5-kdc krb5-admin-server krb5-user krb5-pkinit python3-gssapi
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq krb5-kdc krb5-admin-server krb5-user krb5-pkinit krb5-otp python3-gssapi
       - run: scripts/test-kdc.sh "$RUNNER_TEMP/krb5test"
       - run: cat "$RUNNER_TEMP/krb5test/test.env" >> "$GITHUB_ENV"
-      # PKINIT must be set up here, not skipped.
+      # PKINIT and OTP must be set up here, not skipped.
       - run: test "$KRB5_TEST_PKINIT" = 1
+      - run: test "$KRB5_TEST_OTP" = 1
       - run: cargo test --features pkinit --test kdc -- --nocapture
         env:
           # Also compare the DNS resolver with dig on public realms' records.
@@ -130,6 +131,7 @@ jobs:
       - run: test "$KRB5_TEST_PKINIT_ECDH" = 1
       - run: test "$KRB5_TEST_S4U_REALM" = S4U.TEST
       - run: command -v uuserver  # the user-to-user interop test's peer
+      - run: test "$KRB5_TEST_OTP" = 1
       - run: cargo test --features pkinit --test kdc -- --nocapture
       - run: |
           kill $(cat "$KRB5_TEST_DIR/kdc.pid")  # the KDC and kadmind

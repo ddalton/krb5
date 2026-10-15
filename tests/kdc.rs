@@ -967,6 +967,8 @@ fn udp_preference_limit_from_krb5_conf() {
 
 /// TicketFlags forwarded (bit 2).
 const FORWARDED: u32 = 1 << 29;
+/// TicketFlags pre-authent (bit 10).
+const PRE_AUTHENT: u32 = 1 << 21;
 
 /// Our initiator delegates a forwarded TGT to our acceptor, which can then
 /// act as the client: it buys a ticket to another service with it.
@@ -1910,6 +1912,67 @@ fn mit_refuses_a_replayed_authenticator_of_ours() {
         err.windows(5).any(|w| w == [0xA6, 3, 2, 1, 34]),
         "KRB_AP_ERR_REPEAT: {}",
         hex(&err)
+    );
+}
+
+// ------------------------------------------------------------------- OTP
+
+/// The RADIUS server's verdicts so far (`scripts/radius-test.py`), or
+/// `None` without MIT's otp plugin.
+fn radius_log(e: &Env) -> Option<Vec<String>> {
+    if std::env::var("KRB5_TEST_OTP").as_deref() != Ok("1") {
+        eprintln!("KRB5_TEST_OTP not set (no MIT otp plugin); skipping");
+        return None;
+    }
+    let log = std::fs::read_to_string(format!("{}/radius.log", e.dir)).unwrap();
+    Some(log.lines().map(str::to_string).collect())
+}
+
+/// A one-time password through FAST to MIT's KDC, which checks it with
+/// RADIUS: the right code logs in, a wrong one is refused, and without
+/// armor nothing is sent.
+#[test]
+fn otp_login_through_fast_and_radius() {
+    use krb5::client::otp::OtpAnswer;
+    let e = live!();
+    let Some(before) = radius_log(&e) else {
+        return;
+    };
+    let kdc = e.client.clone().with_fast_armor(armor_tgt(&e));
+    let user = e.p("otpuser");
+    let tgt = kdc.login_with_otp(&user, "424242").unwrap();
+    assert_eq!(tgt.client.to_string(), format!("otpuser@{}", e.realm));
+    assert_ne!(tgt.flags & PRE_AUTHENT, 0, "pre-authenticated");
+    let st = e
+        .client
+        .service_ticket(&tgt, &e.p("host/svc.krb5.test"))
+        .unwrap();
+    establish(&e, &st);
+
+    let err = kdc.login_with_otp(&user, "111111").unwrap_err();
+    assert_eq!(err.kdc_code(), Some(KDC_ERR_PREAUTH_FAILED), "{err}");
+
+    // MIT's KDC describes one token and nothing about it.
+    kdc.login_with_otp_by(&user, |ch| {
+        assert_eq!((ch.tokens.len(), ch.service.as_deref()), (1, None));
+        Ok(OtpAnswer {
+            token: 0,
+            value: "424242".into(),
+            pin: None,
+        })
+    })
+    .unwrap();
+    let err = e.client.login_with_otp(&user, "424242").unwrap_err();
+    assert!(err.to_string().contains("FAST"), "{err}");
+
+    let log = radius_log(&e).unwrap();
+    assert_eq!(
+        log[before.len()..],
+        [
+            "otpuser 424242 accept",
+            "otpuser 111111 reject",
+            "otpuser 424242 accept"
+        ]
     );
 }
 

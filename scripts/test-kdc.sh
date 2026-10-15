@@ -28,8 +28,10 @@
 # kadmind serves KRB5.TEST on the next port (kadmin) and the one after
 # (kpasswd), with admin/admin (password adminpw) allowed everything,
 # extracting keys included, and limited (limitedpw) only to inquire and
-# list. kdc.pid holds both
-# daemons' process IDs.
+# list. Where MIT's otp plugin is installed, otpuser's KDC wants a
+# one-time password, which a RADIUS server (scripts/radius-test.py) on the
+# port after kpasswd's checks: 424242 is right. KRB5_TEST_OTP=1 then.
+# kdc.pid holds the daemons' process IDs.
 #
 # Writes <dir>/test.env with the KRB5_TEST_* variables the tests read.
 # The keys are random and the passwords are fixed strings: nothing here
@@ -104,6 +106,15 @@ PKINIT=
 for p in "${KDCBIN%/sbin/krb5kdc}/lib/krb5/plugins/preauth/pkinit.so" \
          /usr/lib/*/krb5/plugins/preauth/pkinit.so /usr/lib*/krb5/plugins/preauth/pkinit.so; do
     if [ -f "$p" ] && command -v openssl >/dev/null; then PKINIT=1; fi
+done
+# OTP (RFC 6560): MIT's otp preauth plugin, checking codes with a RADIUS
+# server (scripts/radius-test.py, which takes 424242) on the port after
+# kpasswd's.
+OTP=
+RADIUS_PORT=$((PORT + 3))
+for p in "${KDCBIN%/sbin/krb5kdc}/lib/krb5/plugins/preauth/otp.so" \
+         /usr/lib/*/krb5/plugins/preauth/otp.so /usr/lib*/krb5/plugins/preauth/otp.so; do
+    if [ -f "$p" ] && command -v python3 >/dev/null; then OTP=1; fi
 done
 # ECDH: MIT 1.22 and later.
 ECDH=
@@ -282,6 +293,15 @@ $(if [ -n "$S4UREALM" ]; then cat <<S4U
     }
 S4U
 fi)
+$(if [ -n "$OTP" ]; then cat <<OTPCONF
+[otp]
+    radius = {
+        server = 127.0.0.1:$RADIUS_PORT
+        secret = $DIR/radius.secret
+        timeout = 2
+    }
+OTPCONF
+fi)
 [logging]
     kdc = FILE:$DIR/kdc.log
 EOF
@@ -335,6 +355,12 @@ k ktadd -k "$DIR/robot.keytab" robot
 # A service that may act for users (S4U2Self giving forwardable tickets).
 k addprinc -randkey +ok_to_auth_as_delegate s4u/svc.krb5.test
 k ktadd -k "$DIR/service.keytab" s4u/svc.krb5.test
+# A user whose KDC wants a one-time password (checked by RADIUS).
+if [ -n "$OTP" ]; then
+    k addprinc -pw otpuserpw +requires_preauth otpuser
+    out=$(kadmin.local -r "$REALM" setstr otpuser otp '[{"type": "radius"}]' 2>&1)
+    if [ -n "$out" ]; then echo "setstr otp: $out" >&2; exit 1; fi
+fi
 # The realm's krbtgt key, for checking the KDC's PAC signatures.
 # (lockdown_keys keeps it from kadmind, not from kadmin.local.)
 k ktadd -norandkey -k "$DIR/krbtgt.keytab" "krbtgt/$REALM"
@@ -365,10 +391,18 @@ if [ -n "$S4UREALM" ]; then
     kr "$S4UREALM" ktadd -norandkey -k "$DIR/s4u.keytab" user sensitive proxy constrained target impersonator rb "krbtgt/$S4UREALM"
 fi
 
+if [ -n "$OTP" ]; then
+    echo otptest >"$DIR/radius.secret"
+    : >"$DIR/radius.log"
+    python3 "$(dirname "$0")/radius-test.py" "$RADIUS_PORT" "$DIR/radius.secret" \
+        "$DIR/radius.log" 424242 >"$DIR/radius.out" 2>&1 &
+    RADIUS_PID=$!
+fi
 krb5kdc -n -r "$REALM" -r "$XREALM" -r "$FREALM" ${S4UREALM:+-r "$S4UREALM"} >"$DIR/kdc.out" 2>&1 &
 echo $! >"$DIR/kdc.pid"
 kadmind -nofork -r "$REALM" >"$DIR/kadmind.out" 2>&1 &
 echo $! >>"$DIR/kdc.pid"
+if [ -n "$OTP" ]; then echo "$RADIUS_PID" >>"$DIR/kdc.pid"; fi
 for p in "$PORT" "$KADMIN_PORT" "$KPASSWD_PORT"; do
     for _ in $(seq 50); do
         if (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null; then break; fi
@@ -386,5 +420,6 @@ KRB5_TEST_PKINIT_ECDH=$ECDH
 KRB5_TEST_KADMIN=$HOST:$KADMIN_PORT
 KRB5_TEST_KPASSWD=$HOST:$KPASSWD_PORT
 KRB5_TEST_S4U_REALM=$S4UREALM
+KRB5_TEST_OTP=$OTP
 EOF
 echo "KDC for $REALM on port $PORT, kadmind on $KADMIN_PORT and $KPASSWD_PORT (pids $(tr '\n' ' ' <"$DIR/kdc.pid")); env in $DIR/test.env"
