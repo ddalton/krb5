@@ -9,6 +9,30 @@ may break the API).
 
 ### Added
 
+- SPAKE pre-authentication (draft-ietf-kitten-krb-spake-preauth, MIT 1.17
+  and later): a password or keytab login whose recorded exchange gives an
+  eavesdropper nothing to guess passwords against offline. As in MIT's
+  client, it is used whenever the KDC offers it.
+  - The flow is MIT's. The support message lists our groups, the KDC's
+    challenge (sent with MORE_PREAUTH_DATA_REQUIRED and a cookie holding
+    its state) is answered with our public value and an encrypted SF-NONE
+    factor, and the reply comes in K'[0]. An optimistic challenge is
+    answered directly. A KDC that takes none of our groups leaves the
+    login to encrypted timestamps, and SPAKE works inside FAST too.
+  - edwards25519, MIT's client default, is implemented in the crate, in
+    constant time, with no new dependency. P-256, P-384 and P-521 come
+    with the new `spake-nist` feature (also part of `pkinit`), on
+    RustCrypto's curves. A response costs about 0.2 ms on edwards25519
+    and 0.6 to 2.2 ms on the NIST curves.
+  - `client::spake::SpakeGroup`, `KdcClient::with_spake_groups`, and
+    `spake_preauth_groups` in krb5.conf (`ClientDefaults::spake_groups`)
+    set the groups offered. An empty list (or `none` in krb5.conf) turns
+    SPAKE off.
+  - Tested against MIT's test vectors for every group (w, T, S, K, the
+    transcript hash, K'[0..3]), and live against MIT 1.21 and 1.22, whose
+    test KDC now offers SPAKE in edwards25519, P-256 and P-384: each
+    group, the fallback for P-521, a wrong password, a keytab key, and
+    inside FAST.
 - OTP pre-authentication (RFC 6560): one-time passwords, as FreeIPA uses
   them for two-factor login. `KdcClient::login_with_otp` answers the
   KDC's PA-OTP-CHALLENGE inside FAST armor as MIT's `kinit` does: the
@@ -20,6 +44,13 @@ may break the API).
   - Tested live against MIT 1.21 and 1.22, whose KDC checks the code with
     a RADIUS server (`scripts/radius-test.py`, standard-library Python, in
     the test realm): the right code logs in, a wrong one is refused.
+
+### Changed
+
+- Breaking: `ClientDefaults` has a new field, `spake_groups`.
+- Password and keytab logins use SPAKE when the KDC offers it, which takes
+  one round trip more than encrypted timestamps. `with_spake_groups(&[])`
+  restores the old behavior.
 
 ## [0.11.0] - 2026-10-15
 

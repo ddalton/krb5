@@ -287,6 +287,11 @@ pub struct ClientDefaults {
     /// first. Default 1465; a negative value means the default, and more
     /// than 32700 means 32700, as in MIT. Not realm-specific.
     pub udp_preference_limit: usize,
+    /// `spake_preauth_groups`, default `edwards25519` (MIT's client
+    /// default); unknown names, and groups this build cannot use, are
+    /// skipped, so a list with none it knows (`none`, say) turns SPAKE off,
+    /// as in MIT. Not realm-specific.
+    pub spake_groups: Vec<crate::client::spake::SpakeGroup>,
 }
 
 impl Krb5Conf {
@@ -376,6 +381,10 @@ impl Krb5Conf {
             forwardable: boolean("forwardable"),
             proxiable: boolean("proxiable"),
             udp_preference_limit,
+            spake_groups: crate::client::spake::SpakeGroup::parse_list(
+                self.get(&["libdefaults", "spake_preauth_groups"])
+                    .unwrap_or("edwards25519"),
+            ),
         })
     }
 }
@@ -1093,6 +1102,15 @@ mod tests {
         assert_eq!(
             (d.renew_lifetime, d.forwardable, d.proxiable),
             (None, false, false)
+        );
+        use crate::client::spake::SpakeGroup;
+        assert_eq!(d.spake_groups, [SpakeGroup::Edwards25519], "MIT's default");
+        let off = conf("[libdefaults]\n spake_preauth_groups = none\n");
+        assert!(
+            off.client_defaults("A.ORG")
+                .unwrap()
+                .spake_groups
+                .is_empty()
         );
 
         let c = conf(

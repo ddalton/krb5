@@ -27,6 +27,13 @@ tickets without shelling out to `kinit`.
   `kinit -T`: the encrypted challenge, armored errors and replies, TGS
   requests too); UDP and TCP, chosen as MIT chooses. KDCs come from `krb5.conf`, from DNS
   (URI and SRV records, as MIT looks them up), or are passed in directly.
+- **SPAKE** — password login that a recorded exchange cannot be used to
+  guess passwords against offline (MIT 1.17+'s SPAKE pre-authentication),
+  preferred when the KDC offers it, as MIT's client does: edwards25519
+  (implemented here, constant-time) by default, and P-256, P-384 and P-521
+  with the optional `spake-nist` feature; `spake_preauth_groups` from
+  krb5.conf. Checked against MIT's test vectors and live against MIT's
+  KDC, inside FAST too.
 - **OTP** — one-time-password login (RFC 6560, FreeIPA's two-factor
   login): the KDC's challenge answered inside FAST, tokens chosen and
   PINs handled as MIT's `kinit` does. Tested against MIT's KDC checking

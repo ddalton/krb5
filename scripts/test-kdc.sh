@@ -28,7 +28,8 @@
 # kadmind serves KRB5.TEST on the next port (kadmin) and the one after
 # (kpasswd), with admin/admin (password adminpw) allowed everything,
 # extracting keys included, and limited (limitedpw) only to inquire and
-# list. Where MIT's otp plugin is installed, otpuser's KDC wants a
+# list. The KDC offers SPAKE (edwards25519, P-256 and P-384) alongside
+# encrypted timestamps. Where MIT's otp plugin is installed, otpuser's KDC wants a
 # one-time password, which a RADIUS server (scripts/radius-test.py) on the
 # port after kpasswd's checks: 424242 is right. KRB5_TEST_OTP=1 then.
 # kdc.pid holds the daemons' process IDs.
@@ -222,6 +223,11 @@ pkinit_kdc_conf() {
 }
 
 cat >"$DIR/kdc.conf" <<EOF
+[libdefaults]
+    # SPAKE pre-authentication, as MIT deploys it: no optimistic challenge,
+    # the client's support message first. P-521 is left out so a client
+    # offering only it falls back to encrypted timestamps.
+    spake_preauth_groups = edwards25519 P-256 P-384
 [kdcdefaults]
     kdc_ports = $PORT
     kdc_tcp_ports = $PORT

@@ -18,6 +18,7 @@ mod fast;
 pub(crate) mod krbcred;
 pub mod otp;
 mod s4u;
+pub mod spake;
 mod u2u;
 mod xrealm;
 use crate::config::{self, ClientDefaults, ConfigError, Krb5Conf};
@@ -578,6 +579,8 @@ pub struct KdcClient {
     /// required from the first request or taken up when the KDC offers it.
     fast_armor: Option<Credentials>,
     fast_required: bool,
+    /// The groups offered for SPAKE pre-authentication; none turns it off.
+    spake_groups: Vec<spake::SpakeGroup>,
     #[cfg(feature = "pkinit")]
     pkinit: pkinit::Settings,
 }
@@ -609,6 +612,7 @@ impl KdcClient {
             realm_kdcs: HashMap::new(),
             fast_armor: None,
             fast_required: false,
+            spake_groups: vec![spake::SpakeGroup::Edwards25519],
             #[cfg(feature = "pkinit")]
             pkinit: pkinit::Settings::default(),
         }
@@ -846,6 +850,21 @@ impl KdcClient {
             .with_forwardable(d.forwardable)
             .with_proxiable(d.proxiable)
             .with_udp_preference_limit(d.udp_preference_limit)
+            .with_spake_groups(&d.spake_groups)
+    }
+
+    /// The groups offered for SPAKE pre-authentication (MIT's
+    /// `spake_preauth_groups`), in order of preference; the default is
+    /// edwards25519, as MIT's client. None turns SPAKE off, leaving
+    /// encrypted timestamps. Groups this build cannot use are dropped
+    /// (see [`spake::SpakeGroup::is_available`]).
+    pub fn with_spake_groups(mut self, groups: &[spake::SpakeGroup]) -> Self {
+        self.spake_groups = groups
+            .iter()
+            .copied()
+            .filter(|g| g.is_available())
+            .collect();
+        self
     }
 
     /// Requested ticket lifetime (default 24 h; the KDC may shorten it).
@@ -1447,8 +1466,13 @@ impl KdcClient {
         {
             pk.group = self.pkinit.dh_group;
         }
+        let mut spake = spake::Spake::default();
+        let mut spake_key: Option<Key> = None;
 
-        for _ in 0..4 {
+        // Each round trip a step: SPAKE takes three (offer, challenge,
+        // response), a FAST upgrade or a refused informational PA-DATA one
+        // more each.
+        for _ in 0..8 {
             if armored && armor.is_none() {
                 let tgt = self
                     .fast_armor
@@ -1469,6 +1493,11 @@ impl KdcClient {
                 kdc_options,
                 None,
             );
+            // A SPAKE response is keyed to this very request body.
+            if let Some((value, k0)) = spake.respond(&body)? {
+                preauth.insert(0, (spake::PA_SPAKE, value));
+                preauth_key = Some(k0);
+            }
             let mut padata = preauth.clone();
             #[cfg(feature = "pkinit")]
             if let Secret::Pkinit(identity) = &secret {
@@ -1548,6 +1577,7 @@ impl KdcClient {
                         preauth.clear();
                         preauth_key = None;
                         pa_type = None;
+                        spake = spake::Spake::default();
                         pk = PkState {
                             #[cfg(feature = "pkinit")]
                             group: pk.group,
@@ -1599,6 +1629,55 @@ impl KdcClient {
                         pa_type = Some(pkinit::PA_PK_AS_REQ);
                         preauth = fast::cookie(&methods).into_iter().collect();
                         continue;
+                    }
+                    // SPAKE, when the KDC offers it, for a password or a
+                    // keytab key: MIT's client prefers it to encrypted
+                    // timestamps.
+                    if matches!(secret, Secret::Password(_) | Secret::Keytab(_))
+                        && !self.spake_groups.is_empty()
+                        && !spake.declined
+                        && !spake.responded()
+                    {
+                        let offered = methods
+                            .iter()
+                            .find(|(t, _)| *t == spake::PA_SPAKE)
+                            .map(|(_, v)| v.clone());
+                        let first = e.code == KDC_ERR_PREAUTH_REQUIRED
+                            && preauth.is_empty()
+                            && !spake.support_sent();
+                        let more = e.code == spake::KDC_ERR_MORE_PREAUTH_DATA_REQUIRED
+                            && spake.support_sent();
+                        if let (true, Some(value)) = (first || more, offered) {
+                            if first {
+                                let info = choose_salt(&methods, &enctypes).ok_or_else(|| {
+                                    ClientError::NoKey(
+                                        "KDC offered no supported enctype for pre-authentication"
+                                            .into(),
+                                    )
+                                })?;
+                                spake_key = Some(derive_key(&secret, client, &info)?);
+                            }
+                            let ikey = spake_key.clone().ok_or_else(|| {
+                                ClientError::Protocol("SPAKE challenge before any offer".into())
+                            })?;
+                            preauth = match spake.step(&self.spake_groups, &value, ikey)? {
+                                spake::Step::Send(m) => vec![(spake::PA_SPAKE, m)],
+                                spake::Step::Respond => Vec::new(),
+                            };
+                            // The KDC's SPAKE state lives in its cookie.
+                            preauth.extend(fast::cookie(&methods));
+                            pa_type = Some(spake::PA_SPAKE);
+                            continue;
+                        }
+                        // None of our groups: MIT's KDC refuses the support
+                        // message, and its client tries other methods.
+                        if e.code == KDC_ERR_PREAUTH_FAILED && spake.support_sent() {
+                            debug!("the KDC takes none of our SPAKE groups; falling back");
+                            spake.declined = true;
+                            preauth.clear();
+                            pa_type = None;
+                            continue;
+                        }
                     }
                     if let Secret::Otp(answer) = &secret {
                         if e.code != KDC_ERR_PREAUTH_REQUIRED || !preauth.is_empty() {
@@ -1737,6 +1816,8 @@ impl KdcClient {
                         ));
                     }
                 },
+                // SPAKE: K'[0] replaced the reply key.
+                (_, Some(k)) if pa_type == Some(spake::PA_SPAKE) => k,
                 (_, Some(k)) if k.enctype() == rep.enc_etype => k,
                 _ => {
                     let info = choose_salt(reply_padata, &[rep.enc_etype]).unwrap_or(SaltInfo {

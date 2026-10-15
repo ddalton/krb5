@@ -766,12 +766,18 @@ fn libdefaults_shape_the_tickets_the_kdc_issues() {
     );
     let kdc = KdcClient::from_config(&conf, &e.realm).unwrap();
     let tgt = kdc.login_with_password(&e.p("alice"), "alicepw").unwrap();
+    // Asked from our clock, counted from the KDC's: a second may tick
+    // between the two.
     let start = tgt.starttime.unwrap_or(tgt.authtime);
-    assert_eq!(tgt.endtime - start, 2 * 3600, "ticket_lifetime");
-    assert_eq!(
-        tgt.renew_till.expect("renewable") - start,
-        3 * 86400,
-        "renew_lifetime"
+    let life = tgt.endtime - start;
+    assert!(
+        (2 * 3600 - 1..=2 * 3600).contains(&life),
+        "ticket_lifetime {life}"
+    );
+    let renew = tgt.renew_till.expect("renewable") - start;
+    assert!(
+        (3 * 86400 - 1..=3 * 86400).contains(&renew),
+        "renew_lifetime {renew}"
     );
     assert_eq!(
         tgt.flags & (FORWARDABLE | RENEWABLE),
@@ -916,8 +922,9 @@ fn the_kdc_is_reached_over_udp() {
     let tgt = kdc.login_with_password(&e.p("alice"), "alicepw").unwrap();
     kdc.service_ticket(&tgt, &e.p("host/svc.krb5.test"))
         .unwrap();
-    // PREAUTH_REQUIRED, AS-REQ, TGS-REQ: all UDP, nothing else on offer.
-    assert_eq!(*seen.lock().unwrap(), ["udp", "udp", "udp"]);
+    // PREAUTH_REQUIRED, the SPAKE support message and response, TGS-REQ:
+    // all UDP, nothing else on offer.
+    assert_eq!(*seen.lock().unwrap(), ["udp", "udp", "udp", "udp"]);
     // With UDP off there is no way through.
     let tcp_only = KdcClient::new(e.realm.clone(), [addr])
         .with_udp(false)
@@ -1915,6 +1922,100 @@ fn mit_refuses_a_replayed_authenticator_of_ours() {
     );
 }
 
+// ----------------------------------------------------------------- SPAKE
+
+/// The pre-authentication type a login used, as `kinit` records it in the
+/// cache (its `pa_type` entry): 151 SPAKE, 2 encrypted timestamp, 138
+/// FAST's encrypted challenge.
+fn pa_type_of(e: &Env, tag: &str, kinit: impl FnOnce(&krb5::CacheName)) -> String {
+    let path = scratch(e, tag);
+    let name = krb5::CacheName::parse(&format!("FILE:{}", path.display())).unwrap();
+    kinit(&name);
+    let cc = krb5::CCache::read(&path).unwrap();
+    let t = cc
+        .config("pa_type", Some(&Principal::krbtgt(&e.realm)))
+        .expect("a pa_type entry")
+        .to_vec();
+    let _ = std::fs::remove_file(&path);
+    String::from_utf8(t).unwrap()
+}
+
+/// The test KDC offers SPAKE in edwards25519, P-256 and P-384 (not
+/// P-521), as MIT deploys it: our client's support message, the KDC's
+/// challenge, our response, and the reply in K'[0].
+#[test]
+fn spake_logins_in_each_group_the_kdc_takes() {
+    use krb5::client::spake::SpakeGroup;
+    let e = live!();
+    let alice = e.p("alice");
+    let login = |groups: &[SpakeGroup], tag: &str| {
+        let kdc = e.client.clone().with_spake_groups(groups);
+        pa_type_of(&e, tag, |c| {
+            let tgt = kdc.kinit_with_password(&alice, "alicepw", c).unwrap();
+            let st = e
+                .client
+                .service_ticket(&tgt, &e.p("host/svc.krb5.test"))
+                .unwrap();
+            establish(&e, &st);
+        })
+    };
+    // edwards25519, the default, needs no feature.
+    assert_eq!(login(&[SpakeGroup::Edwards25519], "spake-ed"), "151");
+    if SpakeGroup::P256.is_available() {
+        assert_eq!(login(&[SpakeGroup::P256], "spake-256"), "151");
+        assert_eq!(login(&[SpakeGroup::P384], "spake-384"), "151");
+        // A group the KDC does not take: it refuses our support message,
+        // and the login falls back to encrypted timestamps, as MIT's does.
+        assert_eq!(login(&[SpakeGroup::P521], "spake-521"), "2");
+    }
+    // SPAKE off: encrypted timestamps.
+    assert_eq!(login(&[], "spake-off"), "2");
+    // The default client takes SPAKE when it is offered.
+    let kdc = e.client.clone();
+    let t = pa_type_of(&e, "spake-default", |c| {
+        kdc.kinit_with_password(&alice, "alicepw", c).unwrap();
+    });
+    assert_eq!(t, "151");
+}
+
+/// A wrong password fails at the KDC, which cannot open our second
+/// factor; a keytab key works as a password's does.
+#[test]
+fn spake_refuses_a_wrong_password_and_takes_a_keytab_key() {
+    let e = live!();
+    let err = e
+        .client
+        .login_with_password(&e.p("alice"), "wrong")
+        .unwrap_err();
+    assert_eq!(err.kdc_code(), Some(KDC_ERR_PREAUTH_FAILED), "{err}");
+    let t = pa_type_of(&e, "spake-kt", |c| {
+        e.client
+            .kinit_with_keytab(&e.p("robot"), &e.keytab("robot.keytab"), c)
+            .unwrap();
+    });
+    assert_eq!(t, "151");
+}
+
+/// SPAKE inside FAST, which the KDC offers there too, and FAST's
+/// encrypted challenge when SPAKE is off.
+#[test]
+fn spake_inside_fast() {
+    let e = live!();
+    let alice = e.p("alice");
+    let kdc = e.client.clone().with_fast_armor(armor_tgt(&e));
+    let t = pa_type_of(&e, "spake-fast", |c| {
+        kdc.kinit_with_password(&alice, "alicepw", c).unwrap();
+    });
+    assert_eq!(t, "151");
+    let plain = kdc.clone().with_spake_groups(&[]);
+    let t = pa_type_of(&e, "spake-fast-off", |c| {
+        plain.kinit_with_password(&alice, "alicepw", c).unwrap();
+    });
+    assert_eq!(t, "138");
+    let err = kdc.login_with_password(&alice, "wrong").unwrap_err();
+    assert_eq!(err.kdc_code(), Some(KDC_ERR_PREAUTH_FAILED), "{err}");
+}
+
 // ------------------------------------------------------------------- OTP
 
 /// The RADIUS server's verdicts so far (`scripts/radius-test.py`), or
@@ -1990,7 +2091,12 @@ fn armor_tgt(e: &Env) -> Credentials {
 #[test]
 fn fast_armored_password_login() {
     let e = live!();
-    let kdc = e.client.clone().with_fast_armor(armor_tgt(&e));
+    // SPAKE off: the KDC offers it inside FAST too (see spake_inside_fast).
+    let kdc = e
+        .client
+        .clone()
+        .with_fast_armor(armor_tgt(&e))
+        .with_spake_groups(&[]);
     let tgt = kdc.login_with_password(&e.p("alice"), "alicepw").unwrap();
     assert_eq!(tgt.client.to_string(), format!("alice@{}", e.realm));
     assert_eq!(tgt.server, Principal::krbtgt(&e.realm));
@@ -2138,8 +2244,8 @@ fn kinit_records_fast_avail_as_mit_does() {
     let krbtgt = Principal::krbtgt(&e.realm);
     assert_eq!(
         cc.config("pa_type", Some(&krbtgt)),
-        Some(&b"2"[..]),
-        "PA-ENC-TIMESTAMP"
+        Some(&b"151"[..]),
+        "PA-SPAKE"
     );
     // The same entries MIT's kinit writes, in the same place.
     if let Some(listed) = mit(&e, &format!("FILE:{}", path.display()), "klist", &[], None) {
@@ -2161,8 +2267,13 @@ fn kinit_records_fast_avail_as_mit_does() {
         assert_eq!(conf(&cc), conf(&theirs));
         let _ = std::fs::remove_file(mit_path);
     }
-    // FAST logins record the encrypted challenge.
-    let fast = e.client.clone().with_fast_armor(armor_tgt(&e));
+    // FAST logins record the encrypted challenge (SPAKE off; with it on
+    // they record SPAKE, see spake_inside_fast).
+    let fast = e
+        .client
+        .clone()
+        .with_fast_armor(armor_tgt(&e))
+        .with_spake_groups(&[]);
     fast.kinit_with_password(&e.p("alice"), "alicepw", &cache)
         .unwrap();
     assert_eq!(
@@ -2186,9 +2297,11 @@ fn an_armor_cache_upgrades_or_starts_armored() {
     e.client
         .kinit_with_keytab(&robot, &kt, &krb5::CacheName::File(with.clone()))
         .unwrap();
+    // Counting requests: SPAKE (a round trip more) off.
     let kdc = e
         .client
         .clone()
+        .with_spake_groups(&[])
         .with_fast_armor_cache(&krb5::CacheName::File(with.clone()))
         .unwrap();
     let before = as_requests(&e, "alice");
@@ -2208,6 +2321,7 @@ fn an_armor_cache_upgrades_or_starts_armored() {
     let kdc = e
         .client
         .clone()
+        .with_spake_groups(&[])
         .with_fast_armor_cache(&krb5::CacheName::File(without.clone()))
         .unwrap();
     let before = as_requests(&e, "alice");
@@ -2236,6 +2350,7 @@ fn an_armor_cache_upgrades_or_starts_armored() {
         let kdc = e
             .client
             .clone()
+            .with_spake_groups(&[])
             .with_fast_armor_cache(&krb5::CacheName::File(mit_cache.clone()))
             .unwrap();
         let before = as_requests(&e, "alice");
@@ -2285,7 +2400,11 @@ fn a_renewable_tgt_and_a_service_ticket_are_renewed() {
         .starttime
         .expect("a renewed ticket starts after authtime");
     assert!(start > now, "{start} > {now}");
-    assert_eq!(new.endtime - start, 3600, "the old lifetime, from now");
+    // The old ticket's own lifetime (3600 asked; a second less if the
+    // KDC's clock ticked between our request and its answer).
+    let lifetime = tgt.endtime - tgt.starttime.unwrap_or(tgt.authtime);
+    assert!((3599..=3600).contains(&lifetime), "{lifetime}");
+    assert_eq!(new.endtime - start, lifetime, "the old lifetime, from now");
 
     let svc = kdc
         .service_ticket(&new, &e.p("host/svc.krb5.test"))
@@ -2859,9 +2978,11 @@ mod pkinit {
         {
             return;
         }
+        // SPAKE off: only the encrypted challenge proves FAST.
         let kdc = e
             .client
             .clone()
+            .with_spake_groups(&[])
             .with_fast_armor_cache(&CacheName::File(path))
             .unwrap();
         let out = scratch(&e, "pk-armored");
@@ -2888,8 +3009,10 @@ mod pkinit {
         );
         let anon_before = as_requests(&e, "WELLKNOWN/ANONYMOUS");
         let out = CacheName::File(scratch(&e, "pk-auto"));
+        // SPAKE off: only the encrypted challenge proves FAST.
         KdcClient::from_config(&conf, &e.realm)
             .unwrap()
+            .with_spake_groups(&[])
             .kinit_with_password(&e.p("alice"), "alicepw", &out)
             .unwrap();
         assert!(as_requests(&e, "WELLKNOWN/ANONYMOUS") > anon_before);

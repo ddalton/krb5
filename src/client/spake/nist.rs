@@ -1,0 +1,143 @@
+//! The NIST groups for SPAKE (P-256, P-384, P-521), with RustCrypto's
+//! constant-time curve arithmetic, as MIT does them with OpenSSL: w is the
+//! big-endian w-bytes reduced mod the group order, the private scalar is
+//! uniform in [0, n), points are SEC1-compressed.
+
+use super::{Mask, SpakeGroup};
+use crate::client::{ClientError, Result};
+use p256::elliptic_curve::ff::PrimeField;
+use p256::elliptic_curve::sec1::{FromSec1Point, ToSec1Point};
+use rand::RngCore;
+
+const P256_M: [u8; 33] = [
+    0x02, 0x88, 0x6E, 0x2F, 0x97, 0xAC, 0xE4, 0x6E, 0x55, 0xBA, 0x9D, 0xD7, 0x24, 0x25, 0x79, 0xF2,
+    0x99, 0x3B, 0x64, 0xE1, 0x6E, 0xF3, 0xDC, 0xAB, 0x95, 0xAF, 0xD4, 0x97, 0x33, 0x3D, 0x8F, 0xA1,
+    0x2F,
+];
+const P256_N: [u8; 33] = [
+    0x03, 0xD8, 0xBB, 0xD6, 0xC6, 0x39, 0xC6, 0x29, 0x37, 0xB0, 0x4D, 0x99, 0x7F, 0x38, 0xC3, 0x77,
+    0x07, 0x19, 0xC6, 0x29, 0xD7, 0x01, 0x4D, 0x49, 0xA2, 0x4B, 0x4F, 0x98, 0xBA, 0xA1, 0x29, 0x2B,
+    0x49,
+];
+const P384_M: [u8; 49] = [
+    0x03, 0x0F, 0xF0, 0x89, 0x5A, 0xE5, 0xEB, 0xF6, 0x18, 0x70, 0x80, 0xA8, 0x2D, 0x82, 0xB4, 0x2E,
+    0x27, 0x65, 0xE3, 0xB2, 0xF8, 0x74, 0x9C, 0x7E, 0x05, 0xEB, 0xA3, 0x66, 0x43, 0x4B, 0x36, 0x3D,
+    0x3D, 0xC3, 0x6F, 0x15, 0x31, 0x47, 0x39, 0x07, 0x4D, 0x2E, 0xB8, 0x61, 0x3F, 0xCE, 0xEC, 0x28,
+    0x53,
+];
+const P384_N: [u8; 49] = [
+    0x02, 0xC7, 0x2C, 0xF2, 0xE3, 0x90, 0x85, 0x3A, 0x1C, 0x1C, 0x4A, 0xD8, 0x16, 0xA6, 0x2F, 0xD1,
+    0x58, 0x24, 0xF5, 0x60, 0x78, 0x91, 0x8F, 0x43, 0xF9, 0x22, 0xCA, 0x21, 0x51, 0x8F, 0x9C, 0x54,
+    0x3B, 0xB2, 0x52, 0xC5, 0x49, 0x02, 0x14, 0xCF, 0x9A, 0xA3, 0xF0, 0xBA, 0xAB, 0x4B, 0x66, 0x5C,
+    0x10,
+];
+const P521_M: [u8; 67] = [
+    0x02, 0x00, 0x3F, 0x06, 0xF3, 0x81, 0x31, 0xB2, 0xBA, 0x26, 0x00, 0x79, 0x1E, 0x82, 0x48, 0x8E,
+    0x8D, 0x20, 0xAB, 0x88, 0x9A, 0xF7, 0x53, 0xA4, 0x18, 0x06, 0xC5, 0xDB, 0x18, 0xD3, 0x7D, 0x85,
+    0x60, 0x8C, 0xFA, 0xE0, 0x6B, 0x82, 0xE4, 0xA7, 0x2C, 0xD7, 0x44, 0xC7, 0x19, 0x19, 0x35, 0x62,
+    0xA6, 0x53, 0xEA, 0x1F, 0x11, 0x9E, 0xEF, 0x93, 0x56, 0x90, 0x7E, 0xDC, 0x9B, 0x56, 0x97, 0x99,
+    0x62, 0xD7, 0xAA,
+];
+const P521_N: [u8; 67] = [
+    0x02, 0x00, 0xC7, 0x92, 0x4B, 0x9E, 0xC0, 0x17, 0xF3, 0x09, 0x45, 0x62, 0x89, 0x43, 0x36, 0xA5,
+    0x3C, 0x50, 0x16, 0x7B, 0xA8, 0xC5, 0x96, 0x38, 0x76, 0x88, 0x05, 0x42, 0xBC, 0x66, 0x9E, 0x49,
+    0x4B, 0x25, 0x32, 0xD7, 0x6C, 0x5B, 0x53, 0xDF, 0xB3, 0x49, 0xFD, 0xF6, 0x91, 0x54, 0xB9, 0xE0,
+    0x04, 0x8C, 0x58, 0xA4, 0x2E, 0x8E, 0xD0, 0x4C, 0xEF, 0x05, 0x2A, 0x3B, 0xC3, 0x49, 0xD9, 0x55,
+    0x75, 0xCD, 0x25,
+];
+
+fn bad(what: &str) -> ClientError {
+    ClientError::Protocol(format!("SPAKE: {what}"))
+}
+
+/// Each function once per curve, with that curve's crate as `$m` and its
+/// M and N.
+macro_rules! per_group {
+    ($g:expr, $m:ident, $mc:ident, $nc:ident => $body:expr) => {
+        match $g {
+            SpakeGroup::P256 => {
+                use p256 as $m;
+                let ($mc, $nc) = (&P256_M[..], &P256_N[..]);
+                $body
+            }
+            SpakeGroup::P384 => {
+                use p384 as $m;
+                let ($mc, $nc) = (&P384_M[..], &P384_N[..]);
+                $body
+            }
+            SpakeGroup::P521 => {
+                use p521 as $m;
+                let ($mc, $nc) = (&P521_M[..], &P521_N[..]);
+                $body
+            }
+            SpakeGroup::Edwards25519 => unreachable!("edwards25519 is not a NIST group"),
+        }
+    };
+}
+
+/// `bytes` (big-endian, any length) mod the group order, in constant time:
+/// Horner's rule in the scalar field. (The curve crates' own reduction
+/// subtracts the order once, too little for P-521's 66-octet w.)
+macro_rules! reduce {
+    ($m:ident, $bytes:expr) => {{
+        let b256 = $m::Scalar::from(256u64);
+        $bytes.iter().fold($m::Scalar::ZERO, |acc, &b| {
+            acc * b256 + $m::Scalar::from(u64::from(b))
+        })
+    }};
+}
+
+/// Uniform in [0, n), as OpenSSL's `BN_rand_range`: rejection sampling.
+pub(super) fn random_scalar(g: SpakeGroup) -> Vec<u8> {
+    per_group!(g, m, _mc, _nc => {
+        let mut repr = m::FieldBytes::default();
+        loop {
+            rand::thread_rng().fill_bytes(&mut repr);
+            if g == SpakeGroup::P521 {
+                repr[0] &= 0x01;
+            }
+            if bool::from(m::Scalar::from_repr(repr).is_some()) {
+                return repr.to_vec();
+            }
+        }
+    })
+}
+
+pub(super) fn public(g: SpakeGroup, w: &[u8], private: &[u8], mask: Mask) -> Result<Vec<u8>> {
+    per_group!(g, m, mc, nc => {
+        let x = reduce!(m, private);
+        let w = reduce!(m, w);
+        let c = m::AffinePoint::from_sec1_bytes(match mask { Mask::M => mc, Mask::N => nc })
+            .map_err(|_| bad("constant is not a point"))?;
+        let p = m::ProjectivePoint::GENERATOR * x + m::ProjectivePoint::from(c) * w;
+        Ok(p.to_affine().to_sec1_point(true).as_bytes().to_vec())
+    })
+}
+
+pub(super) fn result(
+    g: SpakeGroup,
+    w: &[u8],
+    private: &[u8],
+    theirs: &[u8],
+    mask: Mask,
+) -> Result<Vec<u8>> {
+    per_group!(g, m, mc, nc => {
+        // MIT's EC_POINT_oct2point with the group's element length: a
+        // compressed point, not the identity.
+        if theirs.len() != mc.len() {
+            return Err(bad("the KDC's value is not a compressed point"));
+        }
+        let q = m::AffinePoint::from_sec1_bytes(theirs)
+            .map_err(|_| bad("the KDC's value is not a curve point"))?;
+        let x = reduce!(m, private);
+        let w = reduce!(m, w);
+        let c = m::AffinePoint::from_sec1_bytes(match mask { Mask::M => mc, Mask::N => nc })
+            .map_err(|_| bad("constant is not a point"))?;
+        let k = (m::ProjectivePoint::from(q) - m::ProjectivePoint::from(c) * w) * x;
+        let out = k.to_affine().to_sec1_point(true).as_bytes().to_vec();
+        if out.len() != mc.len() {
+            return Err(bad("the shared value is the identity"));
+        }
+        Ok(out)
+    })
+}
