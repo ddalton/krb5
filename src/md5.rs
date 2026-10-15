@@ -61,9 +61,36 @@ pub(crate) fn md5(data: &[u8]) -> [u8; 16] {
     out
 }
 
+/// HMAC-MD5 (RFC 2104).
+pub(crate) fn hmac_md5(key: &[u8], data: &[u8]) -> [u8; 16] {
+    let mut k = [0u8; 64];
+    if key.len() > 64 {
+        k[..16].copy_from_slice(&md5(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let pad = |b: u8| k.iter().map(|x| x ^ b).collect::<Vec<u8>>();
+    let mut inner = pad(0x36);
+    inner.extend_from_slice(data);
+    let mut outer = pad(0x5C);
+    outer.extend_from_slice(&md5(&inner));
+    md5(&outer)
+}
+
+/// RFC 4757 §4 KERB_CHECKSUM_HMAC_MD5 (-138), keyed with any key's raw
+/// octets as MIT computes it: `Ksign = HMAC-MD5(key, "signaturekey\0")`,
+/// then `HMAC-MD5(Ksign, MD5(usage, little-endian, || data))`. Windows signs
+/// PACs with it under RC4 keys, and MS-SFU's PA-FOR-USER always uses it.
+pub(crate) fn hmac_md5_checksum(key: &[u8], usage: u32, data: &[u8]) -> [u8; 16] {
+    let ksign = hmac_md5(key, b"signaturekey\0");
+    let mut m = usage.to_le_bytes().to_vec();
+    m.extend_from_slice(data);
+    hmac_md5(&ksign, &md5(&m))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::md5;
+    use super::{hmac_md5, md5};
 
     fn hex(b: &[u8]) -> String {
         b.iter().map(|x| format!("{x:02x}")).collect()
@@ -93,6 +120,27 @@ mod tests {
         for (input, want) in cases {
             assert_eq!(hex(&md5(input.as_bytes())), want, "{input:?}");
         }
+    }
+
+    /// RFC 2202 §2, HMAC-MD5 test cases 1, 2 and 6 (a key longer than a
+    /// block).
+    #[test]
+    fn rfc_2202_hmac_md5() {
+        assert_eq!(
+            hex(&hmac_md5(&[0x0b; 16], b"Hi There")),
+            "9294727a3638bb1c13f48ef8158bfc9d"
+        );
+        assert_eq!(
+            hex(&hmac_md5(b"Jefe", b"what do ya want for nothing?")),
+            "750c783e6ab0b503eaa86e310a5db738"
+        );
+        assert_eq!(
+            hex(&hmac_md5(
+                &[0xaa; 80],
+                b"Test Using Larger Than Block-Size Key - Hash Key First"
+            )),
+            "6b1ab7fe4bd7bf8f0b62e6ce61b9d0cd"
+        );
     }
 
     /// Lengths around the 56- and 64-octet padding boundaries.

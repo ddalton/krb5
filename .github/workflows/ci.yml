@@ -93,7 +93,7 @@ jobs:
         id: mit
         with:
           path: /home/runner/mit-krb5-1.22.2
-          key: mit-krb5-1.22.2-ubuntu-24.04
+          key: mit-krb5-1.22.2-kdbtest-ubuntu-24.04
       - if: steps.mit.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update -qq
@@ -106,6 +106,9 @@ jobs:
           ./configure --prefix="$MIT" --disable-nls >/dev/null
           make -j"$(nproc)" >/dev/null
           make install >/dev/null
+          # MIT's test KDB module, which holds delegation rules for the
+          # S4U2Proxy tests; make install leaves it out.
+          cp plugins/kdb/test/test.so "$MIT/lib/krb5/plugins/kdb/"
       - run: |
           echo "$MIT/bin" >> "$GITHUB_PATH"
           echo "$MIT/sbin" >> "$GITHUB_PATH"
@@ -125,6 +128,7 @@ jobs:
       - run: scripts/test-kdc.sh "$RUNNER_TEMP/krb5test"
       - run: cat "$RUNNER_TEMP/krb5test/test.env" >> "$GITHUB_ENV"
       - run: test "$KRB5_TEST_PKINIT_ECDH" = 1
+      - run: test "$KRB5_TEST_S4U_REALM" = S4U.TEST
       - run: cargo test --features pkinit --test kdc -- --nocapture
       - run: |
           kill $(cat "$KRB5_TEST_DIR/kdc.pid")  # the KDC and kadmind

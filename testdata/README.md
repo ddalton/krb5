@@ -107,3 +107,25 @@ libkrb5; MIT 1.20 (Ubuntu) and 1.21 (Homebrew) give identical output:
 ```sh
 scripts/record-mit-settings.sh [path/to/krb5-config]
 ```
+
+## `pac/` — PACs from Windows KDCs
+
+Copied, byte for byte, from MIT krb5 1.22.2's own tests (their files'
+licences, KTH's and Red Hat's, are in `MIT-KRB5-NOTICE`):
+
+- from `src/lib/krb5/krb/t_pac.c`:
+  - `saved_pac.bin`: Samba's torture PAC, from Windows Server 2003, signed
+    with RC4 keys;
+  - the four `s4u_pac_*.bin`: S4U2Self PACs from Windows Server 2008;
+  - `w2022_ticket.der`: a ticket issued by Windows Server 2022, with a
+    full PAC.
+
+  The keys are in `t_pac.c` and in `src/pac/tests.rs`.
+  `w2022_pac.bin` is that ticket's PAC, decrypted out of it.
+- from `src/kdc/t_ndr.c`:
+  - `s4u_di_*.bin`: S4U_DELEGATION_INFO buffers from Active Directory
+    2019;
+  - `ndr_fuzz*.bin`: two buffers MIT's fuzzer found.
+
+The expected field values in `src/pac/tests.rs` are what impacket 0.12.0
+(`impacket.krb5.pac`) decodes from the same bytes.

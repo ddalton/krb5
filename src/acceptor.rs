@@ -522,6 +522,14 @@ pub struct KerberosContext {
     /// (1.2.840.48018.1.2.2), which its clients still send and MIT
     /// accepts.
     pub mech_oid: Vec<u8>,
+    /// The ticket's PAC ([MS-PAC](crate::pac)): the client's SIDs and
+    /// groups from Active Directory, or what MIT's KDC puts there. Kept
+    /// only when it is the KDC's for this ticket, as MIT's acceptor
+    /// decides: its server signature verifies with our key and its client
+    /// info names the ticket's client at its authtime. A PAC that fails
+    /// is dropped, not an error, as in MIT (an old KDC may copy a PAC it
+    /// cannot sign).
+    pub pac: Option<crate::pac::Pac>,
 }
 
 /// What [`KerberosContext::accept_token_with`] takes besides the keytab
@@ -875,7 +883,11 @@ impl Ticket {
         debug!("   ✅ Ticket checksum verified");
 
         // Parse decrypted content
-        EncTicketPart::parse(&data)
+        let mut part = EncTicketPart::parse(&data)?;
+        part.authorization_data = crate::der::Fields::parse_tagged("EncTicketPart", 0x63, &data)
+            .ok()
+            .and_then(|f| f.raw(10).ok().map(<[u8]>::to_vec));
+        Ok(part)
     }
 }
 
@@ -888,10 +900,11 @@ struct EncTicketPart {
     cname: Vec<String>,
     /// Parsed because the ASN.1 walk has to step over it to reach
     /// `starttime`/`endtime`; nothing validates against it.
-    #[allow(dead_code)]
     authtime: i64,
     starttime: Option<i64>,
     endtime: i64,
+    /// `authorization-data [10]`, DER, if present: where a PAC lives.
+    authorization_data: Option<Vec<u8>>,
 }
 
 /// RFC 4120 §5.3 TicketFlags: bit 0 is the MOST significant bit of the
@@ -1026,6 +1039,7 @@ impl EncTicketPart {
             authtime,
             starttime,
             endtime,
+            authorization_data: None,
         })
     }
 }
@@ -1802,6 +1816,27 @@ fn parse_gss_checksum(ck: &[u8]) -> Result<GssChecksum<'_>> {
     Ok((flags, bnd, deleg))
 }
 
+/// The ticket's PAC, if it has one and it verifies as MIT's `mspac_verify`
+/// checks it: the server signature with the service key, and the client
+/// info against the ticket's client (without realm) and authtime.
+fn verified_pac(ticket: &EncTicketPart, service_key: &ServiceKey) -> Option<crate::pac::Pac> {
+    use crate::pac::Pac;
+    let raw = crate::pac::find_pac(ticket.authorization_data.as_deref()?).ok()??;
+    let pac = Pac::parse(raw).ok()?;
+    let key = crate::Key::new(service_key.enctype as i32, service_key.key.clone()).ok()?;
+    let client = crate::Principal::new(1, ticket.cname.clone(), ticket.crealm.clone());
+    let checked = pac
+        .verify_server_signature(&key)
+        .and_then(|()| pac.verify_client(ticket.authtime, &client, false));
+    match checked {
+        Ok(()) => Some(pac),
+        Err(e) => {
+            debug!("   ignoring the ticket's PAC: {e}");
+            None
+        }
+    }
+}
+
 /// MIT's `check_cbt`: whether AuthorizationData `ad` holds
 /// AD-AUTH-DATA-AP-OPTIONS (143), at the top or inside AD-IF-RELEVANT,
 /// with KERB_AP_OPTIONS_CBT (0x4000, little-endian) set. More than one,
@@ -2083,6 +2118,7 @@ impl KerberosContext {
         // is not a skew problem and must not be reported as one.
         enc_ticket_part.validate_validity(now, max_skew_secs)?;
 
+        let pac = verified_pac(&enc_ticket_part, service_key);
         let session_key = enc_ticket_part.key;
 
         info!(
@@ -2168,6 +2204,7 @@ impl KerberosContext {
             initiator_seq,
             acceptor_seq: if mutual { 0 } else { initiator_seq },
             mech_oid: krb5_oid.to_vec(),
+            pac,
         };
 
         // RFC 4120 §3.2.4: an AP-REP is the answer to MUTUAL-REQUIRED and
@@ -2964,6 +3001,7 @@ mod tests {
             authtime: 1_000,
             starttime,
             endtime,
+            authorization_data: None,
         }
     }
 

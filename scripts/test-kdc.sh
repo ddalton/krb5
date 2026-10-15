@@ -82,9 +82,25 @@ cat >"$DIR/krb5.conf" <<EOF
     }
 EOF
 
+# S4U2Proxy needs delegation rules, which MIT's DB2 module cannot hold: a
+# fourth realm on MIT's test KDB module (built with MIT, not installed by
+# make install or packaged) when it is there.
+S4UREALM=
+KDCBIN=$(command -v krb5kdc || true)
+for p in "${KDCBIN%/sbin/krb5kdc}/lib/krb5/plugins/kdb/test.so" /usr/lib/*/krb5/plugins/kdb/test.so; do
+    if [ -f "$p" ]; then S4UREALM=S4U.TEST; fi
+done
+if [ -n "$S4UREALM" ]; then
+    cat >>"$DIR/krb5.conf" <<EOF
+[realms]
+    $S4UREALM = {
+        kdc = 127.0.0.1:$PORT
+    }
+EOF
+fi
+
 # PKINIT: on when openssl and MIT's pkinit plugin are both there.
 PKINIT=
-KDCBIN=$(command -v krb5kdc || true)
 for p in "${KDCBIN%/sbin/krb5kdc}/lib/krb5/plugins/preauth/pkinit.so" \
          /usr/lib/*/krb5/plugins/preauth/pkinit.so /usr/lib*/krb5/plugins/preauth/pkinit.so; do
     if [ -f "$p" ] && command -v openssl >/dev/null; then PKINIT=1; fi
@@ -214,6 +230,58 @@ $(pkinit_kdc_conf "$r")
     }
 REALM
 done)
+$(if [ -n "$S4UREALM" ]; then cat <<S4U
+    $S4UREALM = {
+        database_module = s4u
+        supported_enctypes = aes256-cts-hmac-sha1-96:normal
+        max_life = 1d
+        max_renewable_life = 7d
+    }
+[dbmodules]
+    # proxy may delegate to target (traditional constrained delegation,
+    # and protocol transition); constrained may too, but without protocol
+    # transition; rb accepts delegation from impersonator (resource-based);
+    # sensitive may not be delegated at all.
+    s4u = {
+        db_library = test
+        princs = {
+            krbtgt/$S4UREALM = {
+                keys = aes256-cts
+            }
+            user = {
+                keys = aes256-cts
+            }
+            sensitive = {
+                keys = aes256-cts
+                flags = +disallow_forwardable
+            }
+            proxy = {
+                keys = aes256-cts
+                flags = +ok-to-auth-as-delegate
+            }
+            constrained = {
+                keys = aes256-cts
+            }
+            target = {
+                keys = aes256-cts
+            }
+            impersonator = {
+                keys = aes256-cts
+            }
+            rb = {
+                keys = aes256-cts
+            }
+        }
+        delegation = {
+            proxy = target
+            constrained = target
+        }
+        rbcd = {
+            rb@$S4UREALM = impersonator@$S4UREALM
+        }
+    }
+S4U
+fi)
 [logging]
     kdc = FILE:$DIR/kdc.log
 EOF
@@ -264,6 +332,12 @@ k addprinc -randkey host/svc.krb5.test
 k ktadd -k "$DIR/service.keytab" host/svc.krb5.test
 k addprinc -randkey robot
 k ktadd -k "$DIR/robot.keytab" robot
+# A service that may act for users (S4U2Self giving forwardable tickets).
+k addprinc -randkey +ok_to_auth_as_delegate s4u/svc.krb5.test
+k ktadd -k "$DIR/service.keytab" s4u/svc.krb5.test
+# The realm's krbtgt key, for checking the KDC's PAC signatures.
+# (lockdown_keys keeps it from kadmind, not from kadmin.local.)
+k ktadd -norandkey -k "$DIR/krbtgt.keytab" "krbtgt/$REALM"
 
 if [ -n "$PKINIT" ]; then
     k addprinc -randkey WELLKNOWN/ANONYMOUS
@@ -285,7 +359,13 @@ kr "$FREALM" ktadd -k "$DIR/far.keytab" host/server.far.test
 kr "$FREALM" addprinc -randkey host/other.far.test
 kr "$FREALM" ktadd -k "$DIR/far.keytab" host/other.far.test
 
-krb5kdc -n -r "$REALM" -r "$XREALM" -r "$FREALM" >"$DIR/kdc.out" 2>&1 &
+if [ -n "$S4UREALM" ]; then
+    # The test module derives every key from the principal's name; read
+    # them out as MIT's own tests do.
+    kr "$S4UREALM" ktadd -norandkey -k "$DIR/s4u.keytab" user sensitive proxy constrained target impersonator rb "krbtgt/$S4UREALM"
+fi
+
+krb5kdc -n -r "$REALM" -r "$XREALM" -r "$FREALM" ${S4UREALM:+-r "$S4UREALM"} >"$DIR/kdc.out" 2>&1 &
 echo $! >"$DIR/kdc.pid"
 kadmind -nofork -r "$REALM" >"$DIR/kadmind.out" 2>&1 &
 echo $! >>"$DIR/kdc.pid"
@@ -305,5 +385,6 @@ KRB5_TEST_PKINIT=$PKINIT
 KRB5_TEST_PKINIT_ECDH=$ECDH
 KRB5_TEST_KADMIN=$HOST:$KADMIN_PORT
 KRB5_TEST_KPASSWD=$HOST:$KPASSWD_PORT
+KRB5_TEST_S4U_REALM=$S4UREALM
 EOF
 echo "KDC for $REALM on port $PORT, kadmind on $KADMIN_PORT and $KPASSWD_PORT (pids $(tr '\n' ' ' <"$DIR/kdc.pid")); env in $DIR/test.env"

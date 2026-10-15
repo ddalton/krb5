@@ -7,6 +7,40 @@ may break the API).
 
 ## [Unreleased]
 
+### Added
+
+- S4U (MS-SFU). `KdcClient::s4u2self` gets a ticket to the service in a
+  user's name (protocol transition, `kvno -U`). It sends PA-S4U-X509-USER
+  (checksummed with the authenticator subkey) and PA-FOR-USER (HMAC-MD5),
+  and checks the KDC's checksummed reply as MIT does: our nonce, our
+  subkey, and the user it names. `KdcClient::s4u2proxy` turns such a
+  ticket, or one the user sent, into a ticket to another service
+  (constrained delegation). It sends the evidence ticket with
+  cname-in-addl-tkt and PA-PAC-OPTIONS, so the KDC can apply either
+  traditional or resource-based delegation rules. Both work in the
+  service's own realm, and inside FAST armor when FAST is configured.
+- `pac`: the MS-PAC.
+  - `Pac::parse` reads the buffer table as MIT checks it. There are
+    readers for the logon info (`KERB_VALIDATION_INFO`, NDR-decoded: user
+    and group SIDs, extra and resource-group SIDs, logon details), client
+    info, UPN/DNS info, delegation info, attributes and the requestor SID.
+  - The server, KDC and full signatures are verified, with HMAC-MD5 under
+    any key, as for RC4, or AES. `verify_ticket_signature` and
+    `verify_ticket` check a ticket the way MIT's `krb5_kdc_verify_ticket`
+    does, re-encoding the ticket for its ticket signature.
+  - Tested against PACs from Windows Server 2003, 2008, 2019 and 2022
+    (MIT's `t_pac.c` and `t_ndr.c` fixtures, with impacket's decoding as
+    the reference) and from MIT's KDC.
+- `KerberosContext::pac`: the ticket's PAC. As in MIT's acceptor, it is
+  kept only when its server signature and client info verify. One that
+  fails is dropped, and authentication still succeeds.
+
+### Fixed
+
+- A TGS reply encrypted in an authenticator subkey without FAST (as for
+  S4U2Self) is decrypted with the subkey, as RFC 4120 says. Before, a
+  subkey always meant FAST armor.
+
 ## [0.9.0] - 2026-10-15
 
 ### Added

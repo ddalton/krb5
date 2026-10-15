@@ -16,12 +16,14 @@ use std::collections::HashMap;
 
 mod fast;
 pub(crate) mod krbcred;
+mod s4u;
 mod xrealm;
 use crate::config::{self, ClientDefaults, ConfigError, Krb5Conf};
 use crate::der::{self, Fields, Reader, app};
 use crate::dns::{self, Resolver};
 use crate::key::{Key, KeyError};
 use rand::RngCore;
+use s4u::{S4u, TgsReply};
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs, UdpSocket};
@@ -1214,6 +1216,20 @@ impl KdcClient {
         server: &Principal,
         kdc_options: u32,
     ) -> Result<Credentials> {
+        self.tgs_ext(realm, tgt, server, kdc_options, &S4u::None)
+            .map(|r| r.creds)
+    }
+
+    /// [`KdcClient::tgs_to`], with S4U: the reply, its PA-DATA and the
+    /// subkey that keyed it.
+    fn tgs_ext(
+        &self,
+        realm: &str,
+        tgt: &Credentials,
+        server: &Principal,
+        kdc_options: u32,
+        s4u: &S4u<'_>,
+    ) -> Result<TgsReply> {
         let kdc = self.for_realm(realm)?;
         let (now, usec) = now();
         let nonce = random_nonce();
@@ -1221,14 +1237,28 @@ impl KdcClient {
         // and renewable flags carry over as options (KDC_TKT_COMMON_MASK).
         let kdc_options = kdc_options | (tgt.flags & KDC_TKT_COMMON_MASK);
         let times = kdc.tgs_times(now);
-        let body = kdc.req_body_with(None, server, nonce, &times, &kdc.tgs_enctypes, kdc_options);
-
-        // With FAST, a subkey in the authenticator: it keys the implicit
-        // armor and the reply (MIT send_tgs.c always does this).
-        let subkey = match self.fast_armor {
-            Some(_) => Some(Key::random(tgt.session_key.enctype())?),
-            None => None,
+        let evidence = match s4u {
+            S4u::Proxy { evidence, .. } => Some(evidence.ticket.as_slice()),
+            _ => None,
         };
+        let body = kdc.req_body_with(
+            None,
+            server,
+            nonce,
+            &times,
+            &kdc.tgs_enctypes,
+            kdc_options,
+            evidence,
+        );
+
+        // With FAST or S4U2Self, a subkey in the authenticator: it keys the
+        // implicit armor, the PA-S4U-X509-USER checksum, and the reply (MIT
+        // send_tgs.c always sends one).
+        let subkey = match (&self.fast_armor, s4u) {
+            (None, S4u::None | S4u::Proxy { .. }) => None,
+            _ => Some(Key::random(tgt.session_key.enctype())?),
+        };
+        let s4u_padata = s4u::request_padata(s4u, tgt, nonce, subkey.as_ref())?;
         let cksum = tgt.session_key.checksum(KU_TGS_REQ_AUTH_CKSUM, &body)?;
         let authenticator = encode_authenticator(
             &tgt.client,
@@ -1242,14 +1272,21 @@ impl KdcClient {
         let enc_auth = tgt.session_key.encrypt(KU_TGS_REQ_AUTH, &authenticator)?;
         let ap_req = encode_ap_req(0, &tgt.ticket, tgt.session_key.enctype(), &enc_auth);
 
-        let armor = match &subkey {
-            Some(sk) => Some(fast::Armor::implicit(sk, &tgt.session_key)?),
-            None => None,
+        // FAST only when it is configured; S4U2Self's subkey alone is not
+        // a reason to armor.
+        let armor = match (&self.fast_armor, &subkey) {
+            (Some(_), Some(sk)) => Some(fast::Armor::implicit(sk, &tgt.session_key)?),
+            _ => None,
         };
+        // The S4U PA-DATA rides in the request, or inside FAST's.
         let req = match &armor {
-            None => encode_kdc_req(12, &[(PA_TGS_REQ, ap_req)], body),
+            None => {
+                let mut padata = vec![(PA_TGS_REQ, ap_req)];
+                padata.extend(s4u_padata);
+                encode_kdc_req(12, &padata, body)
+            }
             Some(a) => {
-                let fx = a.wrap(&ap_req, &body, &[])?;
+                let fx = a.wrap(&ap_req, &body, &s4u_padata)?;
                 encode_kdc_req(12, &[(PA_TGS_REQ, ap_req), fx], body)
             }
         };
@@ -1270,16 +1307,29 @@ impl KdcClient {
             }
             Reply::Rep(r) => r,
         };
-        if !same_principal(&rep.client, &tgt.client) {
-            return protocol(format!(
-                "TGS reply is for {}, not {} (KRB5_KDCREP_MODIFIED)",
-                rep.client, tgt.client
-            ));
+        // The reply is for the TGT's client, but for S4U for the user:
+        // the evidence ticket's (MIT does not look; the KDC answers with
+        // its client), or the S4U2Self user, checked against the KDC's
+        // signed PA-S4U-X509-USER by the caller.
+        let want_client = match s4u {
+            S4u::None => Some(&tgt.client),
+            S4u::Proxy { evidence, .. } => Some(&evidence.client),
+            S4u::User(_) => None,
+        };
+        if let Some(want) = want_client {
+            if !same_principal(&rep.client, want) {
+                return protocol(format!(
+                    "TGS reply is for {}, not {want} (KRB5_KDCREP_MODIFIED)",
+                    rep.client
+                ));
+            }
         }
         let ticket_server = rep.ticket_server.clone();
+        let mut reply_padata = rep.padata.clone();
         let plain = match (&armor, &subkey) {
             (Some(a), Some(sk)) => {
                 let fr = a.open(&rep.padata, nonce)?;
+                reply_padata = fr.padata.clone();
                 a.check_finished(&fr, &rep.ticket)?;
                 // RFC 4120 §5.4.2: with a subkey the reply is in it (usage
                 // 9); FAST may strengthen it (MIT krb5int_fast_reply_key).
@@ -1289,6 +1339,7 @@ impl KdcClient {
                 };
                 key.decrypt(KU_TGS_REP_ENC_PART_SUBKEY, &rep.cipher)?
             }
+            (None, Some(sk)) => sk.decrypt(KU_TGS_REP_ENC_PART_SUBKEY, &rep.cipher)?,
             _ => tgt
                 .session_key
                 .decrypt(KU_TGS_REP_ENC_PART_SESSION, &rep.cipher)?,
@@ -1322,7 +1373,12 @@ impl KdcClient {
         if !local && tgt.flags & TKT_FLG_OK_AS_DELEGATE == 0 {
             creds.flags &= !TKT_FLG_OK_AS_DELEGATE;
         }
-        Ok(creds)
+        Ok(TgsReply {
+            creds,
+            padata: reply_padata,
+            subkey,
+            nonce,
+        })
     }
 
     /// The AS exchange for a TGT.
@@ -1401,8 +1457,15 @@ impl KdcClient {
             let (now, usec) = now();
             let nonce = random_nonce();
             let times = self.as_times(now);
-            let body =
-                self.req_body_with(Some(client), &krbtgt, nonce, &times, &enctypes, kdc_options);
+            let body = self.req_body_with(
+                Some(client),
+                &krbtgt,
+                nonce,
+                &times,
+                &enctypes,
+                kdc_options,
+                None,
+            );
             let mut padata = preauth.clone();
             #[cfg(feature = "pkinit")]
             if let Secret::Pkinit(identity) = &secret {
@@ -1703,7 +1766,7 @@ impl KdcClient {
         now: i64,
     ) -> Vec<u8> {
         let times = self.as_times(now);
-        self.req_body_with(cname, sname, nonce, &times, &self.tkt_enctypes, 0)
+        self.req_body_with(cname, sname, nonce, &times, &self.tkt_enctypes, 0, None)
     }
 
     /// The times an AS request asks for, as MIT's `set_request_times`
@@ -1731,6 +1794,8 @@ impl KdcClient {
         }
     }
 
+    // The KDC-REQ-BODY fields, one argument each.
+    #[allow(clippy::too_many_arguments)]
     fn req_body_with(
         &self,
         cname: Option<&Principal>,
@@ -1739,6 +1804,7 @@ impl KdcClient {
         times: &ReqTimes,
         enctypes: &[i32],
         kdc_options: u32,
+        additional_ticket: Option<&[u8]>,
     ) -> Vec<u8> {
         let mut parts = vec![der::field(0, der::flags32(kdc_options))];
         if let Some(c) = cname {
@@ -1763,6 +1829,10 @@ impl KdcClient {
                     .collect::<Vec<_>>(),
             ),
         ));
+        // additional-tickets [11]: the evidence ticket for S4U2Proxy.
+        if let Some(t) = additional_ticket {
+            parts.push(der::field(11, der::seq(&[t.to_vec()])));
+        }
         der::seq(&parts)
     }
 
@@ -2361,7 +2431,7 @@ mod tests {
             KDC_OPT_ALLOW_POSTDATE | KDC_OPT_POSTDATED | KDC_OPT_RENEWABLE
         );
         let alice = Principal::parse("alice@R").unwrap();
-        let body = c.req_body_with(Some(&alice), &Principal::krbtgt("R"), 1, &t, &[18], o);
+        let body = c.req_body_with(Some(&alice), &Principal::krbtgt("R"), 1, &t, &[18], o, None);
         let bf = Fields::parse_tagged("KDC-REQ-BODY", der::SEQUENCE, &body).unwrap();
         assert_eq!(bf.get(4).unwrap().time().unwrap(), now + 600);
         assert_eq!(bf.get(5).unwrap().time().unwrap(), now + 4200);

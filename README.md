@@ -21,6 +21,15 @@ tickets without shelling out to `kinit`.
   `kinit -T`: the encrypted challenge, armored errors and replies, TGS
   requests too); UDP and TCP, chosen as MIT chooses. KDCs come from `krb5.conf`, from DNS
   (URI and SRV records, as MIT looks them up), or are passed in directly.
+- **S4U** — S4U2Self (protocol transition, `kvno -U`) and S4U2Proxy
+  (constrained delegation, traditional and resource-based), as MIT's
+  client makes and checks them.
+- **PAC** — the MS-PAC in tickets from Active Directory and MIT: logon
+  info (user and group SIDs, NDR-decoded), client info, UPN and DNS
+  domain, delegation path, attributes; the server, KDC, ticket and full
+  signatures (HMAC-MD5 and AES). The acceptor keeps a ticket's PAC once
+  it verifies, as MIT's does. Tested on PACs from Windows Server 2003,
+  2008, 2019 and 2022, and from MIT's KDC.
 - **PKINIT** (optional `pkinit` feature) — login with an X.509
   certificate and an RSA or elliptic-curve key (RFC 4556, `kinit -X
   X509_user_identity=...`), anonymous PKINIT (RFC 8062, `kinit -n`), and

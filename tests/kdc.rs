@@ -1445,6 +1445,235 @@ fn our_acceptor_checks_mits_channel_bindings() {
     let _ = std::fs::remove_file(&path);
 }
 
+// ------------------------------------------------------- S4U and the PAC
+
+/// A key from `keytab` for `principal` (name without realm) and
+/// `enctype`.
+fn keytab_key(keytab: &Keytab, principal: &str, enctype: i32) -> krb5::Key {
+    let k = keytab
+        .keys()
+        .iter()
+        .find(|k| k.principal == principal && k.enctype as i32 == enctype)
+        .unwrap_or_else(|| panic!("no {principal} enctype {enctype} key"));
+    krb5::Key::new(enctype, k.key.clone()).unwrap()
+}
+
+/// A TCP relay to `target` (Kerberos framing) recording every request.
+fn recording_relay(target: String) -> (String, Arc<Mutex<Vec<Vec<u8>>>>) {
+    use std::io::{Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        for c in l.incoming() {
+            let mut c = c.unwrap();
+            let mut len = [0u8; 4];
+            if c.read_exact(&mut len).is_err() {
+                continue;
+            }
+            let mut req = vec![0; u32::from_be_bytes(len) as usize];
+            c.read_exact(&mut req).unwrap();
+            log.lock().unwrap().push(req.clone());
+            let mut up = std::net::TcpStream::connect(&target).unwrap();
+            up.write_all(&len).unwrap();
+            up.write_all(&req).unwrap();
+            let mut rep = Vec::new();
+            up.read_to_end(&mut rep).ok();
+            c.write_all(&rep).unwrap();
+        }
+    });
+    (addr, seen)
+}
+
+/// Whether a KDC-REQ carries PA-DATA of type `ty` (its padata-type field,
+/// `[1] INTEGER ty`, two octets).
+fn has_padata(req: &[u8], ty: u16) -> bool {
+    let field = [0xA1, 0x04, 0x02, 0x02, (ty >> 8) as u8, ty as u8];
+    req.windows(6).any(|w| w == field)
+}
+
+/// S4U2Self in the main (DB2) realm, every MIT version: a ticket to the
+/// service in alice's name, forwardable only for a service the KDC lets
+/// act for users; our acceptor takes it, with a PAC naming alice.
+#[test]
+fn s4u2self_gets_a_ticket_in_the_users_name() {
+    let e = live!();
+    let kdc = e.client.clone().with_forwardable(true);
+    let keytab = e.keytab("service.keytab");
+    let svc = e.p("s4u/svc.krb5.test");
+    let tgt = kdc.login_with_keytab(&svc, &keytab).unwrap();
+    let creds = kdc.s4u2self(&tgt, &e.p("alice")).unwrap();
+    assert_eq!(creds.client, e.p("alice"));
+    assert_eq!(creds.server, svc);
+    assert_eq!(
+        creds.flags & FORWARDABLE,
+        FORWARDABLE,
+        "ok_to_auth_as_delegate"
+    );
+    let (_, token) = InitiatorContext::new(&creds, GSS_C_MUTUAL_FLAG).unwrap();
+    let (ctx, _) = KerberosContext::accept_token(&keytab, &token).unwrap();
+    assert_eq!(ctx.client_principal, format!("alice@{}", e.realm));
+    if let Some(pac) = &ctx.pac {
+        // MIT 1.20 and later issue PACs.
+        assert_eq!(pac.client_info().unwrap().unwrap().name, "alice");
+    }
+
+    // A service without ok_to_auth_as_delegate but with no delegation
+    // targets (DB2 holds none) still gets it forwardable: MIT withholds
+    // the flag only from services with traditional delegation targets.
+    let host = e.p("host/svc.krb5.test");
+    let tgt = kdc.login_with_keytab(&host, &keytab).unwrap();
+    let creds = kdc.s4u2self(&tgt, &e.p("alice")).unwrap();
+    assert_eq!(creds.client, e.p("alice"));
+
+    // On the wire, as MIT sends it: PA-S4U-X509-USER (130) and
+    // PA-FOR-USER (129), and no FAST (PA-FX-FAST, 136) unless asked for.
+    let (relay, seen) = recording_relay(e.client.kdcs()[0].clone());
+    let via = KdcClient::new(e.realm.clone(), [relay]).with_udp(false);
+    via.s4u2self(&tgt, &e.p("alice")).unwrap();
+    {
+        let reqs = seen.lock().unwrap();
+        let last = reqs.last().unwrap();
+        assert!(has_padata(last, 130) && has_padata(last, 129));
+        assert!(!has_padata(last, 136), "armored without FAST configured");
+    }
+
+    // Inside FAST armor too: the S4U PA-DATA rides in the armored request.
+    let armored = via.clone().with_fast_armor(armor_tgt(&e));
+    let creds = armored.s4u2self(&tgt, &e.p("alice")).unwrap();
+    assert_eq!(creds.client, e.p("alice"));
+    assert!(has_padata(seen.lock().unwrap().last().unwrap(), 136));
+
+    // No such user.
+    let err = kdc.s4u2self(&tgt, &e.p("nobody")).unwrap_err();
+    assert!(err.kdc_code().is_some(), "{err}");
+    // DB2 holds no delegation rules: S4U2Proxy is refused.
+    let tgt = kdc.login_with_keytab(&svc, &keytab).unwrap();
+    let evidence = kdc.s4u2self(&tgt, &e.p("alice")).unwrap();
+    let err = kdc
+        .s4u2proxy(&tgt, &evidence, &e.p("host/svc.krb5.test"))
+        .unwrap_err();
+    assert!(err.kdc_code().is_some(), "{err}");
+}
+
+/// S4U2Proxy, on the realm with delegation rules (MIT's test KDB module):
+/// traditional constrained delegation (proxy may delegate to target, with
+/// forwardable evidence) and resource-based (rb accepts impersonator),
+/// each refused outside its rules; the tickets' PACs carry the
+/// delegation path, and every KDC signature on them verifies.
+#[test]
+fn s4u2proxy_by_the_kdcs_delegation_rules() {
+    let e = live!();
+    let realm = std::env::var("KRB5_TEST_S4U_REALM").unwrap_or_default();
+    if realm.is_empty() {
+        eprintln!("KRB5_TEST_S4U_REALM not set (no MIT test KDB module); skipping S4U2Proxy");
+        return;
+    }
+    let p = |n: &str| Principal::parse_in_realm(n, &realm).unwrap();
+    let kdc = KdcClient::new(realm.clone(), e.client.kdcs().to_vec()).with_forwardable(true);
+    let keytab = e.keytab("s4u.keytab");
+    let krbtgt = keytab_key(&keytab, &format!("krbtgt/{realm}"), 18);
+
+    for (service, target, transited) in [
+        ("proxy", "target", "proxy"),
+        ("impersonator", "rb", "impersonator"),
+    ] {
+        let tgt = kdc.login_with_keytab(&p(service), &keytab).unwrap();
+        let evidence = kdc.s4u2self(&tgt, &p("user")).unwrap();
+        assert_eq!(
+            (evidence.client.clone(), evidence.server.clone()),
+            (p("user"), p(service))
+        );
+        let creds = kdc
+            .s4u2proxy(&tgt, &evidence, &Principal::new(1, [target], ""))
+            .unwrap();
+        assert_eq!(
+            (creds.client.clone(), creds.server.clone()),
+            (p("user"), p(target))
+        );
+
+        let (_, token) = InitiatorContext::new(&creds, GSS_C_MUTUAL_FLAG).unwrap();
+        let (ctx, _) = KerberosContext::accept_token(&keytab, &token).unwrap();
+        assert_eq!(ctx.client_principal, format!("user@{realm}"));
+        let pac = ctx.pac.expect("a verified PAC");
+        let di = pac.delegation_info().unwrap().expect("delegation info");
+        assert_eq!(di.proxy_target, target);
+        assert_eq!(di.transited_services, [format!("{transited}@{realm}")]);
+        let all =
+            krb5::pac::verify_ticket(&creds.ticket, &keytab_key(&keytab, target, 18), &krbtgt)
+                .unwrap()
+                .unwrap();
+        assert_eq!(all, pac);
+        assert!(
+            krb5::pac::verify_ticket(
+                &creds.ticket,
+                &keytab_key(&keytab, target, 18),
+                &keytab_key(&keytab, "rb", 18)
+            )
+            .is_err()
+        );
+    }
+
+    // Outside the rules: proxy may not reach rb, impersonator not target.
+    for (service, target) in [("proxy", "rb"), ("impersonator", "target")] {
+        let tgt = kdc.login_with_keytab(&p(service), &keytab).unwrap();
+        let evidence = kdc.s4u2self(&tgt, &p("user")).unwrap();
+        let err = kdc
+            .s4u2proxy(&tgt, &evidence, &Principal::new(1, [target], ""))
+            .unwrap_err();
+        assert!(err.kdc_code().is_some(), "{service} -> {target}: {err}");
+    }
+    // Delegation targets without protocol transition: the S4U2Self ticket
+    // is not forwardable, so it is no evidence for traditional S4U2Proxy.
+    let tgt = kdc.login_with_keytab(&p("constrained"), &keytab).unwrap();
+    let evidence = kdc.s4u2self(&tgt, &p("user")).unwrap();
+    assert_eq!(evidence.flags & FORWARDABLE, 0);
+    assert!(
+        kdc.s4u2proxy(&tgt, &evidence, &Principal::new(1, ["target"], ""))
+            .is_err()
+    );
+    // A user who may not be delegated: no forwardable evidence, no proxy.
+    let tgt = kdc.login_with_keytab(&p("proxy"), &keytab).unwrap();
+    let evidence = kdc.s4u2self(&tgt, &p("sensitive")).unwrap();
+    assert_eq!(evidence.flags & FORWARDABLE, 0);
+    assert!(
+        kdc.s4u2proxy(&tgt, &evidence, &Principal::new(1, ["target"], ""))
+            .is_err()
+    );
+}
+
+/// The PAC MIT's KDC puts in an ordinary service ticket: verified by our
+/// acceptor, and every KDC signature on it checked with the krbtgt key
+/// (kadmin.local's export of it).
+#[test]
+fn every_signature_on_mits_pac_verifies() {
+    let e = live!();
+    let svc = alice_ticket_for_host(&e);
+    let (_, token) = InitiatorContext::new(&svc, GSS_C_MUTUAL_FLAG).unwrap();
+    let (ctx, _) = KerberosContext::accept_token(&e.keytab("service.keytab"), &token).unwrap();
+    let Some(pac) = ctx.pac else {
+        eprintln!("no PAC (MIT before 1.20); skipping");
+        return;
+    };
+    pac.verify_client(svc.authtime, &e.p("alice"), false)
+        .unwrap();
+    let krbtgt = keytab_key(
+        &e.keytab("krbtgt.keytab"),
+        &format!("krbtgt/{}", e.realm),
+        18,
+    );
+    let service_key = keytab_key(
+        &e.keytab("service.keytab"),
+        "host/svc.krb5.test",
+        svc.ticket_enctype,
+    );
+    let all = krb5::pac::verify_ticket(&svc.ticket, &service_key, &krbtgt)
+        .unwrap()
+        .unwrap();
+    assert_eq!(all, pac);
+}
+
 // ------------------------------------------------------------------ FAST
 
 /// An armor TGT, as a host would hold one from its keytab.

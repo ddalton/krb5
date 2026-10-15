@@ -13,7 +13,10 @@
 //!   keytab, including PA-ENC-TIMESTAMP pre-authentication) and the TGS
 //!   exchange (service tickets, across realms by referral and
 //!   `[capaths]`), over UDP and TCP as MIT chooses between them; ticket
-//!   renewal and postdated tickets (`kinit -R`, `-s`, `-v`).
+//!   renewal and postdated tickets (`kinit -R`, `-s`, `-v`); S4U2Self and
+//!   S4U2Proxy ([`KdcClient::s4u2self`], [`KdcClient::s4u2proxy`]):
+//!   protocol transition and constrained delegation, traditional and
+//!   resource-based.
 //! * `pkinit` (with the `pkinit` feature) — PKINIT: login with an X.509
 //!   certificate (`kinit -X`), anonymous PKINIT (`kinit -n`), and FAST
 //!   armor from it (`auto_fast_armor`), in pure Rust.
@@ -30,6 +33,11 @@
 //!   from URI and SRV records when `krb5.conf` lists none.
 //! * [`InitiatorContext`] — `gss_init_sec_context`: the AP-REQ token and
 //!   verification of the acceptor's AP-REP.
+//!
+//! **Authorization**: [`pac`] — the MS-PAC in tickets from Active
+//! Directory and MIT: the client's SIDs and groups, UPN, delegation path,
+//! and its signatures; the acceptor keeps a ticket's PAC once its server
+//! signature and client info verify.
 //!
 //! **Both**: [`token::PerMessageTokens`] — RFC 4121 §4.2 Wrap and MIC;
 //! [`spnego`] — RFC 4178 SPNEGO, initiator and acceptor (HTTP
@@ -105,8 +113,9 @@ pub mod kadmin; // kadmind's kadm5 RPC protocol: what kadmin does
 pub mod kdf; // RFC 3961 §5.1 DR/DK, RFC 3962 §4, RFC 8009 §3
 pub mod key;
 pub mod kpasswd; // password changes over the kpasswd protocol (RFC 3244)
-mod md5; // RFC 1321, for channel bindings only
+mod md5; // RFC 1321 and HMAC-MD5: channel bindings, PAC signatures, MS-SFU
 pub mod nfold; // RFC 3961 §5.1 n-fold
+pub mod pac; // MS-PAC: the authorization data Windows and MIT put in tickets
 #[cfg(feature = "pkinit")]
 pub mod pkinit; // RFC 4556 PKINIT, RFC 8062 anonymous PKINIT
 pub mod profile; // RFC 3961 §5.3 simplified profile (confounder + HMAC)
