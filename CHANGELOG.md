@@ -7,6 +7,8 @@ may break the API).
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-15
+
 ### Added
 
 - S4U (MS-SFU). `KdcClient::s4u2self` gets a ticket to the service in a
@@ -27,13 +29,20 @@ may break the API).
   - The server, KDC and full signatures are verified, with HMAC-MD5 under
     any key, as for RC4, or AES. `verify_ticket_signature` and
     `verify_ticket` check a ticket the way MIT's `krb5_kdc_verify_ticket`
-    does, re-encoding the ticket for its ticket signature.
+    does, re-encoding the ticket for its ticket signature. Like MIT 1.21,
+    a service ticket's PAC must carry the full signature, which KDCs
+    before MIT 1.21 and Windows' November 2022 update don't add.
   - Tested against PACs from Windows Server 2003, 2008, 2019 and 2022
     (MIT's `t_pac.c` and `t_ndr.c` fixtures, with impacket's decoding as
     the reference) and from MIT's KDC.
 - `KerberosContext::pac`: the ticket's PAC. As in MIT's acceptor, it is
   kept only when its server signature and client info verify. One that
   fails is dropped, and authentication still succeeds.
+
+### Changed
+
+- Breaking: `KerberosContext` has a new public field, `pac`, so code that
+  builds one with a struct literal must set it.
 
 ### Fixed
 
@@ -465,7 +474,8 @@ Initial release: the GSS-API acceptor extracted from
 - RFC 3961 n-fold and DR/DK, RFC 3962 and RFC 8009 AES enctypes.
 - RFC 4121 Wrap and MIC tokens.
 
-[Unreleased]: https://github.com/ddalton/krb5/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/ddalton/krb5/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/ddalton/krb5/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/ddalton/krb5/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/ddalton/krb5/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/ddalton/krb5/compare/v0.7.1...v0.8.0
