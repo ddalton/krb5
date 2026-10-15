@@ -12,7 +12,8 @@
 //! * [`KdcClient`] — the AS exchange (`kinit`, with a password or a
 //!   keytab, including PA-ENC-TIMESTAMP pre-authentication) and the TGS
 //!   exchange (service tickets, across realms by referral and
-//!   `[capaths]`), over UDP and TCP as MIT chooses between them.
+//!   `[capaths]`), over UDP and TCP as MIT chooses between them; ticket
+//!   renewal and postdated tickets (`kinit -R`, `-s`, `-v`).
 //! * `pkinit` (with the `pkinit` feature) — PKINIT: login with an X.509
 //!   certificate (`kinit -X`), anonymous PKINIT (`kinit -n`), and FAST
 //!   armor from it (`auto_fast_armor`), in pure Rust.

@@ -298,6 +298,22 @@ impl Credentials {
     pub fn is_expired_at(&self, now: i64) -> bool {
         now >= self.endtime
     }
+
+    /// True if the KDC would renew this ticket at `now` (Unix seconds):
+    /// it is renewable, not yet expired, and `now` is within its renewable
+    /// life. (The KDC allows its clock skew besides.)
+    pub fn can_renew_at(&self, now: i64) -> bool {
+        self.flags & TKT_FLG_RENEWABLE != 0
+            && !self.is_expired_at(now)
+            && self.renew_till.is_some_and(|r| now <= r)
+    }
+
+    /// True for a postdated ticket not yet validated (the `invalid` flag):
+    /// no service accepts it until [`KdcClient::validate`] has made it
+    /// valid, after its start time.
+    pub fn is_invalid(&self) -> bool {
+        self.flags & TKT_FLG_INVALID != 0
+    }
 }
 
 /// RFC 6806 §11 PA-REQ-ENC-PA-REP: sent empty, returned in the encrypted
@@ -368,6 +384,14 @@ const TKT_FLG_OK_AS_DELEGATE: u32 = 1 << 18;
 const KDC_OPT_FORWARDABLE: u32 = 1 << 30;
 const KDC_OPT_PROXIABLE: u32 = 1 << 28;
 const KDC_OPT_RENEWABLE: u32 = 1 << 23;
+const KDC_OPT_ALLOW_POSTDATE: u32 = 1 << 26;
+const KDC_OPT_POSTDATED: u32 = 1 << 25;
+/// Bits 30 and 31: renew or validate the ticket in the TGS request.
+const KDC_OPT_RENEW: u32 = 1 << 1;
+const KDC_OPT_VALIDATE: u32 = 1 << 0;
+/// TicketFlags renewable (bit 8) and invalid (bit 7).
+const TKT_FLG_RENEWABLE: u32 = 1 << 23;
+const TKT_FLG_INVALID: u32 = 1 << 24;
 /// Bit 2, not 4 (which is `proxy`).
 const KDC_OPT_FORWARDED: u32 = 1 << 29;
 /// MIT's KDC_TKT_COMMON_MASK: the ticket flags a TGS request asks for again.
@@ -474,6 +498,44 @@ struct PkState {
     group: pkinit::DhGroup,
 }
 
+/// The times a KDC request asks for (KDC-REQ-BODY from, till, rtime).
+struct ReqTimes {
+    from: Option<i64>,
+    till: i64,
+    rtime: Option<i64>,
+}
+
+impl ReqTimes {
+    /// MIT's `verify_as_reply`: a postdated ticket starts when asked, and
+    /// no ticket outlives the times asked for.
+    fn check_as_reply(&self, creds: &Credentials, kdc_options: u32) -> Result<()> {
+        let modified = |what: &str| {
+            protocol(format!(
+                "the KDC's {what} is not what we asked for (KRB5_KDCREP_MODIFIED)"
+            ))
+        };
+        if kdc_options & KDC_OPT_POSTDATED != 0
+            && self.from.is_some()
+            && creds.starttime.or(Some(creds.authtime)) != self.from
+        {
+            return modified("start time");
+        }
+        if creds.endtime > self.till {
+            return modified("end time");
+        }
+        if let (true, Some(rtime), Some(r)) = (
+            kdc_options & KDC_OPT_RENEWABLE != 0,
+            self.rtime,
+            creds.renew_till,
+        ) {
+            if r > rtime {
+                return modified("renewable end time");
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Salt information from ETYPE-INFO2 / ETYPE-INFO / PW-SALT.
 #[derive(Debug, Clone)]
 struct SaltInfo {
@@ -499,6 +561,8 @@ pub struct KdcClient {
     tgs_enctypes: Vec<i32>,
     lifetime: Duration,
     renew_lifetime: Option<Duration>,
+    /// Postdate initial tickets to start this long after the request.
+    start_time: Option<Duration>,
     forwardable: bool,
     proxiable: bool,
     /// For locating other realms' KDCs.
@@ -533,6 +597,7 @@ impl KdcClient {
             tgs_enctypes: DEFAULT_ENCTYPES.to_vec(),
             lifetime: Duration::from_secs(24 * 3600),
             renew_lifetime: None,
+            start_time: None,
             forwardable: false,
             proxiable: false,
             conf: Krb5Conf::empty(),
@@ -679,6 +744,9 @@ impl KdcClient {
         if self.renew_lifetime.is_some() {
             o |= KDC_OPT_RENEWABLE;
         }
+        if self.start_time.is_some() {
+            o |= KDC_OPT_ALLOW_POSTDATE | KDC_OPT_POSTDATED;
+        }
         o
     }
 
@@ -726,6 +794,15 @@ impl KdcClient {
     /// `None`, the default, asks for none).
     pub fn with_renew_lifetime(mut self, renew: Option<Duration>) -> Self {
         self.renew_lifetime = renew.filter(|d| !d.is_zero());
+        self
+    }
+
+    /// Postdate initial tickets (`kinit -s`): they start `delay` after the
+    /// request and are issued invalid, to be made valid with
+    /// [`KdcClient::validate`] (`kinit -v`) once that time has come. `None`,
+    /// the default, asks for a ticket valid now.
+    pub fn with_start_time(mut self, delay: Option<Duration>) -> Self {
+        self.start_time = delay.filter(|d| !d.is_zero());
         self
     }
 
@@ -1061,17 +1138,89 @@ impl KdcClient {
         self.tgs(tgt, &me, KDC_OPT_FORWARDED)
     }
 
+    /// `creds` renewed (`kinit -R`, MIT's `krb5_get_renewed_creds`): a TGS
+    /// request presenting the ticket itself with the RENEW option, to the
+    /// KDC of the realm of its server. The new ticket has the old one's
+    /// lifetime from now, cut at its renew-till, and keeps its flags and
+    /// renew-till; its session key is new.
+    ///
+    /// Any ticket can be renewed this way, a TGT or a service ticket, but
+    /// only before it expires and within its renewable life (see
+    /// [`Credentials::can_renew_at`]); the KDC says no otherwise, with
+    /// `KDC_ERR_BADOPTION` for a ticket that is not renewable and
+    /// `KRB_AP_ERR_TKT_EXPIRED` for one past its end.
+    pub fn renew(&self, creds: &Credentials) -> Result<Credentials> {
+        self.tgs_to(&creds.server.realm, creds, &creds.server, KDC_OPT_RENEW)
+    }
+
+    /// `creds`, a postdated ticket, made valid (`kinit -v`, MIT's
+    /// `krb5_get_validated_creds`): a TGS request presenting it with the
+    /// VALIDATE option. The KDC keeps its times and flags, clears
+    /// `invalid`, and refuses (`KRB_AP_ERR_TKT_NYV`) before its start time,
+    /// or (`KDC_ERR_BADOPTION`) a ticket that is valid already.
+    pub fn validate(&self, creds: &Credentials) -> Result<Credentials> {
+        self.tgs_to(&creds.server.realm, creds, &creds.server, KDC_OPT_VALIDATE)
+    }
+
+    /// `kinit -R`: renew the TGT in `cache` (the one for its principal's
+    /// realm) and leave the cache holding only the renewed TGT, as MIT's
+    /// `kinit` does.
+    pub fn kinit_renew(&self, cache: &CacheName) -> Result<Credentials> {
+        self.kinit_again(cache, KDC_OPT_RENEW)
+    }
+
+    /// `kinit -v`: as [`KdcClient::kinit_renew`], validating a postdated
+    /// TGT instead.
+    pub fn kinit_validate(&self, cache: &CacheName) -> Result<Credentials> {
+        self.kinit_again(cache, KDC_OPT_VALIDATE)
+    }
+
+    fn kinit_again(&self, cache: &CacheName, kdc_option: u32) -> Result<Credentials> {
+        let cache = cache.resolved()?;
+        let cc = cache.read()?;
+        // MIT asks the cache for the TGT by name alone, not for one valid
+        // now: an expired or postdated TGT goes to the KDC, which decides.
+        let krbtgt = Principal::krbtgt(&cc.principal.realm);
+        let old = cc
+            .credentials()
+            .filter(|c| {
+                same_principal(&c.client, &cc.principal) && same_principal(&c.server, &krbtgt)
+            })
+            .max_by_key(|c| c.endtime)
+            .ok_or_else(|| ClientError::NoTgt {
+                principal: cc.principal.to_string(),
+                cache: cache.to_string(),
+            })?;
+        let new = self.tgs_to(&krbtgt.realm, &old, &krbtgt, kdc_option)?;
+        let mut fresh = CCache::new(cc.principal.clone());
+        fresh.store(&new);
+        cache.write(&fresh)?;
+        Ok(new)
+    }
+
     /// One TGS exchange with the KDC of the realm `tgt` is for: a ticket
     /// for `server` (whose realm is the request realm), checked as MIT's
     /// `krb5int_process_tgs_reply` checks it.
     fn tgs(&self, tgt: &Credentials, server: &Principal, kdc_options: u32) -> Result<Credentials> {
-        let kdc = self.for_realm(tgt_realm(tgt))?;
+        self.tgs_to(tgt_realm(tgt), tgt, server, kdc_options)
+    }
+
+    /// [`KdcClient::tgs`] to the KDC of `realm`.
+    fn tgs_to(
+        &self,
+        realm: &str,
+        tgt: &Credentials,
+        server: &Principal,
+        kdc_options: u32,
+    ) -> Result<Credentials> {
+        let kdc = self.for_realm(realm)?;
         let (now, usec) = now();
         let nonce = random_nonce();
         // MIT's FLAGS2OPTS: the TGT's forwardable, proxiable, may-postdate
         // and renewable flags carry over as options (KDC_TKT_COMMON_MASK).
         let kdc_options = kdc_options | (tgt.flags & KDC_TKT_COMMON_MASK);
-        let body = kdc.req_body_with(None, server, nonce, now, &kdc.tgs_enctypes, kdc_options);
+        let times = kdc.tgs_times(now);
+        let body = kdc.req_body_with(None, server, nonce, &times, &kdc.tgs_enctypes, kdc_options);
 
         // With FAST, a subkey in the authenticator: it keys the implicit
         // armor and the reply (MIT send_tgs.c always does this).
@@ -1165,7 +1314,9 @@ impl KdcClient {
         }
         // A foreign realm's ok-as-delegate counts only if every TGT on the
         // way had it (MIT gc_via_tkt.c).
-        let local = tgt.server.realm == tgt.client.realm && tgt_realm(tgt) == tgt.client.realm;
+        let local = is_tgs(&tgt.server)
+            && tgt.server.realm == tgt.client.realm
+            && tgt_realm(tgt) == tgt.client.realm;
         if !local && tgt.flags & TKT_FLG_OK_AS_DELEGATE == 0 {
             creds.flags &= !TKT_FLG_OK_AS_DELEGATE;
         }
@@ -1210,6 +1361,7 @@ impl KdcClient {
                     .clone()
                     .with_lifetime(Duration::from_secs(3600))
                     .with_renew_lifetime(None)
+                    .with_start_time(None)
                     .anonymous(&client.realm)?
                     .0;
                 return self
@@ -1246,8 +1398,9 @@ impl KdcClient {
             }
             let (now, usec) = now();
             let nonce = random_nonce();
+            let times = self.as_times(now);
             let body =
-                self.req_body_with(Some(client), &krbtgt, nonce, now, &enctypes, kdc_options);
+                self.req_body_with(Some(client), &krbtgt, nonce, &times, &enctypes, kdc_options);
             let mut padata = preauth.clone();
             #[cfg(feature = "pkinit")]
             if let Secret::Pkinit(identity) = &secret {
@@ -1520,6 +1673,7 @@ impl KdcClient {
                 rep.client = client;
             }
             let creds = rep.into_credentials(&plain, nonce)?;
+            times.check_as_reply(&creds, kdc_options)?;
             #[cfg(feature = "pkinit")]
             if anonymous {
                 pkinit::verify_anonymous(&kx, &long_term, &creds.session_key)?;
@@ -1546,7 +1700,33 @@ impl KdcClient {
         nonce: u32,
         now: i64,
     ) -> Vec<u8> {
-        self.req_body_with(cname, sname, nonce, now, &self.tkt_enctypes, 0)
+        let times = self.as_times(now);
+        self.req_body_with(cname, sname, nonce, &times, &self.tkt_enctypes, 0)
+    }
+
+    /// The times an AS request asks for, as MIT's `set_request_times`
+    /// sets them: from `now` or the postdated start, and a renewable life
+    /// no shorter than the lifetime.
+    fn as_times(&self, now: i64) -> ReqTimes {
+        let from = now + self.start_time.map_or(0, |d| d.as_secs() as i64);
+        let till = from + self.lifetime.as_secs() as i64;
+        ReqTimes {
+            from: self.start_time.map(|_| from),
+            till,
+            rtime: self
+                .renew_lifetime
+                .map(|r| (from + r.as_secs() as i64).max(till)),
+        }
+    }
+
+    /// The times a TGS request asks for: a lifetime from now, and no
+    /// rtime (the KDC renews up to the TGT's own renew-till, as MIT does).
+    fn tgs_times(&self, now: i64) -> ReqTimes {
+        ReqTimes {
+            from: None,
+            till: now + self.lifetime.as_secs() as i64,
+            rtime: None,
+        }
     }
 
     fn req_body_with(
@@ -1554,7 +1734,7 @@ impl KdcClient {
         cname: Option<&Principal>,
         sname: &Principal,
         nonce: u32,
-        now: i64,
+        times: &ReqTimes,
         enctypes: &[i32],
         kdc_options: u32,
     ) -> Vec<u8> {
@@ -1564,14 +1744,12 @@ impl KdcClient {
         }
         parts.push(der::field(2, der::general_string(&sname.realm)));
         parts.push(der::field(3, sname.encode_name()));
-        parts.push(der::field(
-            5,
-            der::time(now + self.lifetime.as_secs() as i64),
-        ));
-        // rtime, for a renewable AS request (TGS requests leave it to the
-        // KDC, which renews up to the TGT's own renew-till, as MIT does).
-        if let (Some(renew), Some(_)) = (self.renew_lifetime, cname) {
-            parts.push(der::field(6, der::time(now + renew.as_secs() as i64)));
+        if let Some(from) = times.from {
+            parts.push(der::field(4, der::time(from)));
+        }
+        parts.push(der::field(5, der::time(times.till)));
+        if let Some(rtime) = times.rtime {
+            parts.push(der::field(6, der::time(rtime)));
         }
         parts.push(der::field(7, der::int(nonce as i64)));
         parts.push(der::field(
@@ -2152,6 +2330,123 @@ mod tests {
             got.push(et.i32().unwrap());
         }
         assert_eq!(got, DEFAULT_ENCTYPES);
+    }
+
+    #[test]
+    fn request_times_are_mits() {
+        let now = 1_790_000_000;
+        let c = KdcClient::new("R", ["kdc"]).with_lifetime(Duration::from_secs(3600));
+        let t = c.as_times(now);
+        assert_eq!((t.from, t.till, t.rtime), (None, now + 3600, None));
+
+        // Postdated: from, and the lifetime and renewable life counted
+        // from it; a renewable life shorter than the lifetime is raised.
+        let c = c
+            .with_start_time(Some(Duration::from_secs(600)))
+            .with_renew_lifetime(Some(Duration::from_secs(60)));
+        let t = c.as_times(now);
+        assert_eq!(
+            (t.from, t.till, t.rtime),
+            (Some(now + 600), now + 4200, Some(now + 4200))
+        );
+        let o = c.as_options();
+        assert_eq!(
+            o & (KDC_OPT_ALLOW_POSTDATE | KDC_OPT_POSTDATED | KDC_OPT_RENEWABLE),
+            KDC_OPT_ALLOW_POSTDATE | KDC_OPT_POSTDATED | KDC_OPT_RENEWABLE
+        );
+        let alice = Principal::parse("alice@R").unwrap();
+        let body = c.req_body_with(Some(&alice), &Principal::krbtgt("R"), 1, &t, &[18], o);
+        let bf = Fields::parse_tagged("KDC-REQ-BODY", der::SEQUENCE, &body).unwrap();
+        assert_eq!(bf.get(4).unwrap().time().unwrap(), now + 600);
+        assert_eq!(bf.get(5).unwrap().time().unwrap(), now + 4200);
+        assert_eq!(bf.get(6).unwrap().time().unwrap(), now + 4200);
+
+        // A zero start time is none, as `kinit -s 0` is.
+        let c = c.with_start_time(Some(Duration::ZERO));
+        assert_eq!(c.as_options() & KDC_OPT_POSTDATED, 0);
+        assert!(c.as_times(now).from.is_none());
+    }
+
+    #[test]
+    fn an_as_reply_must_keep_to_the_times_asked_for() {
+        let now = 1_790_000_000;
+        let t = ReqTimes {
+            from: Some(now + 600),
+            till: now + 4200,
+            rtime: Some(now + 9000),
+        };
+        let opts = KDC_OPT_POSTDATED | KDC_OPT_RENEWABLE;
+        let creds = |start: Option<i64>, end: i64, renew: Option<i64>| Credentials {
+            client: Principal::parse("alice@R").unwrap(),
+            server: Principal::krbtgt("R"),
+            session_key: Key::new(18, vec![0; 32]).unwrap(),
+            ticket: vec![],
+            ticket_enctype: 18,
+            flags: 0,
+            authtime: now,
+            starttime: start,
+            endtime: end,
+            renew_till: renew,
+        };
+        assert!(
+            t.check_as_reply(&creds(Some(now + 600), now + 4200, Some(now + 9000)), opts)
+                .is_ok()
+        );
+        // The KDC may shorten.
+        assert!(
+            t.check_as_reply(&creds(Some(now + 600), now + 100, Some(now + 200)), opts)
+                .is_ok()
+        );
+        for (bad, what) in [
+            (creds(Some(now + 601), now + 4200, None), "start time"),
+            (creds(None, now + 4200, None), "start time"),
+            (creds(Some(now + 600), now + 4201, None), "end time"),
+            (
+                creds(Some(now + 600), now + 4200, Some(now + 9001)),
+                "renewable end time",
+            ),
+        ] {
+            let e = t.check_as_reply(&bad, opts).unwrap_err().to_string();
+            assert!(e.contains(what) && e.contains("KDCREP_MODIFIED"), "{e}");
+        }
+        // Not postdated, a start time is not compared (the KDC's clock).
+        let now_t = ReqTimes {
+            from: None,
+            till: now + 4200,
+            rtime: None,
+        };
+        assert!(
+            now_t
+                .check_as_reply(&creds(Some(now + 5), now + 4200, None), 0)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn renewability_is_read_from_the_flags_and_times() {
+        let now = 1_790_000_000;
+        let mut c = Credentials {
+            client: Principal::parse("alice@R").unwrap(),
+            server: Principal::krbtgt("R"),
+            session_key: Key::new(18, vec![0; 32]).unwrap(),
+            ticket: vec![],
+            ticket_enctype: 18,
+            flags: TKT_FLG_RENEWABLE,
+            authtime: now,
+            starttime: None,
+            endtime: now + 100,
+            renew_till: Some(now + 1000),
+        };
+        assert!(c.can_renew_at(now));
+        assert!(!c.can_renew_at(now + 100), "expired");
+        c.flags = 0;
+        assert!(!c.can_renew_at(now), "not renewable");
+        c.flags = TKT_FLG_RENEWABLE;
+        c.renew_till = None;
+        assert!(!c.can_renew_at(now), "no renew-till");
+        assert!(!c.is_invalid());
+        c.flags |= TKT_FLG_INVALID;
+        assert!(c.is_invalid());
     }
 
     #[test]

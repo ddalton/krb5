@@ -7,6 +7,34 @@ may break the API).
 
 ## [Unreleased]
 
+### Added
+
+- Ticket renewal and validation. `KdcClient::renew` renews any ticket,
+  a TGT or a service ticket, with a TGS request that presents the ticket
+  itself with the RENEW option, as MIT's `krb5_get_renewed_creds` does.
+  `KdcClient::validate` makes a postdated ticket valid in the same way,
+  with the VALIDATE option. `kinit_renew` (`kinit -R`) and
+  `kinit_validate` (`kinit -v`) do the same for the TGT in a credential
+  cache and leave the cache holding only the new TGT, as MIT's `kinit`
+  does.
+- Postdated tickets: `KdcClient::with_start_time` (`kinit -s`) asks for
+  initial tickets that start later and are issued invalid.
+- `Credentials::can_renew_at` and `Credentials::is_invalid`.
+- AS replies are now checked against the times we asked for, as MIT's
+  `verify_as_reply` checks them. A postdated ticket must start at the time
+  requested, and no ticket may end after `till` or be renewable past
+  `rtime`. Otherwise the reply is rejected as `KRB5_KDCREP_MODIFIED`.
+
+### Changed
+
+- When `renew_lifetime` is shorter than the ticket lifetime, the requested
+  renewable life is raised to match the lifetime, as MIT does.
+
+### Fixed
+
+- A TGS reply that came back for a ticket whose server name has a single
+  component no longer panics in the ok-as-delegate check.
+
 ## [0.8.0] - 2026-10-14
 
 ### Added

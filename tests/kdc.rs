@@ -1359,6 +1359,241 @@ fn an_armor_cache_upgrades_or_starts_armored() {
 
 // ------------------------------------------------------------------ PKINIT
 
+// ------------------------------------------- renewal and postdated tickets
+
+const INVALID: u32 = 1 << 24;
+const POSTDATED: u32 = 1 << 25;
+
+fn renewable(e: &Env) -> KdcClient {
+    e.client
+        .clone()
+        .with_lifetime(std::time::Duration::from_secs(3600))
+        .with_renew_lifetime(Some(std::time::Duration::from_secs(7200)))
+}
+
+/// `kinit -R`'s exchange: the KDC renews the TGT with a new session key,
+/// the old lifetime from now and the old renew-till, and the renewed TGT
+/// gets service tickets. A service ticket renews the same way.
+#[test]
+fn a_renewable_tgt_and_a_service_ticket_are_renewed() {
+    let e = live!();
+    let kdc = renewable(&e);
+    let tgt = kdc.login_with_password(&e.p("alice"), "alicepw").unwrap();
+    assert_eq!(tgt.flags & RENEWABLE, RENEWABLE);
+    let now = tgt.starttime.unwrap_or(tgt.authtime);
+    assert!(tgt.can_renew_at(now));
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    let new = kdc.renew(&tgt).unwrap();
+    assert_eq!(new.server, tgt.server);
+    assert_eq!(new.client, tgt.client);
+    assert_eq!(new.authtime, tgt.authtime, "authtime is the login's");
+    assert_eq!(new.renew_till, tgt.renew_till);
+    assert_eq!(new.flags & RENEWABLE, RENEWABLE);
+    assert_ne!(new.session_key.bytes(), tgt.session_key.bytes());
+    let start = new
+        .starttime
+        .expect("a renewed ticket starts after authtime");
+    assert!(start > now, "{start} > {now}");
+    assert_eq!(new.endtime - start, 3600, "the old lifetime, from now");
+
+    let svc = kdc
+        .service_ticket(&new, &e.p("host/svc.krb5.test"))
+        .unwrap();
+    establish(&e, &svc);
+    assert_eq!(svc.flags & RENEWABLE, RENEWABLE, "inherited from the TGT");
+    let svc2 = kdc.renew(&svc).unwrap();
+    assert_eq!(svc2.server, svc.server);
+    assert_ne!(svc2.session_key.bytes(), svc.session_key.bytes());
+    establish(&e, &svc2);
+}
+
+/// Near the end of the renewable life, the renewed ticket ends there.
+#[test]
+fn a_renewal_stops_at_renew_till() {
+    let e = live!();
+    let kdc = e
+        .client
+        .clone()
+        .with_lifetime(std::time::Duration::from_secs(3600))
+        .with_renew_lifetime(Some(std::time::Duration::from_secs(3610)));
+    let tgt = kdc.login_with_password(&e.p("alice"), "alicepw").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let new = kdc.renew(&tgt).unwrap();
+    let till = tgt.renew_till.unwrap();
+    assert!(new.endtime <= till && new.endtime > tgt.endtime, "{new:?}");
+}
+
+/// A ticket that is not renewable is refused (KDC_ERR_BADOPTION).
+#[test]
+fn a_ticket_that_is_not_renewable_is_refused() {
+    let e = live!();
+    let tgt = e
+        .client
+        .login_with_password(&e.p("alice"), "alicepw")
+        .unwrap();
+    assert_eq!(tgt.flags & RENEWABLE, 0);
+    assert!(!tgt.can_renew_at(tgt.authtime));
+    let err = e.client.renew(&tgt).unwrap_err();
+    assert_eq!(err.kdc_code(), Some(13), "KDC_ERR_BADOPTION: {err}");
+}
+
+/// `kinit -s`: a postdated TGT is issued invalid; the KDC will not
+/// validate it early (KRB_AP_ERR_TKT_NYV) nor use it for a service
+/// ticket, and after its start time `validate` makes it work.
+#[test]
+fn a_postdated_tgt_is_validated_after_its_start() {
+    let e = live!();
+    let kdc = e
+        .client
+        .clone()
+        .with_start_time(Some(std::time::Duration::from_secs(2)));
+    let tgt = kdc.login_with_password(&e.p("alice"), "alicepw").unwrap();
+    assert!(tgt.is_invalid());
+    assert_eq!(tgt.flags & (INVALID | POSTDATED), INVALID | POSTDATED);
+    let start = tgt.starttime.expect("postdated");
+    assert!(start > tgt.authtime);
+
+    let err = kdc.validate(&tgt).unwrap_err();
+    assert_eq!(err.kdc_code(), Some(33), "KRB_AP_ERR_TKT_NYV: {err}");
+    let err = kdc
+        .service_ticket(&tgt, &e.p("host/svc.krb5.test"))
+        .unwrap_err();
+    assert!(err.kdc_code().is_some(), "an invalid TGT is refused: {err}");
+    // Validating a ticket that is valid already is a bad option.
+    let plain = e
+        .client
+        .login_with_password(&e.p("alice"), "alicepw")
+        .unwrap();
+    let err = e.client.validate(&plain).unwrap_err();
+    assert_eq!(err.kdc_code(), Some(13), "KDC_ERR_BADOPTION: {err}");
+
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    let valid = kdc.validate(&tgt).unwrap();
+    assert!(!valid.is_invalid());
+    assert_eq!(valid.flags & POSTDATED, POSTDATED);
+    assert_eq!(
+        (valid.starttime, valid.endtime),
+        (tgt.starttime, tgt.endtime),
+        "validation keeps the times"
+    );
+    let svc = kdc
+        .service_ticket(&valid, &e.p("host/svc.krb5.test"))
+        .unwrap();
+    establish(&e, &svc);
+}
+
+/// `kinit -R` both ways: MIT's renews a cache we wrote, ours renews one
+/// MIT's `kinit -r` wrote, and either way the cache is left holding only
+/// the renewed TGT, which MIT's `kvno` then uses.
+#[test]
+fn kinit_renew_shares_caches_with_mit() {
+    let e = live!();
+    let path = scratch(&e, "renew");
+    let name = format!("FILE:{}", path.display());
+    let cache = krb5::CacheName::parse(&name).unwrap();
+    let kdc = renewable(&e);
+
+    // Ours, with a service ticket beside the TGT, renewed by MIT.
+    let tgt = kdc
+        .kinit_with_password(&e.p("alice"), "alicepw", &cache)
+        .unwrap();
+    kdc.service_ticket_cached(&cache, &e.p("host/svc.krb5.test"))
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    if mit(&e, &name, "kinit", &["-R"], None).is_none() {
+        eprintln!("MIT's krb5 tools not on PATH; skipping");
+        return;
+    }
+    let cc = krb5::CCache::read(&path).unwrap();
+    let all: Vec<_> = cc.credentials().collect();
+    assert_eq!(all.len(), 1, "only the renewed TGT: {all:?}");
+    assert_eq!(all[0].server, tgt.server);
+    assert_ne!(all[0].session_key.bytes(), tgt.session_key.bytes());
+    assert_eq!(all[0].renew_till, tgt.renew_till);
+
+    // MIT's, renewed by us.
+    let _ = std::fs::remove_file(&path);
+    mit(
+        &e,
+        &name,
+        "kinit",
+        &["-r", "2h", "-l", "1h", "alice"],
+        Some("alicepw\n"),
+    )
+    .unwrap();
+    mit(&e, &name, "kvno", &["host/svc.krb5.test"], None).unwrap();
+    let before = krb5::CCache::read(&path).unwrap().tgt(0).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let renewed = e.client.kinit_renew(&cache).unwrap();
+    assert_ne!(renewed.session_key.bytes(), before.session_key.bytes());
+    assert_eq!(renewed.renew_till, before.renew_till);
+    let listed = mit(&e, &name, "klist", &[], None).unwrap();
+    assert!(!listed.contains("host/svc.krb5.test"), "{listed}");
+    assert!(
+        listed.contains(&format!("krbtgt/{0}@{0}", e.realm)),
+        "{listed}"
+    );
+    mit(&e, &name, "kvno", &["host/svc.krb5.test"], None).unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// `kinit -v` both ways, on caches holding a TGT postdated by `kinit -s`.
+#[test]
+fn kinit_validate_shares_caches_with_mit() {
+    let e = live!();
+    let path = scratch(&e, "validate");
+    let name = format!("FILE:{}", path.display());
+    let cache = krb5::CacheName::parse(&name).unwrap();
+    if mit(
+        &e,
+        &name,
+        "kinit",
+        &["-s", "2s", "alice"],
+        Some("alicepw\n"),
+    )
+    .is_none()
+    {
+        eprintln!("MIT's krb5 tools not on PATH; skipping");
+        return;
+    }
+    let tgt = krb5::CCache::read(&path).unwrap().tgt(0).unwrap();
+    assert!(tgt.is_invalid());
+    let err = e.client.kinit_validate(&cache).unwrap_err();
+    assert_eq!(err.kdc_code(), Some(33), "KRB_AP_ERR_TKT_NYV: {err}");
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    let valid = e.client.kinit_validate(&cache).unwrap();
+    assert!(!valid.is_invalid());
+    mit(&e, &name, "kvno", &["host/svc.krb5.test"], None).unwrap();
+
+    // Ours postdated, validated by MIT.
+    let _ = std::fs::remove_file(&path);
+    let kdc = e
+        .client
+        .clone()
+        .with_start_time(Some(std::time::Duration::from_secs(2)));
+    kdc.kinit_with_password(&e.p("alice"), "alicepw", &cache)
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    mit(&e, &name, "kinit", &["-v"], None).unwrap();
+    let cc = krb5::CCache::read(&path).unwrap();
+    assert!(!cc.tgt(0).unwrap().is_invalid());
+    mit(&e, &name, "kvno", &["host/svc.krb5.test"], None).unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A cache with no TGT for its principal's realm is reported as such.
+#[test]
+fn kinit_renew_needs_a_tgt_in_the_cache() {
+    let e = live!();
+    let path = scratch(&e, "renew-none");
+    let cache = krb5::CacheName::parse(&format!("FILE:{}", path.display())).unwrap();
+    krb5::CCache::new(e.p("alice")).write(&path).unwrap();
+    let err = e.client.kinit_renew(&cache).unwrap_err();
+    assert!(matches!(err, krb5::ClientError::NoTgt { .. }), "{err}");
+    let _ = std::fs::remove_file(&path);
+}
+
 /// PKINIT against the KDC `scripts/test-kdc.sh` sets up when openssl and
 /// MIT's pkinit plugin are there (`KRB5_TEST_PKINIT=1`): a CA in
 /// `pki/ca.pem`, the KDC's certificate, and one for alice.
