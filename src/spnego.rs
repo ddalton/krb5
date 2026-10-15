@@ -627,5 +627,7 @@ fn is_krb5_token(token: &[u8]) -> bool {
         .is_ok_and(|body| body.starts_with(&KRB5_MECH_OID) || body.starts_with(&MS_KRB5_OID))
 }
 
+#[cfg(any(fuzzing, test))]
+pub mod fuzz;
 #[cfg(test)]
 mod tests;

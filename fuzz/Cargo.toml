@@ -1,0 +1,103 @@
+[package]
+name = "krb5-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+krb5 = { path = "..", features = ["pkinit"] }
+
+# Not part of the crate's workspace.
+[workspace]
+
+[profile.release]
+debug = 1
+
+
+[[bin]]
+name = "acceptor_token"
+path = "fuzz_targets/acceptor_token.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "acceptor_inner"
+path = "fuzz_targets/acceptor_inner.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "keytab"
+path = "fuzz_targets/keytab.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "spnego"
+path = "fuzz_targets/spnego.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pac"
+path = "fuzz_targets/pac.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "kdc_message"
+path = "fuzz_targets/kdc_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "text"
+path = "fuzz_targets/text.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dns"
+path = "fuzz_targets/dns.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "kadmin"
+path = "fuzz_targets/kadmin.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "kpasswd"
+path = "fuzz_targets/kpasswd.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pkinit"
+path = "fuzz_targets/pkinit.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ccache"
+path = "fuzz_targets/ccache.rs"
+test = false
+doc = false
+bench = false

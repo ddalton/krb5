@@ -42,6 +42,25 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo clippy --all-targets --features spake-nist -- -D warnings
       - run: cargo clippy --all-targets --features pkinit -- -D warnings
+  fuzz:
+    # Every fuzz target (fuzz/README.md) for 30 s from the seeds in
+    # testdata/: a target that no longer builds, or a shallow crash. The
+    # crashes found so far are replayed by `cargo test` (testdata/fuzz/).
+    # Pinned, so a nightly regression is a deliberate upgrade.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-05
+      - run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - run: fuzz/seed.py
+      - working-directory: fuzz
+        run: |
+          cargo +nightly-2026-06-05 fuzz build -O
+          for t in $(cargo +nightly-2026-06-05 fuzz list); do
+            cargo +nightly-2026-06-05 fuzz run -O "$t" -- -max_total_time=30 -rss_limit_mb=4096 -max_len=16384
+          done
   live-kdc:
     # The client against a real MIT KDC, and its GSS tokens against MIT's
     # own acceptor. Pinned: it depends on the distro's MIT krb5 and

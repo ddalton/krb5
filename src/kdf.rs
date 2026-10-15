@@ -37,7 +37,7 @@
 
 use aes::{
     Aes128, Aes256,
-    cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray},
+    cipher::{BlockCipherEncrypt, KeyInit},
 };
 use hmac::{Hmac, Mac};
 use pbkdf2::pbkdf2_hmac;
@@ -263,14 +263,13 @@ impl Enctype {
 /// all-zero IV — and that degenerates to a bare ECB block encryption. It is
 /// **not** the §5.3 encrypt function: no confounder, no padding, no HMAC.
 fn aes_encrypt_block(key: &[u8], block: &mut [u8; AES_BLOCK]) -> Result<()> {
-    let b = GenericArray::from_mut_slice(block);
     match key.len() {
         16 => Aes128::new_from_slice(key)
             .expect("length checked")
-            .encrypt_block(b),
+            .encrypt_block(block.into()),
         32 => Aes256::new_from_slice(key)
             .expect("length checked")
-            .encrypt_block(b),
+            .encrypt_block(block.into()),
         n => return Err(KdfError::AesKeyLength(n)),
     }
     Ok(())
@@ -417,8 +416,8 @@ pub fn kdf_hmac_sha2(
                     max: 256,
                 });
             }
-            let mut mac =
-                <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
+            let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key)
+                .expect("HMAC accepts any key length");
             mac.update(&msg);
             Ok(mac.finalize().into_bytes()[..out].to_vec())
         }
@@ -429,8 +428,8 @@ pub fn kdf_hmac_sha2(
                     max: 384,
                 });
             }
-            let mut mac =
-                <Hmac<Sha384> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
+            let mut mac = <Hmac<Sha384> as KeyInit>::new_from_slice(key)
+                .expect("HMAC accepts any key length");
             mac.update(&msg);
             Ok(mac.finalize().into_bytes()[..out].to_vec())
         }

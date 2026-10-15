@@ -704,4 +704,72 @@ pub(crate) mod tests {
         KerberosContext::accept_token_with(&kt, &token, &off).unwrap();
         KerberosContext::accept_token_with(&kt, &token, &off).unwrap();
     }
+
+    /// Not a test: `cargo test --release --lib -- --ignored hot_paths
+    /// --nocapture` prints what the per-request and per-message work
+    /// costs, for each enctype.
+    #[test]
+    #[ignore]
+    fn hot_paths() {
+        use crate::acceptor::AcceptOptions;
+        use std::time::Instant;
+        fn per<T>(n: u32, mut f: impl FnMut() -> T) -> std::time::Duration {
+            for _ in 0..n / 10 {
+                std::hint::black_box(f());
+            }
+            let t = Instant::now();
+            for _ in 0..n {
+                std::hint::black_box(f());
+            }
+            t.elapsed() / n
+        }
+        let opts = AcceptOptions {
+            replay_cache: None,
+            ..Default::default()
+        };
+        for et in [17, 18, 19, 20] {
+            let service = Principal::parse("host/p.example.com@EXAMPLE.COM").unwrap();
+            let key = Key::random(et).unwrap();
+            let creds = mint(&key, &Key::random(et).unwrap(), &service, &service);
+            let kt = keytab_with(&service, &key);
+            let (_, token) = InitiatorContext::new(&creds, GSS_C_MUTUAL_FLAG).unwrap();
+            let init = per(2000, || {
+                InitiatorContext::new(&creds, GSS_C_MUTUAL_FLAG).unwrap()
+            });
+            let accept = per(2000, || {
+                KerberosContext::accept_token_with(&kt, &token, &opts).unwrap()
+            });
+            let rc = AcceptOptions::default();
+            let accept_rc = per(2000, || {
+                let (_, t) = InitiatorContext::new(&creds, GSS_C_MUTUAL_FLAG).unwrap();
+                KerberosContext::accept_token_with(&kt, &t, &rc).unwrap()
+            }) - init;
+            let (ctx, _) = KerberosContext::accept_token_with(&kt, &token, &opts).unwrap();
+            let ta = ctx.per_message_tokens().unwrap();
+            let s2k = per(20, || {
+                let e = crate::kdf::Enctype::from_i32(et).unwrap();
+                crate::kdf::string_to_key(e, b"password", b"EXAMPLE.COMuser", None).unwrap()
+            });
+            let mut line = format!(
+                "etype {et}: init {init:?}  accept {accept:?}  accept+replay-cache {accept_rc:?}  string-to-key {s2k:?}"
+            );
+            for size in [64usize, 1024, 65536] {
+                let msg = vec![0x5Au8; size];
+                let n = if size > 4096 { 200 } else { 5000 };
+                let w = ta.emit_wrap(1, &msg).unwrap();
+                let wrap = per(n, || ta.emit_wrap(1, &msg).unwrap());
+                let ti = PerMessageTokens::new(
+                    crate::token::ContextKey::new(ctx.base_key_enctype as i32, &ctx.base_key)
+                        .unwrap(),
+                    crate::token::Role::Initiator,
+                    false,
+                );
+                let unwrap = per(n, || ti.unwrap(&w).unwrap());
+                let mic = per(n, || ta.emit_mic(1, &msg).unwrap());
+                line +=
+                    &format!("\n    {size:>6} B: wrap {wrap:?}  unwrap {unwrap:?}  mic {mic:?}");
+            }
+            eprintln!("{line}");
+        }
+    }
 }

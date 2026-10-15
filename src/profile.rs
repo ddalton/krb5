@@ -65,7 +65,7 @@
 //! Appendix B *does* pin, as "Next IV") but deliberately do not build a
 //! stateful encrypt API on top of unverifiable ground.
 
-use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit, generic_array::GenericArray};
+use aes::cipher::{Array, BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use sha1::Sha1;
@@ -286,14 +286,14 @@ enum Aes {
 impl Aes {
     fn new(key: &[u8]) -> Result<Self> {
         match key.len() {
-            16 => Ok(Aes::A128(aes::Aes128::new(GenericArray::from_slice(key)))),
-            32 => Ok(Aes::A256(aes::Aes256::new(GenericArray::from_slice(key)))),
+            16 => Ok(Aes::A128(aes::Aes128::new_from_slice(key).expect("16"))),
+            32 => Ok(Aes::A256(aes::Aes256::new_from_slice(key).expect("32"))),
             n => Err(ProfileError::AesKeyLength(n)),
         }
     }
 
     fn encrypt_block(&self, block: &mut [u8; BLOCK_SIZE]) {
-        let ga = GenericArray::from_mut_slice(&mut block[..]);
+        let ga = block.into();
         match self {
             Aes::A128(c) => c.encrypt_block(ga),
             Aes::A256(c) => c.encrypt_block(ga),
@@ -301,10 +301,21 @@ impl Aes {
     }
 
     fn decrypt_block(&self, block: &mut [u8; BLOCK_SIZE]) {
-        let ga = GenericArray::from_mut_slice(&mut block[..]);
+        let ga = block.into();
         match self {
             Aes::A128(c) => c.decrypt_block(ga),
             Aes::A256(c) => c.decrypt_block(ga),
+        }
+    }
+
+    /// Each whole block of `blocks` independently (ECB), several at a time:
+    /// what makes CBC decryption parallel where encryption cannot be.
+    fn decrypt_blocks(&self, blocks: &mut [u8]) {
+        let (blocks, rest) = Array::slice_as_chunks_mut(blocks);
+        debug_assert!(rest.is_empty());
+        match self {
+            Aes::A128(c) => c.decrypt_blocks(blocks),
+            Aes::A256(c) => c.decrypt_blocks(blocks),
         }
     }
 }
@@ -339,22 +350,30 @@ fn xor_into(dst: &mut [u8; BLOCK_SIZE], src: &[u8]) {
 /// `iv` is the cipher state. Kerberos always supplies the initial (all-zero)
 /// state; see the module docs.
 pub fn aes_cts_encrypt(key: &[u8], iv: &[u8; BLOCK_SIZE], plaintext: &[u8]) -> Result<Vec<u8>> {
-    let n = plaintext.len();
+    if plaintext.len() < BLOCK_SIZE {
+        return Err(ProfileError::CtsInputTooShort(plaintext.len()));
+    }
+    let mut out = plaintext.to_vec();
+    cts_encrypt_in_place(&Aes::new(key)?, iv, &mut out)?;
+    Ok(out)
+}
+
+/// [`aes_cts_encrypt`] over `buf`, in place.
+fn cts_encrypt_in_place(cipher: &Aes, iv: &[u8; BLOCK_SIZE], buf: &mut [u8]) -> Result<()> {
+    let n = buf.len();
     if n < BLOCK_SIZE {
         return Err(ProfileError::CtsInputTooShort(n));
     }
-    let cipher = Aes::new(key)?;
 
     // Exactly one block: plain CBC. There is no second block to steal from, so
     // an unconditional "exchange the last two blocks" would index off the
     // front. This is the empty-plaintext case of RFC 8009 (the CTS input is
     // then just the confounder) and it has a published vector.
     if n == BLOCK_SIZE {
-        let mut b = [0u8; BLOCK_SIZE];
-        b.copy_from_slice(plaintext);
-        xor_into(&mut b, iv);
-        cipher.encrypt_block(&mut b);
-        return Ok(b.to_vec());
+        let b: &mut [u8; BLOCK_SIZE] = buf.try_into().expect("one block");
+        xor_into(b, iv);
+        cipher.encrypt_block(b);
+        return Ok(());
     }
 
     let d = match n % BLOCK_SIZE {
@@ -363,30 +382,29 @@ pub fn aes_cts_encrypt(key: &[u8], iv: &[u8; BLOCK_SIZE], plaintext: &[u8]) -> R
     };
     let nb = n.div_ceil(BLOCK_SIZE);
 
-    // Ordinary CBC over the input zero-extended to a whole number of blocks.
-    // The zero extension is internal to this pass: it is never transmitted and
-    // never MACed, and must not be confused with message padding.
-    let mut out = Vec::with_capacity(nb * BLOCK_SIZE);
+    // Ordinary CBC over every block but the last.
     let mut prev = *iv;
-    for i in 0..nb {
-        let mut b = [0u8; BLOCK_SIZE];
-        let start = i * BLOCK_SIZE;
-        let end = std::cmp::min(start + BLOCK_SIZE, n);
-        b[..end - start].copy_from_slice(&plaintext[start..end]);
-        xor_into(&mut b, &prev);
-        cipher.encrypt_block(&mut b);
-        out.extend_from_slice(&b);
-        prev = b;
+    for b in buf[..(nb - 1) * BLOCK_SIZE].chunks_exact_mut(BLOCK_SIZE) {
+        let b: &mut [u8; BLOCK_SIZE] = b.try_into().expect("whole block");
+        xor_into(b, &prev);
+        cipher.encrypt_block(b);
+        prev = *b;
     }
+
+    // The last, zero-extended to a whole block. The zero extension is
+    // internal to this pass: it is never transmitted and never MACed, and
+    // must not be confused with message padding.
+    let mut last = [0u8; BLOCK_SIZE];
+    last[..d].copy_from_slice(&buf[(nb - 1) * BLOCK_SIZE..]);
+    xor_into(&mut last, &prev);
+    cipher.encrypt_block(&mut last);
 
     // Exchange the final two blocks and truncate the (now) last one to d.
     // Result = C_1 .. C_{nb-2} | C_nb | C_{nb-1}[0..d], length exactly n.
-    let mut swapped = Vec::with_capacity(n);
-    swapped.extend_from_slice(&out[..(nb - 2) * BLOCK_SIZE]);
-    swapped.extend_from_slice(&out[(nb - 1) * BLOCK_SIZE..nb * BLOCK_SIZE]);
-    swapped.extend_from_slice(&out[(nb - 2) * BLOCK_SIZE..(nb - 2) * BLOCK_SIZE + d]);
-    debug_assert_eq!(swapped.len(), n);
-    Ok(swapped)
+    // `prev` is C_{nb-1}.
+    buf[(nb - 2) * BLOCK_SIZE..(nb - 1) * BLOCK_SIZE].copy_from_slice(&last);
+    buf[(nb - 1) * BLOCK_SIZE..].copy_from_slice(&prev[..d]);
+    Ok(())
 }
 
 /// Inverse of [`aes_cts_encrypt`].
@@ -395,18 +413,24 @@ pub fn aes_cts_encrypt(key: &[u8], iv: &[u8; BLOCK_SIZE], plaintext: &[u8]) -> R
 /// octets stolen from `C_{n-1}` have to be recovered out of the decryption of
 /// `C_n` before `C_{n-1}` can be decrypted at all.
 pub fn aes_cts_decrypt(key: &[u8], iv: &[u8; BLOCK_SIZE], ciphertext: &[u8]) -> Result<Vec<u8>> {
+    if ciphertext.len() < BLOCK_SIZE {
+        return Err(ProfileError::CtsInputTooShort(ciphertext.len()));
+    }
+    cts_decrypt(&Aes::new(key)?, iv, ciphertext)
+}
+
+fn cts_decrypt(cipher: &Aes, iv: &[u8; BLOCK_SIZE], ciphertext: &[u8]) -> Result<Vec<u8>> {
     let n = ciphertext.len();
     if n < BLOCK_SIZE {
         return Err(ProfileError::CtsInputTooShort(n));
     }
-    let cipher = Aes::new(key)?;
+    let mut out = ciphertext.to_vec();
 
     if n == BLOCK_SIZE {
-        let mut b = [0u8; BLOCK_SIZE];
-        b.copy_from_slice(ciphertext);
-        cipher.decrypt_block(&mut b);
-        xor_into(&mut b, iv);
-        return Ok(b.to_vec());
+        let b: &mut [u8; BLOCK_SIZE] = out.as_mut_slice().try_into().expect("one block");
+        cipher.decrypt_block(b);
+        xor_into(b, iv);
+        return Ok(out);
     }
 
     let d = match n % BLOCK_SIZE {
@@ -415,46 +439,47 @@ pub fn aes_cts_decrypt(key: &[u8], iv: &[u8; BLOCK_SIZE], ciphertext: &[u8]) -> 
     };
     let nb = n.div_ceil(BLOCK_SIZE);
 
-    let mut out = Vec::with_capacity(n);
-    let mut prev = *iv;
-    for i in 0..nb - 2 {
-        let mut b = [0u8; BLOCK_SIZE];
-        b.copy_from_slice(&ciphertext[i * BLOCK_SIZE..(i + 1) * BLOCK_SIZE]);
-        let c_i = b;
-        cipher.decrypt_block(&mut b);
-        xor_into(&mut b, &prev);
-        out.extend_from_slice(&b);
-        prev = c_i;
+    // CBC up to the last two: every block decrypts independently, so all at
+    // once, and then each is XORed with the ciphertext block before it,
+    // which `ciphertext` still holds.
+    let body = (nb - 2) * BLOCK_SIZE;
+    cipher.decrypt_blocks(&mut out[..body]);
+    for (i, b) in out[..body].chunks_exact_mut(BLOCK_SIZE).enumerate() {
+        let prev = match i {
+            0 => &iv[..],
+            _ => &ciphertext[(i - 1) * BLOCK_SIZE..i * BLOCK_SIZE],
+        };
+        for (x, p) in b.iter_mut().zip(prev) {
+            *x ^= p;
+        }
     }
-    // `prev` is now C_{nb-2}, or the IV when nb == 2 — the RFC 2040 errata
-    // clause that RFC 3962 Appendix A makes normative.
+    // C_{nb-2}, or the IV when nb == 2 — the RFC 2040 errata clause that
+    // RFC 3962 Appendix A makes normative.
+    let mut prev = *iv;
+    if nb > 2 {
+        prev.copy_from_slice(&ciphertext[body - BLOCK_SIZE..body]);
+    }
 
     // Positionally: the swapped-in full block sits at nb-2, the truncated one
     // at nb-1.
     let mut z = [0u8; BLOCK_SIZE];
-    z.copy_from_slice(&ciphertext[(nb - 2) * BLOCK_SIZE..(nb - 1) * BLOCK_SIZE]);
+    z.copy_from_slice(&ciphertext[body..body + BLOCK_SIZE]);
     cipher.decrypt_block(&mut z); // z = (P_nb || 0*) XOR C_{nb-1}
-    let tail = &ciphertext[(nb - 1) * BLOCK_SIZE..];
+    let tail = &ciphertext[body + BLOCK_SIZE..];
 
     // Recover the full C_{nb-1}: its first d octets travelled in the clear as
     // `tail`, and the b-d octets that were stolen reappear in z, because the
     // plaintext there was the zero extension.
-    let mut c_nm1 = [0u8; BLOCK_SIZE];
-    c_nm1[..d].copy_from_slice(tail);
-    c_nm1[d..].copy_from_slice(&z[d..]);
-
-    let mut p_last = Vec::with_capacity(d);
-    for i in 0..d {
-        p_last.push(z[i] ^ tail[i]);
-    }
-
-    let mut p_nm1 = c_nm1;
+    let mut p_nm1 = [0u8; BLOCK_SIZE];
+    p_nm1[..d].copy_from_slice(tail);
+    p_nm1[d..].copy_from_slice(&z[d..]);
     cipher.decrypt_block(&mut p_nm1);
     xor_into(&mut p_nm1, &prev);
 
-    out.extend_from_slice(&p_nm1);
-    out.extend_from_slice(&p_last);
-    debug_assert_eq!(out.len(), n);
+    out[body..body + BLOCK_SIZE].copy_from_slice(&p_nm1);
+    for ((o, z), t) in out[body + BLOCK_SIZE..].iter_mut().zip(z).zip(tail) {
+        *o = z ^ t;
+    }
     Ok(out)
 }
 
@@ -492,7 +517,7 @@ fn hmac(hash: Hash, key: &[u8], parts: &[&[u8]]) -> Vec<u8> {
     // already carries.
     macro_rules! run {
         ($d:ty) => {{
-            let mut m = <Hmac<$d> as Mac>::new_from_slice(key)
+            let mut m = <Hmac<$d> as KeyInit>::new_from_slice(key)
                 .expect("HMAC accepts a key of any length by construction");
             for p in parts {
                 m.update(p);
@@ -541,13 +566,13 @@ const ZERO_IV: [u8; BLOCK_SIZE] = [0u8; BLOCK_SIZE];
 /// the enctype, because for enctype 20 a 32-octet Ki is exactly the shape of
 /// a silent bug (SHA-384 emits 48 octets, so truncating to 32 succeeds).
 ///
-/// The confounder is drawn from the OS CSPRNG, fresh per message. It is the
-/// only source of IV unpredictability in the construction (RFC 8009 §8), and
-/// a repeated one leaks plaintext equality.
+/// The confounder is fresh per message, from `rand`'s thread-local CSPRNG
+/// (ChaCha12, seeded and periodically reseeded from the OS), as MIT draws
+/// it from its own Fortuna generator rather than a system call per
+/// message. It is the only source of IV unpredictability in the
+/// construction (RFC 8009 §8), and a repeated one leaks plaintext equality.
 pub fn encrypt(enctype: Enctype, ke: &[u8], ki: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
-    let mut conf = vec![0u8; enctype.confounder_len()];
-    rand::rngs::OsRng.fill_bytes(&mut conf);
-    encrypt_with_confounder(enctype, ke, ki, &conf, plaintext)
+    encrypt_parts(enctype, ke, ki, &[plaintext])
 }
 
 /// The deterministic core of [`encrypt`], with the confounder supplied.
@@ -568,6 +593,25 @@ pub fn encrypt_with_confounder(
     confounder: &[u8],
     plaintext: &[u8],
 ) -> Result<Vec<u8>> {
+    encrypt_parts_with_confounder(enctype, ke, ki, confounder, &[plaintext])
+}
+
+/// [`encrypt`] of the concatenation of `parts`, without making it.
+pub fn encrypt_parts(enctype: Enctype, ke: &[u8], ki: &[u8], parts: &[&[u8]]) -> Result<Vec<u8>> {
+    let mut conf = [0u8; BLOCK_SIZE];
+    let conf = &mut conf[..enctype.confounder_len()];
+    rand::thread_rng().fill_bytes(conf);
+    encrypt_parts_with_confounder(enctype, ke, ki, conf, parts)
+}
+
+/// [`encrypt_with_confounder`] of the concatenation of `parts`.
+pub fn encrypt_parts_with_confounder(
+    enctype: Enctype,
+    ke: &[u8],
+    ki: &[u8],
+    confounder: &[u8],
+    parts: &[&[u8]],
+) -> Result<Vec<u8>> {
     enctype.check_ke(ke)?;
     enctype.check_ki(ki)?;
     if confounder.len() != enctype.confounder_len() {
@@ -577,32 +621,35 @@ pub fn encrypt_with_confounder(
         });
     }
     let h = enctype.checksum_len();
+    let cipher = Aes::new(ke)?;
 
-    // conf | plaintext. No pad: RFC 3962 §6 sets m = 1 octet, and RFC 8009 has
-    // no pad term at all.
-    let mut inner = Vec::with_capacity(confounder.len() + plaintext.len());
-    inner.extend_from_slice(confounder);
-    inner.extend_from_slice(plaintext);
-
-    let c = aes_cts_encrypt(ke, &ZERO_IV, &inner)?;
+    // conf | plaintext, encrypted where it lies, with the tag after it. No
+    // pad: RFC 3962 §6 sets m = 1 octet, and RFC 8009 has no pad term at all.
+    let n = confounder.len() + parts.iter().map(|p| p.len()).sum::<usize>();
+    let mut out = Vec::with_capacity(n + h);
+    out.extend_from_slice(confounder);
+    for p in parts {
+        out.extend_from_slice(p);
+    }
 
     let tag = if enctype.is_rfc8009() {
+        cts_encrypt_in_place(&cipher, &ZERO_IV, &mut out)?;
         // RFC 8009 §5: H = HMAC(Ki, IV | C). Encrypt-then-MAC, and the cipher
         // state is *part of the MAC input*. With the initial state that is 16
         // zero octets in front of C. Dropping them verifies perfectly against
         // yourself and against nobody else.
-        hmac(enctype.hash(), ki, &[&ZERO_IV[..], &c])
+        hmac(enctype.hash(), ki, &[&ZERO_IV[..], &out])
     } else {
         // RFC 3961 §5.3: H1 = HMAC(Ki, conf | plaintext | pad). Over the
         // PLAINTEXT, and no IV. The opposite of the line above; this is why
         // the two families cannot share an integrity path.
-        hmac(enctype.hash(), ki, &[&inner])
+        let tag = hmac(enctype.hash(), ki, &[&out]);
+        cts_encrypt_in_place(&cipher, &ZERO_IV, &mut out)?;
+        tag
     };
 
     // The tag is appended AFTER the ciphertext, in the clear, and is not
     // itself encrypted. [1..h] is 1-based and means the LEADING h octets.
-    let mut out = Vec::with_capacity(c.len() + h);
-    out.extend_from_slice(&c);
     out.extend_from_slice(&tag[..h]);
     Ok(out)
 }
@@ -637,23 +684,25 @@ pub fn decrypt(enctype: Enctype, ke: &[u8], ki: &[u8], ciphertext: &[u8]) -> Res
     let split = ciphertext.len() - h;
     let (c, tag) = ciphertext.split_at(split);
 
-    if enctype.is_rfc8009() {
+    let cipher = Aes::new(ke)?;
+    let mut p1 = if enctype.is_rfc8009() {
         let expect = hmac(enctype.hash(), ki, &[&ZERO_IV[..], c]);
         if !ct_eq(&expect[..h], tag) {
             return Err(ProfileError::IntegrityFailure);
         }
-        let p1 = aes_cts_decrypt(ke, &ZERO_IV, c)?;
-        Ok(p1[c_len..].to_vec())
+        cts_decrypt(&cipher, &ZERO_IV, c)?
     } else {
-        let p1 = aes_cts_decrypt(ke, &ZERO_IV, c)?;
+        let p1 = cts_decrypt(&cipher, &ZERO_IV, c)?;
         // The MAC covers the whole decryption output — confounder included.
         // Verifying over the stripped plaintext is a different MAC.
         let expect = hmac(enctype.hash(), ki, &[&p1]);
         if !ct_eq(&expect[..h], tag) {
             return Err(ProfileError::IntegrityFailure);
         }
-        Ok(p1[c_len..].to_vec())
-    }
+        p1
+    };
+    p1.drain(..c_len);
+    Ok(p1)
 }
 
 // ---------------------------------------------------------------------------
@@ -671,10 +720,16 @@ pub fn decrypt(enctype: Enctype, ke: &[u8], ki: &[u8], ciphertext: &[u8]) -> Res
 /// accompanies (an AP-REQ authenticator is usage 11, its checksum usage 10),
 /// so the caller must not reuse one usage for both.
 pub fn checksum(enctype: Enctype, kc: &[u8], message: &[u8]) -> Result<Vec<u8>> {
+    checksum_parts(enctype, kc, &[message])
+}
+
+/// [`checksum`] of the concatenation of `parts`, without making it.
+pub fn checksum_parts(enctype: Enctype, kc: &[u8], parts: &[&[u8]]) -> Result<Vec<u8>> {
     enctype.check_kc(kc)?;
     let h = enctype.checksum_len();
-    let mac = hmac(enctype.hash(), kc, &[message]);
-    Ok(mac[..h].to_vec())
+    let mut mac = hmac(enctype.hash(), kc, parts);
+    mac.truncate(h);
+    Ok(mac)
 }
 
 /// `verify_mic`: recompute [`checksum`] and compare in constant time.
@@ -1162,6 +1217,21 @@ mod tests {
                 decrypt(Enctype::Aes256CtsHmacSha196, &ke, &ki, &ct).unwrap(),
                 pt
             );
+        }
+    }
+
+    /// Decryption takes the CBC blocks several at a time (8 with AES-NI or
+    /// ARMv8, up to 64 with VAES), encryption one at a time: every length
+    /// through 70 blocks, each tail length, both key sizes. Encryption is
+    /// the side the published vectors pin.
+    #[test]
+    fn cts_decrypts_every_length_across_parallel_batches() {
+        let pt: Vec<u8> = (0..70 * BLOCK_SIZE).map(|i| (i * 7 + 3) as u8).collect();
+        for key in [&[0x11u8; 16][..], &[0x22u8; 32][..]] {
+            for n in BLOCK_SIZE..=pt.len() {
+                let c = aes_cts_encrypt(key, &ZERO_IV, &pt[..n]).unwrap();
+                assert_eq!(aes_cts_decrypt(key, &ZERO_IV, &c).unwrap(), &pt[..n], "{n}");
+            }
         }
     }
 

@@ -433,6 +433,9 @@ fn describe(text: &[u8]) -> String {
     String::from_utf8_lossy(text).into_owned()
 }
 
+#[cfg(any(fuzzing, test))]
+pub mod fuzz;
+
 #[cfg(test)]
 mod tests {
     use super::*;

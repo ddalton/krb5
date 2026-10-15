@@ -15,6 +15,8 @@ use crate::ccache::{CCache, CacheError, CacheName, same_principal};
 use std::collections::HashMap;
 
 mod fast;
+#[cfg(any(fuzzing, test))]
+pub mod fuzz;
 pub(crate) mod krbcred;
 pub mod otp;
 mod s4u;

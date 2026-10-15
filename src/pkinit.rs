@@ -704,6 +704,9 @@ pub(crate) fn verify_anonymous(
     Ok(())
 }
 
+#[cfg(any(fuzzing, test))]
+pub mod fuzz;
+
 #[cfg(test)]
 mod tests {
     use super::*;

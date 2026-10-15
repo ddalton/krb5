@@ -7,6 +7,47 @@ may break the API).
 
 ## [Unreleased]
 
+### Security
+
+- A malformed AP-REQ could panic the acceptor before any decryption: a
+  DER length running past the end of its input was sliced, not refused
+  (and the indefinite form and over-long length fields were not
+  rejected). Any client able to reach a service could take down a
+  process that does not catch panics. Found by fuzzing, as were two
+  lesser panics, each reachable only with a key: a KerberosTime holding
+  a non-ASCII character in a decrypted ticket or authenticator, and the
+  same in an X.509 certificate's validity times (PKINIT).
+
+### Added
+
+- Fuzzing: a libFuzzer target for every parser that reads what a peer
+  sends (the acceptor's tokens and what they decrypt to, SPNEGO, Wrap
+  and MIC tokens, the PAC, KDC replies and errors, FAST, KRB-CRED, OTP
+  and SPAKE challenges, DNS, kadmind's RPC, kpasswd, PKINIT's
+  certificates, CMS, keys and PKCS #12, ccaches, keytabs, krb5.conf),
+  seeded from the recorded MIT traffic in `testdata/`. See
+  `fuzz/README.md`. Crashing inputs are kept in `testdata/fuzz/` and
+  replayed by `cargo test`; CI fuzzes every target briefly on each push.
+
+### Changed
+
+- Faster crypto, through RustCrypto's current `aes`, `sha1`, `sha2`,
+  `hmac` and `pbkdf2` (and, for PKCS #12, `des` and `rc2`), which use the
+  CPU's AES and SHA instructions on ARM as well as x86, chosen at run
+  time; the previous versions ran AES and SHA in software on ARM. Wrap
+  and unwrap now encrypt in place, decrypt CBC blocks several at a time,
+  and copy a message once rather than about seven times, and the
+  confounder comes from the thread-local CSPRNG, not a system call per
+  message, as MIT draws it from its own generator. On an Apple M1, with
+  aes128-cts-hmac-sha1-96: a 64-octet Wrap 3.5 µs to 0.4 µs, 64 KiB
+  1.2 ms to 80 µs (unwrap 1.2 ms to 38 µs), a 64 KiB MIC 69 µs to 29 µs,
+  accepting an AP-REQ about 22 µs to 10 µs, and string-to-key for
+  aes128-cts-hmac-sha256-128 12.5 ms to 2.6 ms. The direct dependency
+  count is unchanged, and seven duplicate crates leave the build.
+- `token::PerMessageCrypto` gains `encrypt_parts` and `get_mic_parts`,
+  provided methods (defaulting to the existing ones), so the token layer
+  can encrypt and checksum a header and a message without joining them.
+
 ## [0.12.0] - 2026-10-15
 
 ### Added

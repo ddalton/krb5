@@ -260,6 +260,27 @@ pub(crate) fn cookie(padata: &[(i32, Vec<u8>)]) -> Option<(i32, Vec<u8>)> {
     padata.iter().find(|(t, _)| *t == PA_FX_COOKIE).cloned()
 }
 
+/// For `fuzz/`: `plain` as the KrbFastResponse of a reply, encrypted in
+/// a known armor key, opened and checked as a real one is.
+#[cfg(any(fuzzing, test))]
+pub(crate) fn fuzz_response(plain: &[u8]) {
+    let Ok(key) = Key::new(18, vec![9; 32]) else {
+        return;
+    };
+    let Ok(cipher) = key.encrypt(KU_FAST_REP, plain) else {
+        return;
+    };
+    let rep = der::seq(&[der::field(0, encode_encrypted_data(18, &cipher))]);
+    let a = Armor { armor: None, key };
+    if let Ok(fr) = a.open(&[(PA_FX_FAST, der::field(0, rep))], 0x0102_0304) {
+        let _ = a.check_finished(&fr, b"ticket");
+        let _ = a.verify_kdc_challenge(
+            &a.key,
+            &fr.padata.first().map(|p| p.1.clone()).unwrap_or_default(),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

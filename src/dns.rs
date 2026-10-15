@@ -569,6 +569,9 @@ fn parse_reply(m: &[u8], id: u16, name: &str, qtype: u16) -> Result<Reply, Rejec
     Ok(Reply::Answer(records))
 }
 
+#[cfg(any(fuzzing, test))]
+pub mod fuzz;
+
 #[cfg(test)]
 mod tests {
     use super::*;

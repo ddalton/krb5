@@ -309,7 +309,7 @@ fn support_message(groups: &[SpakeGroup]) -> Vec<u8> {
 
 /// A SPAKEChallenge: the group, the KDC's public value T, and the second
 /// factor types it accepts.
-struct Challenge {
+pub(super) struct Challenge {
     group: i32,
     pubkey: Vec<u8>,
     factors: Vec<i64>,
@@ -317,7 +317,7 @@ struct Challenge {
 
 /// The PA-SPAKE CHOICE: a challenge, or `None` for the other choices
 /// (support, response, encdata), which a client does not act on.
-fn parse_challenge(value: &[u8]) -> Result<Option<Challenge>> {
+pub(super) fn parse_challenge(value: &[u8]) -> Result<Option<Challenge>> {
     let mut r = Reader::new(value);
     let (tag, content) = r.next()?;
     if tag != der::ctx(1) {

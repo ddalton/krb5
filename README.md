@@ -93,8 +93,12 @@ tickets without shelling out to `kinit`.
   (`GSS_C_CHANNEL_BOUND_FLAG`, `client_aware_channel_bindings`).
 - **Crypto** — RFC 3961 n-fold and DR/DK, RFC 3962
   (`aes128/256-cts-hmac-sha1-96`), RFC 8009
-  (`aes128-cts-hmac-sha256-128`, `aes256-cts-hmac-sha384-192`).
-- **Per-message tokens** — RFC 4121 §4.2 Wrap and MIC.
+  (`aes128-cts-hmac-sha256-128`, `aes256-cts-hmac-sha384-192`), on the
+  CPU's AES and SHA instructions (x86 and ARM, detected at run time).
+- **Per-message tokens** — RFC 4121 §4.2 Wrap and MIC. On an Apple M1,
+  aes128-cts-hmac-sha1-96: a 64-octet Wrap in 0.4 µs, 64 KiB sealed at
+  about 800 MB/s and unsealed at 1.7 GB/s; accepting an AP-REQ about
+  10 µs.
 
 Not implemented: a KDC, `KEYRING:` and `API:`
 caches, and macOS's KCM, which is reached over Mach IPC rather than a
@@ -216,6 +220,11 @@ KRB5_CONFIG=/tmp/krb5test/krb5.conf scripts/mit-acceptor.py /tmp/krb5test target
 ```
 
 CI runs both on every push.
+
+Every parser that reads what a peer sends has a libFuzzer target
+(`fuzz/`, see `fuzz/README.md`); the inputs they have crashed on are
+kept in `testdata/fuzz/` and replayed by `cargo test`, and CI runs each
+target briefly on every push.
 
 ## Origin
 

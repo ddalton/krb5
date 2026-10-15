@@ -131,6 +131,60 @@ pub mod rcache; // replay detection for AP-REQs (RFC 4120 §3.2.3)
 pub mod spnego; // RFC 4178 SPNEGO, for HTTP Negotiate, SMB and Windows
 pub mod token; // RFC 4121 §4.2 per-message Wrap and MIC tokens
 
+/// Entry points for the fuzz targets in `fuzz/`, built only with
+/// `--cfg fuzzing` (as `cargo fuzz` builds): the parsers of everything a
+/// peer sends, including the ones that run only on what decrypts.
+#[cfg(any(fuzzing, test))]
+#[doc(hidden)]
+pub mod fuzz {
+    pub use crate::acceptor::fuzz as acceptor;
+    pub use crate::client::fuzz as client;
+    pub use crate::dns::fuzz as dns;
+    pub use crate::kadmin::fuzz as kadmin;
+    pub use crate::kpasswd::fuzz as kpasswd;
+    #[cfg(feature = "pkinit")]
+    pub use crate::pkinit::fuzz as pkinit;
+    pub use crate::spnego::fuzz as spnego;
+
+    /// Every input the fuzzers have crashed on (`testdata/fuzz/<target>/`),
+    /// through its target again: none may panic.
+    #[cfg(test)]
+    #[test]
+    fn fuzz_regressions() {
+        type Target = fn(&[u8]);
+        let targets: &[(&str, Target)] = &[
+            ("acceptor_token", acceptor::token),
+            ("acceptor_inner", acceptor::inner),
+            ("keytab", acceptor::keytab_file),
+            ("spnego", spnego::tokens),
+            ("pac", spnego::pac),
+            ("kdc_message", client::kdc_message),
+            ("text", client::text),
+            ("dns", dns::reply),
+            ("kadmin", kadmin::reply),
+            ("kpasswd", kpasswd::reply),
+            #[cfg(feature = "pkinit")]
+            ("pkinit", pkinit::input),
+            ("ccache", |d| {
+                let _ = crate::CCache::decode(d);
+            }),
+        ];
+        let mut n = 0;
+        for (target, run) in targets {
+            let dir = format!("{}/testdata/fuzz/{target}", env!("CARGO_MANIFEST_DIR"));
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in entries {
+                let path = e.unwrap().path();
+                run(&std::fs::read(&path).unwrap());
+                n += 1;
+            }
+        }
+        assert!(n > 0, "no regression inputs found");
+    }
+}
+
 #[cfg(test)]
 mod interop; // MIT krb5 interop fixtures — the gate vectors cannot close
 #[cfg(test)]

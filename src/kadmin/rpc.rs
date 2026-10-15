@@ -125,7 +125,7 @@ fn gss_cred(gss_proc: u32, seq: u32, handle: &[u8]) -> Vec<u8> {
 }
 
 /// An accepted reply's verifier and results, after checking the xid.
-fn parse_reply(msg: &[u8], xid: u32) -> Result<(u32, Vec<u8>, Vec<u8>)> {
+pub(super) fn parse_reply(msg: &[u8], xid: u32) -> Result<(u32, Vec<u8>, Vec<u8>)> {
     let mut r = Reader::new(msg);
     if r.u32()? != xid {
         return Err(Error::Protocol("RPC reply to another call".into()));

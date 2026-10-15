@@ -1542,7 +1542,13 @@ fn parse_kerberos_time(data: &[u8]) -> Result<i64> {
 
     debug!("   Parsing KerberosTime: {}", time_str);
 
-    // Expected format: "YYYYMMDDHHMMSSz" (15 characters)
+    // Expected format: "YYYYMMDDHHMMSSz" (15 characters). ASCII, so the
+    // slicing below is on character boundaries.
+    if !time_str.is_ascii() {
+        return Err(KerberosError::ParseError(format!(
+            "GeneralizedTime is not ASCII: {time_str:?}"
+        )));
+    }
     if time_str.len() < 15 {
         return Err(KerberosError::ParseError(format!(
             "GeneralizedTime too short: {} (expected 15 chars)",
@@ -1752,8 +1758,15 @@ fn parse_der_length(data: &[u8]) -> Result<(usize, usize)> {
         // Short form
         Ok((data[0] as usize, 1))
     } else {
-        // Long form
+        // Long form: one to four octets (0x80 alone is BER's indefinite
+        // length, not DER).
         let num_octets = (data[0] & 0x7F) as usize;
+        if num_octets == 0 || num_octets > 4 {
+            return Err(KerberosError::ParseError(format!(
+                "unsupported DER length form {:#04x}",
+                data[0]
+            )));
+        }
         if data.len() < 1 + num_octets {
             return Err(KerberosError::ParseError("Incomplete length".to_string()));
         }
@@ -1774,6 +1787,18 @@ fn parse_der_tag_length(data: &[u8]) -> Result<(u8, usize, usize)> {
 
     let tag = data[0];
     let (length, length_bytes) = parse_der_length(&data[1..])?;
+    // Every caller slices `data[header..header + length]`: a length that
+    // runs past the input is refused here, once, rather than panicking
+    // there (found by fuzzing an AP-REQ).
+    if (1 + length_bytes)
+        .checked_add(length)
+        .is_none_or(|end| end > data.len())
+    {
+        return Err(KerberosError::ParseError(format!(
+            "tag {tag:#04x}: length {length} overruns {} octets",
+            data.len() - 1 - length_bytes
+        )));
+    }
 
     Ok((tag, length, 1 + length_bytes))
 }
@@ -2521,8 +2546,72 @@ impl KerberosContext {
     }
 }
 
+#[cfg(any(fuzzing, test))]
+pub mod fuzz;
+
 #[cfg(test)]
 mod tests {
+    /// Not a test: `cargo test --lib -- --ignored fuzz_seeds` writes the
+    /// decrypted tickets and authenticators of MIT's recorded AP-REQs
+    /// (`testdata/interop*.json`) to `fuzz/corpus/acceptor_inner/`, seeds
+    /// for the parsers that only ever see what decrypts.
+    #[test]
+    #[ignore]
+    fn fuzz_seeds() {
+        use super::*;
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/fuzz/corpus/acceptor_inner");
+        std::fs::create_dir_all(dir).unwrap();
+        let kt = Keytab::load(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/interop.keytab"
+        ))
+        .unwrap();
+        let mut n = 0;
+        for name in ["interop.json", "interop-mutual.json"] {
+            let path = format!("{}/testdata/{name}", env!("CARGO_MANIFEST_DIR"));
+            let fx: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            for v in fx.as_object().unwrap().values() {
+                let hex = v["ap_req"].as_str().unwrap();
+                let token: Vec<u8> = (0..hex.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                    .collect();
+                let (ticket, auth, _) = KerberosContext::parse_ap_req(&token[17..]).unwrap();
+                let sk = kt
+                    .find_key_for(
+                        &ticket.sname.join("/"),
+                        ticket.enc_part.enctype,
+                        ticket.enc_part.kvno,
+                    )
+                    .unwrap();
+                let plain = spec_decrypt(
+                    ticket.enc_part.enctype,
+                    &sk.key,
+                    key_usage::TICKET,
+                    &ticket.enc_part.cipher,
+                )
+                .unwrap();
+                let part = EncTicketPart::parse(&plain).unwrap();
+                let a = spec_decrypt(
+                    part.key.enctype,
+                    &part.key.key,
+                    key_usage::AP_REQ_AUTHENTICATOR,
+                    &auth,
+                )
+                .unwrap();
+                n += 1;
+                std::fs::write(format!("{dir}/ticket-{n}"), [&[0u8][..], &plain].concat()).unwrap();
+                std::fs::write(
+                    format!("{dir}/authenticator-{n}"),
+                    [&[1u8][..], &a].concat(),
+                )
+                .unwrap();
+            }
+        }
+        assert!(n > 0);
+    }
+
     /// A replay is refused for as long as its authenticator could pass
     /// the skew check (until ctime + skew), and not past that.
     #[test]

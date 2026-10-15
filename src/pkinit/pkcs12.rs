@@ -19,7 +19,7 @@ use super::asn1::{self, ReaderExt};
 use super::keys::PrivateKey;
 use super::x509::Cert;
 use crate::der::{self, DerError, Reader};
-use des::cipher::{BlockDecrypt, KeyInit, generic_array::GenericArray};
+use des::cipher::{Array, BlockCipherDecrypt, KeyInit};
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
 use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
@@ -139,7 +139,7 @@ impl Digest12 {
     fn hmac(self, key: &[u8], data: &[u8]) -> Vec<u8> {
         macro_rules! run {
             ($d:ty) => {{
-                let mut m = <Hmac<$d> as Mac>::new_from_slice(key).expect("HMAC takes any key");
+                let mut m = <Hmac<$d> as KeyInit>::new_from_slice(key).expect("HMAC takes any key");
                 m.update(data);
                 m.finalize().into_bytes().to_vec()
             }};
@@ -231,7 +231,7 @@ fn kdf12(d: Digest12, id: u8, password: &[u8], salt: &[u8], rounds: u32, len: us
 }
 
 /// CBC decryption with PKCS #7 padding, for any block cipher.
-fn cbc_decrypt<C: BlockDecrypt>(
+fn cbc_decrypt<C: BlockCipherDecrypt>(
     cipher: &C,
     block: usize,
     iv: &[u8],
@@ -243,7 +243,7 @@ fn cbc_decrypt<C: BlockDecrypt>(
     let mut out = Vec::with_capacity(data.len());
     let mut prev = iv.to_vec();
     for c in data.chunks(block) {
-        let mut b = GenericArray::clone_from_slice(c);
+        let mut b = Array::try_from(c).expect("one block");
         cipher.decrypt_block(&mut b);
         out.extend(b.iter().zip(&prev).map(|(x, p)| x ^ p));
         prev = c.to_vec();
@@ -798,11 +798,11 @@ mod tests {
 
     #[test]
     fn cbc_padding_is_checked_whole() {
-        use des::cipher::BlockEncrypt;
+        use des::cipher::BlockCipherEncrypt;
         let key = aes::Aes128::new_from_slice(&[7; 16]).unwrap();
         let iv = [9u8; 16];
         let enc = |plain: [u8; 16]| {
-            let mut b = GenericArray::clone_from_slice(&plain);
+            let mut b = Array::from(plain);
             for (x, v) in b.iter_mut().zip(iv) {
                 *x ^= v;
             }

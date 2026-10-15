@@ -265,7 +265,10 @@ impl Cert {
 /// (`YYYYMMDDHHMMSSZ`), as RFC 5280 §4.1.2.5 allows them.
 fn read_time(r: &mut Reader<'_>) -> Result<i64> {
     let (tag, c) = r.next()?;
-    let s = std::str::from_utf8(c).map_err(|_| DerError("time is not ASCII".into()))?;
+    let s = std::str::from_utf8(c)
+        .ok()
+        .filter(|s| s.is_ascii())
+        .ok_or_else(|| DerError("time is not ASCII".into()))?;
     let full = match (tag, s.len()) {
         (asn1::UTC_TIME, 13) => {
             let yy: u32 = s[..2].parse().map_err(|_| DerError("bad UTCTime".into()))?;
@@ -379,6 +382,20 @@ pub(crate) mod tests {
             _ => unreachable!(),
         };
         parse_certs(pem.as_bytes()).unwrap().remove(0)
+    }
+
+    /// A 13-octet UTCTime whose second character is not ASCII: refused,
+    /// where slicing out the two-digit year would split the character.
+    #[test]
+    fn a_non_ascii_time_is_refused() {
+        for (tag, t) in [
+            (asn1::UTC_TIME, "1\u{e9}010100000Z"),
+            (der::GENERALIZED_TIME, "20\u{e9}0101000000Z"),
+        ] {
+            let mut d = vec![tag, t.len() as u8];
+            d.extend_from_slice(t.as_bytes());
+            assert!(read_time(&mut Reader::new(&d)).is_err(), "{t}");
+        }
     }
 
     #[test]

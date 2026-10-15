@@ -1203,6 +1203,9 @@ fn with_port(host: &str, port: u16) -> String {
     }
 }
 
+#[cfg(any(fuzzing, test))]
+pub mod fuzz;
+
 #[cfg(test)]
 mod tests {
     use super::*;

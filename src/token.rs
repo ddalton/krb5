@@ -241,6 +241,22 @@ pub trait PerMessageCrypto {
     /// (constant 0x99). Not Ki (0x55), which lives only inside `encrypt`, and
     /// not Ke (0xAA).
     fn get_mic(&self, usage: u32, message: &[u8]) -> Result<Vec<u8>, TokenError>;
+
+    /// [`Self::encrypt`] of the concatenation of `parts`. The default makes
+    /// the concatenation; an implementation can read the parts in place.
+    fn encrypt_parts(
+        &self,
+        usage: u32,
+        parts: &[&[u8]],
+        confounder: Option<&[u8]>,
+    ) -> Result<Vec<u8>, TokenError> {
+        self.encrypt(usage, &parts.concat(), confounder)
+    }
+
+    /// [`Self::get_mic`] of the concatenation of `parts`, likewise.
+    fn get_mic_parts(&self, usage: u32, parts: &[&[u8]]) -> Result<Vec<u8>, TokenError> {
+        self.get_mic(usage, &parts.concat())
+    }
 }
 
 /// Constant-time equality.
@@ -488,11 +504,9 @@ impl<C: PerMessageCrypto> PerMessageTokens<C> {
     /// checksum calculation for simplicity."
     pub fn emit_mic(&self, seq: u64, message: &[u8]) -> Result<Vec<u8>, TokenError> {
         let header = mic_header(self.base_flags(), seq);
-        let mut signed = Vec::with_capacity(message.len() + HEADER_LEN);
-        signed.extend_from_slice(message);
-        signed.extend_from_slice(&header);
-
-        let cksum = self.crypto.get_mic(self.role.sign_usage(), &signed)?;
+        let cksum = self
+            .crypto
+            .get_mic_parts(self.role.sign_usage(), &[message, &header])?;
         let mut token = Vec::with_capacity(HEADER_LEN + cksum.len());
         token.extend_from_slice(&header);
         token.extend_from_slice(&cksum);
@@ -532,11 +546,9 @@ impl<C: PerMessageCrypto> PerMessageTokens<C> {
         self.check_acceptor_subkey(flags)?;
         let sender = self.check_direction(flags)?;
 
-        let mut signed = Vec::with_capacity(message.len() + HEADER_LEN);
-        signed.extend_from_slice(message);
-        signed.extend_from_slice(&token[0..HEADER_LEN]);
-
-        let expected = self.crypto.get_mic(sender.sign_usage(), &signed)?;
+        let expected = self
+            .crypto
+            .get_mic_parts(sender.sign_usage(), &[message, &token[0..HEADER_LEN]])?;
         if !ct_eq(&token[HEADER_LEN..], &expected) {
             return Err(TokenError::IntegrityCheckFailed);
         }
@@ -585,15 +597,19 @@ impl<C: PerMessageCrypto> PerMessageTokens<C> {
             }
         }
         let header = wrap_header(self.base_flags() | FLAG_SEALED, ec, rrc, seq);
-        let to_encrypt = seal_input(plaintext, ec, &header);
-
-        let ct = self
-            .crypto
-            .encrypt(self.role.seal_usage(), &to_encrypt, confounder)?;
+        // seal_input(), in place.
+        let filler = vec![0u8; ec as usize];
+        let ct = self.crypto.encrypt_parts(
+            self.role.seal_usage(),
+            &[plaintext, &filler, &header_for_seal(&header)],
+            confounder,
+        )?;
 
         let mut token = Vec::with_capacity(HEADER_LEN + ct.len());
         token.extend_from_slice(&header);
-        token.extend_from_slice(&rotate_right(&ct, rrc));
+        let split = ct.len() - (rrc as usize).checked_rem(ct.len()).unwrap_or(0);
+        token.extend_from_slice(&ct[split..]);
+        token.extend_from_slice(&ct[..split]);
         Ok(token)
     }
 
@@ -601,8 +617,13 @@ impl<C: PerMessageCrypto> PerMessageTokens<C> {
     pub fn unwrap(&self, token: &[u8]) -> Result<Verified, TokenError> {
         let (flags, ec, rrc, seq, sender) = self.parse_wrap_header(token, true)?;
 
-        let body = rotate_left(&token[HEADER_LEN..], rrc);
-        let full = self.crypto.decrypt(sender.seal_usage(), &body)?;
+        let body = &token[HEADER_LEN..];
+        let mut full = match (rrc as usize).checked_rem(body.len()) {
+            None | Some(0) => self.crypto.decrypt(sender.seal_usage(), body)?,
+            Some(_) => self
+                .crypto
+                .decrypt(sender.seal_usage(), &rotate_left(body, rrc))?,
+        };
 
         // Bounds FIRST. `ec` is attacker-controlled up to 65535 and
         // `len - 16 - ec` underflows: a panic in debug, a catastrophic wrap
@@ -625,10 +646,11 @@ impl<C: PerMessageCrypto> PerMessageTokens<C> {
             return Err(TokenError::HeaderMismatch);
         }
 
+        full.truncate(full.len() - HEADER_LEN - ec);
         Ok(Verified {
             seq,
             flags,
-            message: full[..full.len() - HEADER_LEN - ec].to_vec(),
+            message: full,
         })
     }
 
@@ -652,11 +674,13 @@ impl<C: PerMessageCrypto> PerMessageTokens<C> {
     ) -> Result<Vec<u8>, TokenError> {
         let h = self.crypto.checksum_len();
         let header = wrap_header(self.base_flags(), h as u16, rrc, seq);
-        let signed = sign_input(plaintext, &header);
-
         // SEAL, not SIGN — §2: "Even if the Wrap token does not provide for
         // confidentiality, the same usage values specified above are used."
-        let cksum = self.crypto.get_mic(self.role.seal_usage(), &signed)?;
+        // sign_input(), in place.
+        let cksum = self.crypto.get_mic_parts(
+            self.role.seal_usage(),
+            &[plaintext, &header_for_sign(&header)],
+        )?;
 
         let mut body = Vec::with_capacity(plaintext.len() + cksum.len());
         body.extend_from_slice(plaintext);
@@ -695,8 +719,10 @@ impl<C: PerMessageCrypto> PerMessageTokens<C> {
         }
         let (plaintext, cksum) = body.split_at(body.len() - h);
 
-        let signed = sign_input(plaintext, token[0..HEADER_LEN].try_into().unwrap());
-        let expected = self.crypto.get_mic(sender.seal_usage(), &signed)?;
+        let header = header_for_sign(token[0..HEADER_LEN].try_into().unwrap());
+        let expected = self
+            .crypto
+            .get_mic_parts(sender.seal_usage(), &[plaintext, &header])?;
         if !ct_eq(cksum, &expected) {
             return Err(TokenError::IntegrityCheckFailed);
         }
@@ -888,10 +914,19 @@ impl PerMessageCrypto for ContextKey {
         plaintext: &[u8],
         confounder: Option<&[u8]>,
     ) -> Result<Vec<u8>, TokenError> {
+        self.encrypt_parts(usage, &[plaintext], confounder)
+    }
+
+    fn encrypt_parts(
+        &self,
+        usage: u32,
+        parts: &[&[u8]],
+        confounder: Option<&[u8]>,
+    ) -> Result<Vec<u8>, TokenError> {
         let k = self.keys(usage)?;
         match confounder {
-            Some(c) => profile::encrypt_with_confounder(self.enctype, &k.ke, &k.ki, c, plaintext),
-            None => profile::encrypt(self.enctype, &k.ke, &k.ki, plaintext),
+            Some(c) => profile::encrypt_parts_with_confounder(self.enctype, &k.ke, &k.ki, c, parts),
+            None => profile::encrypt_parts(self.enctype, &k.ke, &k.ki, parts),
         }
         .map_err(|e| TokenError::Crypto(e.to_string()))
     }
@@ -906,8 +941,12 @@ impl PerMessageCrypto for ContextKey {
     }
 
     fn get_mic(&self, usage: u32, message: &[u8]) -> Result<Vec<u8>, TokenError> {
+        self.get_mic_parts(usage, &[message])
+    }
+
+    fn get_mic_parts(&self, usage: u32, parts: &[&[u8]]) -> Result<Vec<u8>, TokenError> {
         let k = self.keys(usage)?;
-        profile::checksum(self.enctype, &k.kc, message)
+        profile::checksum_parts(self.enctype, &k.kc, parts)
             .map_err(|e| TokenError::Crypto(e.to_string()))
     }
 }
