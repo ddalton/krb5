@@ -7,6 +7,8 @@ may break the API).
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-15
+
 ### Added
 
 - A replay cache (RFC 4120 §3.2.3). The acceptor refuses an authenticator
@@ -518,7 +520,8 @@ Initial release: the GSS-API acceptor extracted from
 - RFC 3961 n-fold and DR/DK, RFC 3962 and RFC 8009 AES enctypes.
 - RFC 4121 Wrap and MIC tokens.
 
-[Unreleased]: https://github.com/ddalton/krb5/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/ddalton/krb5/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/ddalton/krb5/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/ddalton/krb5/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/ddalton/krb5/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/ddalton/krb5/compare/v0.8.0...v0.8.1
