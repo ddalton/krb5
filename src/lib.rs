@@ -6,7 +6,11 @@
 //! * [`Keytab`] — load service keys from an MIT-format keytab.
 //! * [`KerberosContext::accept_token`] — validate an AP-REQ (ticket,
 //!   authenticator, clock skew, validity window) and build the AP-REP
-//!   when mutual authentication was requested.
+//!   when mutual authentication was requested; bare AP-REQs too
+//!   ([`KerberosContext::accept_ap_req`]), and user-to-user tickets,
+//!   accepted with a TGT ([`KerberosContext::accept_token_u2u`]).
+//! * [`rcache`] — replay detection, on by default: in memory and
+//!   sharded, or any shared store.
 //!
 //! **Client side**
 //! * [`KdcClient`] — the AS exchange (`kinit`, with a password or a
@@ -16,7 +20,8 @@
 //!   renewal and postdated tickets (`kinit -R`, `-s`, `-v`); S4U2Self and
 //!   S4U2Proxy ([`KdcClient::s4u2self`], [`KdcClient::s4u2proxy`]):
 //!   protocol transition and constrained delegation, traditional and
-//!   resource-based.
+//!   resource-based; user-to-user tickets ([`KdcClient::user_to_user`],
+//!   `kvno --u2u`).
 //! * `pkinit` (with the `pkinit` feature) — PKINIT: login with an X.509
 //!   certificate (`kinit -X`), anonymous PKINIT (`kinit -n`), and FAST
 //!   armor from it (`auto_fast_armor`), in pure Rust.
@@ -119,6 +124,7 @@ pub mod pac; // MS-PAC: the authorization data Windows and MIT put in tickets
 #[cfg(feature = "pkinit")]
 pub mod pkinit; // RFC 4556 PKINIT, RFC 8062 anonymous PKINIT
 pub mod profile; // RFC 3961 §5.3 simplified profile (confounder + HMAC)
+pub mod rcache; // replay detection for AP-REQs (RFC 4120 §3.2.3)
 pub mod spnego; // RFC 4178 SPNEGO, for HTTP Negotiate, SMB and Windows
 pub mod token; // RFC 4121 §4.2 per-message Wrap and MIC tokens
 

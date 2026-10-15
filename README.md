@@ -13,7 +13,13 @@ tickets without shelling out to `kinit`.
   enctype and kvno.
 - **Acceptor** — decrypt and validate the AP-REQ (ticket, authenticator,
   clock skew, validity window, INVALID flag), honour the initiator
-  subkey, and build the AP-REP for mutual authentication.
+  subkey, and build the AP-REP for mutual authentication. Replayed
+  authenticators are refused (an in-memory replay cache, on by default,
+  about 160 ns an AP-REQ; pluggable for services spread over several
+  processes or hosts). GSS-API tokens or bare AP-REQs (`krb5_rd_req`).
+- **User-to-user** — tickets in the session key of a server's TGT
+  (RFC 4120 §2.9.2, `kvno --u2u`), for servers with no keytab: requested,
+  accepted with the TGT, and kept in caches as MIT keeps them.
 - **KDC client** — AS exchange with a password or keytab, including
   PA-ENC-TIMESTAMP pre-authentication and ETYPE-INFO2 salts; TGS exchange
   for service tickets, in other realms too (RFC 6806 referrals and
@@ -99,6 +105,14 @@ let tokens = ctx.per_message_tokens()?; // Wrap / MIC for krb5i / krb5p
 `accept_token` allows the RFC 4120 recommended 5 minutes of clock skew;
 use `accept_token_with_skew` to apply your own policy, and
 `accept_token_with` for channel bindings too.
+
+Each authenticator is accepted once: a replay fails with
+`KerberosError::Replay`. The default replay cache lives in the process,
+shared by every acceptor in it. A service that runs as several processes,
+or on several hosts behind a load balancer, gives
+`AcceptOptions::replay_cache` a store they share (any
+`krb5::rcache::ReplayStore`). `KRB5RCACHETYPE=none` turns it off, as for
+MIT.
 
 An HTTP `Negotiate` server takes SPNEGO, bound to its TLS certificate:
 

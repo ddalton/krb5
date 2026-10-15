@@ -17,6 +17,7 @@ use std::collections::HashMap;
 mod fast;
 pub(crate) mod krbcred;
 mod s4u;
+mod u2u;
 mod xrealm;
 use crate::config::{self, ClientDefaults, ConfigError, Krb5Conf};
 use crate::der::{self, Fields, Reader, app};
@@ -291,9 +292,7 @@ impl Credentials {
     /// really lives in, where `server` is the name as requested. `klist`
     /// shows it as "Ticket server".
     pub fn ticket_server(&self) -> Option<Principal> {
-        let tf = Fields::parse_tagged("Ticket", app(1), &self.ticket).ok()?;
-        let realm = tf.get(1).ok()?.string().ok()?;
-        Principal::decode_name(tf.get(2).ok()?, realm).ok()
+        u2u::ticket_server(&self.ticket)
     }
 
     /// True once `now` (Unix seconds) has reached the ticket's end time.
@@ -1239,6 +1238,7 @@ impl KdcClient {
         let times = kdc.tgs_times(now);
         let evidence = match s4u {
             S4u::Proxy { evidence, .. } => Some(evidence.ticket.as_slice()),
+            S4u::UserToUser(server_tgt) => Some(*server_tgt),
             _ => None,
         };
         let body = kdc.req_body_with(
@@ -1255,7 +1255,7 @@ impl KdcClient {
         // implicit armor, the PA-S4U-X509-USER checksum, and the reply (MIT
         // send_tgs.c always sends one).
         let subkey = match (&self.fast_armor, s4u) {
-            (None, S4u::None | S4u::Proxy { .. }) => None,
+            (None, S4u::None | S4u::Proxy { .. } | S4u::UserToUser(_)) => None,
             _ => Some(Key::random(tgt.session_key.enctype())?),
         };
         let s4u_padata = s4u::request_padata(s4u, tgt, nonce, subkey.as_ref())?;
@@ -1312,7 +1312,7 @@ impl KdcClient {
         // its client), or the S4U2Self user, checked against the KDC's
         // signed PA-S4U-X509-USER by the caller.
         let want_client = match s4u {
-            S4u::None => Some(&tgt.client),
+            S4u::None | S4u::UserToUser(_) => Some(&tgt.client),
             S4u::Proxy { evidence, .. } => Some(&evidence.client),
             S4u::User(_) => None,
         };

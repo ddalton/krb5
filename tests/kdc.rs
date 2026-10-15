@@ -1682,6 +1682,237 @@ fn every_signature_on_mits_pac_verifies() {
     assert_eq!(all.unwrap().unwrap(), pac);
 }
 
+// ---------------------------------------------- user-to-user and replays
+
+/// bob, a user with no keytab: a user-to-user server holds only its TGT.
+fn bob_tgt(e: &Env) -> Credentials {
+    e.client.login_with_password(&e.p("bob"), "bobpw").unwrap()
+}
+
+fn u2u_opts() -> krb5::initiator::InitOptions<'static> {
+    krb5::initiator::InitOptions {
+        use_session_key: true,
+        ..Default::default()
+    }
+}
+
+/// Our client asks MIT's KDC for a ticket in the session key of bob's
+/// TGT; bob accepts it with that TGT, no keytab anywhere.
+#[test]
+fn user_to_user_through_mits_kdc() {
+    let e = live!();
+    let alice = e
+        .client
+        .login_with_password(&e.p("alice"), "alicepw")
+        .unwrap();
+    let bob = bob_tgt(&e);
+    let u2u = e
+        .client
+        .user_to_user(&alice, &Principal::new(1, ["bob"], ""), &bob.ticket)
+        .unwrap();
+    assert_eq!(u2u.server.to_string(), format!("bob@{}", e.realm));
+    assert_eq!(u2u.ticket_enctype, bob.session_key.enctype());
+
+    let flags = GSS_C_MUTUAL_FLAG | GSS_C_INTEG_FLAG | GSS_C_CONF_FLAG;
+    let (mut ini, token) = InitiatorContext::with_options(&u2u, flags, u2u_opts()).unwrap();
+    let (acc, rep) = KerberosContext::accept_token_u2u(&bob, &token, &Default::default()).unwrap();
+    assert_eq!(acc.client_principal, format!("alice@{}", e.realm));
+    assert_eq!(acc.service_principal, format!("bob@{}", e.realm));
+    ini.step(&rep).unwrap();
+    let (ti, ta) = (
+        ini.per_message_tokens().unwrap(),
+        acc.per_message_tokens().unwrap(),
+    );
+    let w = ti.emit_wrap(ini.send_seq(), b"to bob").unwrap();
+    assert_eq!(ta.unwrap(&w).unwrap().message, b"to bob");
+
+    // A TGT of bob's from another login has another session key.
+    let (_, token) = InitiatorContext::with_options(&u2u, 0, u2u_opts()).unwrap();
+    assert!(KerberosContext::accept_token_u2u(&bob_tgt(&e), &token, &Default::default()).is_err());
+    // The KDC issues one only for the client of the TGT it is in.
+    let err = e
+        .client
+        .user_to_user(&alice, &e.p("robot"), &bob.ticket)
+        .unwrap_err();
+    assert_eq!(err.kdc_code(), Some(26), "KDC_ERR_SERVER_NOMATCH: {err}");
+}
+
+/// MIT's `kvno --u2u` gets the ticket from bob's TGT in a cache we wrote
+/// and stores it marked user-to-user; we find it there as such (and not
+/// as an ordinary ticket for bob) and accept it with bob's TGT.
+#[test]
+fn mits_kvno_u2u_ticket_is_accepted_with_the_tgt() {
+    let e = live!();
+    let bob = bob_tgt(&e);
+    let bob_path = scratch(&e, "u2u-bob");
+    krb5::CCache::with_credentials(&bob)
+        .write(&bob_path)
+        .unwrap();
+    let path = scratch(&e, "u2u-alice");
+    let name = format!("FILE:{}", path.display());
+    if mit(&e, &name, "kinit", &["alice"], Some("alicepw\n")).is_none() {
+        eprintln!("MIT's krb5 tools not on PATH; skipping");
+        return;
+    }
+    let out = mit(
+        &e,
+        &name,
+        "kvno",
+        &["--u2u", &format!("FILE:{}", bob_path.display()), "bob"],
+        None,
+    )
+    .unwrap();
+    assert!(out.contains("kvno = 0"), "{out}");
+
+    let cc = krb5::CCache::read(&path).unwrap();
+    let now = bob.authtime;
+    let bob_p = e.p("bob");
+    assert!(cc.find(&bob_p, now).is_none(), "not an ordinary ticket");
+    let u2u = cc
+        .find_user_to_user(&bob_p, &bob.ticket, now)
+        .expect("kvno's user-to-user ticket");
+    let (_, token) = InitiatorContext::with_options(&u2u, GSS_C_MUTUAL_FLAG, u2u_opts()).unwrap();
+    let (acc, _) = KerberosContext::accept_token_u2u(&bob, &token, &Default::default()).unwrap();
+    assert_eq!(acc.client_principal, format!("alice@{}", e.realm));
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&bob_path);
+}
+
+/// MIT's user-to-user sample server (`appl/user_user/uuserver`, in MIT's
+/// `sbin`; Debian and Ubuntu do not package it). We play `uuclient`: send our
+/// name and our TGT, and MIT gets a ticket in its session key and sends a
+/// bare AP-REQ (`krb5_mk_req_extended` with USE-SESSION-KEY), then a
+/// KRB-SAFE message.
+#[test]
+fn mits_uuserver_authenticates_to_us_by_user_to_user() {
+    use std::io::{BufRead, Read, Write};
+    let e = live!();
+    let on_path = std::env::var_os("PATH")
+        .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join("uuserver").is_file()));
+    if !mit_tools_installed() || !on_path {
+        eprintln!("MIT's uuserver not on PATH; skipping");
+        return;
+    }
+    let path = scratch(&e, "uu-alice");
+    let name = format!("FILE:{}", path.display());
+    mit(&e, &name, "kinit", &["alice"], Some("alicepw\n")).unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut server = std::process::Command::new("uuserver")
+        .arg(port.to_string())
+        .env("KRB5_CONFIG", format!("{}/krb5.conf", e.dir))
+        .env("KRB5CCNAME", &name)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = std::io::BufReader::new(server.stdout.take().unwrap()).lines();
+    assert_eq!(lines.next().unwrap().unwrap(), "Server started");
+
+    // krb5_write_message: a 4-octet big-endian length, then the data.
+    let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let send = |s: &mut std::net::TcpStream, m: &[u8]| {
+        s.write_all(&(m.len() as u32).to_be_bytes()).unwrap();
+        s.write_all(m).unwrap();
+    };
+    let recv = |s: &mut std::net::TcpStream| {
+        let mut n = [0; 4];
+        s.read_exact(&mut n).unwrap();
+        let mut m = vec![0; u32::from_be_bytes(n) as usize];
+        s.read_exact(&mut m).unwrap();
+        m
+    };
+    let bob = bob_tgt(&e);
+    send(&mut sock, format!("bob@{}\0", e.realm).as_bytes());
+    send(&mut sock, &bob.ticket);
+    let ap_req = recv(&mut sock);
+    let (ctx, rep) =
+        KerberosContext::accept_ap_req_u2u(&bob, &ap_req, &Default::default()).unwrap();
+    assert_eq!(ctx.client_principal, format!("alice@{}", e.realm));
+    assert_eq!(ctx.service_principal, format!("bob@{}", e.realm));
+    assert!(rep.is_empty(), "uuserver asks no mutual authentication");
+    // KRB-SAFE carries its user data in the clear.
+    let safe = recv(&mut sock);
+    assert_eq!(safe[0], 0x74, "KRB-SAFE, [APPLICATION 20]");
+    let hello = b"Hello, other end of connection.";
+    assert!(safe.windows(hello.len()).any(|w| w == hello));
+    let status = server.wait().unwrap();
+    let mut err = String::new();
+    server
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut err)
+        .unwrap();
+    assert!(status.success(), "uuserver: {err}");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// An authenticator from MIT's initiator is accepted once; sent again it
+/// is a replay (KRB_AP_ERR_REPEAT), and a new one is fine.
+#[test]
+fn a_replayed_mit_authenticator_is_refused() {
+    let e = live!();
+    if !mit_tools_installed() || !python_gssapi() {
+        eprintln!("MIT's tools or python3-gssapi missing; skipping");
+        return;
+    }
+    let path = scratch(&e, "replay-mit");
+    let name = format!("FILE:{}", path.display());
+    mit(&e, &name, "kinit", &["alice"], Some("alicepw\n")).unwrap();
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/mit-initiator.py");
+    let service = format!("host/svc.krb5.test@{}", e.realm);
+    let token = || {
+        unhex(
+            mit(&e, &name, "python3", &[script, &service], None)
+                .unwrap()
+                .trim(),
+        )
+    };
+    let keytab = e.keytab("service.keytab");
+    let first = token();
+    KerberosContext::accept_token(&keytab, &first).unwrap();
+    let err = KerberosContext::accept_token(&keytab, &first).unwrap_err();
+    assert!(matches!(err, krb5::KerberosError::Replay(_)), "{err}");
+    KerberosContext::accept_token(&keytab, &token()).unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The other way: MIT's acceptor, with its replay cache, refuses one of
+/// our authenticators sent twice, to two processes.
+#[test]
+fn mit_refuses_a_replayed_authenticator_of_ours() {
+    let e = live!();
+    let tgt = e
+        .client
+        .login_with_password(&e.p("alice"), "alicepw")
+        .unwrap();
+    let svc = e
+        .client
+        .service_ticket(&tgt, &e.p("host/svc.krb5.test"))
+        .unwrap();
+    let (_, token) = InitiatorContext::new(&svc, GSS_C_MUTUAL_FLAG).unwrap();
+    let Some(mut first) = MitPeer::spawn(&e, "MEMORY:", &["accept"]) else {
+        return;
+    };
+    first.send(&token);
+    assert!(first.token().unwrap().is_some(), "MIT's AP-REP");
+    let mut second = MitPeer::spawn(&e, "MEMORY:", &["accept"]).unwrap();
+    second.send(&token);
+    // MIT answers with a KRB-ERROR token (TOK_ID 03 00): error-code [6]
+    // 34, KRB_AP_ERR_REPEAT.
+    let err = second.token().unwrap().expect("MIT's error token");
+    assert_eq!(&err[13..15], [3, 0], "a KRB-ERROR token");
+    assert!(
+        err.windows(5).any(|w| w == [0xA6, 3, 2, 1, 34]),
+        "KRB_AP_ERR_REPEAT: {}",
+        hex(&err)
+    );
+}
+
 // ------------------------------------------------------------------ FAST
 
 /// An armor TGT, as a host would hold one from its keytab.

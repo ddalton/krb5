@@ -55,6 +55,8 @@ const KU_AP_REP_ENC_PART: u32 = 12;
 
 /// APOptions mutual-required, bit 2 counted from the MSB.
 const AP_OPTS_MUTUAL_REQUIRED: u32 = 0x2000_0000;
+/// APOptions use-session-key, bit 1: a user-to-user ticket.
+const AP_OPTS_USE_SESSION_KEY: u32 = 0x4000_0000;
 
 /// RFC 4120 §7.5.4 AD-IF-RELEVANT, and MS-KILE's AD-AUTH-DATA-AP-OPTIONS
 /// with its KERB_AP_OPTIONS_CBT bit, as MIT's `make_ap_authdata` sends it.
@@ -73,6 +75,13 @@ pub struct InitOptions<'a> {
     /// §4.1.1.2). Without them the hash is all zero, which every
     /// acceptor takes as "none".
     pub channel_bindings: Option<&'a ChannelBindings>,
+    /// The ticket is a user-to-user one, in the session key of the
+    /// acceptor's TGT ([`KdcClient::user_to_user`]): the AP-REQ says
+    /// USE-SESSION-KEY (RFC 4120 §5.5.1), as MIT's `kvno --u2u` and
+    /// `krb5_mk_req_extended` callers set it.
+    ///
+    /// [`KdcClient::user_to_user`]: crate::KdcClient::user_to_user
+    pub use_session_key: bool,
 }
 
 /// The initiator side of a Kerberos GSS-API security context.
@@ -162,7 +171,10 @@ impl InitiatorContext {
         );
         let enc_auth = creds.session_key.encrypt(KU_AP_REQ_AUTH, &authenticator)?;
         let mutual = flags & GSS_C_MUTUAL_FLAG != 0;
-        let ap_options = if mutual { AP_OPTS_MUTUAL_REQUIRED } else { 0 };
+        let mut ap_options = if mutual { AP_OPTS_MUTUAL_REQUIRED } else { 0 };
+        if opts.use_session_key {
+            ap_options |= AP_OPTS_USE_SESSION_KEY;
+        }
         let ap_req = encode_ap_req(
             ap_options,
             &creds.ticket,
@@ -587,5 +599,109 @@ pub(crate) mod tests {
                 .message,
             b"via subkey"
         );
+    }
+
+    fn u2u_setup() -> (Credentials, Credentials) {
+        // The server's TGT: only its session key matters to the acceptor.
+        let server = Principal::parse("bob@EXAMPLE.COM").unwrap();
+        let krbtgt = Principal::krbtgt("EXAMPLE.COM");
+        let tgt_session = Key::random(18).unwrap();
+        let server_tgt = mint(&Key::random(18).unwrap(), &tgt_session, &server, &krbtgt);
+        // A ticket for bob in that session key, as the KDC issues one
+        // with ENC-TKT-IN-SKEY.
+        let alice = Principal::parse("alice@EXAMPLE.COM").unwrap();
+        let u2u = mint(&tgt_session, &Key::random(18).unwrap(), &alice, &server);
+        (server_tgt, u2u)
+    }
+
+    #[test]
+    fn a_user_to_user_ticket_is_accepted_with_the_tgt_session_key() {
+        let (server_tgt, creds) = u2u_setup();
+        let opts = InitOptions {
+            use_session_key: true,
+            ..Default::default()
+        };
+        let (mut ini, token) =
+            InitiatorContext::with_options(&creds, GSS_C_MUTUAL_FLAG, opts).unwrap();
+        let (_, ap_req) = unframe(&token).unwrap();
+        // USE-SESSION-KEY and MUTUAL-REQUIRED: 0x60 in the first octet.
+        let at = ap_req
+            .windows(3)
+            .position(|w| w == [0x03, 0x05, 0x00])
+            .unwrap();
+        assert_eq!(ap_req[at + 3], 0x60);
+
+        let (ctx, rep) =
+            KerberosContext::accept_token_u2u(&server_tgt, &token, &Default::default()).unwrap();
+        assert_eq!(ctx.client_principal, "alice@EXAMPLE.COM");
+        assert_eq!(ctx.service_principal, "bob@EXAMPLE.COM");
+        ini.step(&rep).unwrap();
+        assert!(ini.is_established());
+
+        // Not with a keytab (there is none for bob), nor another TGT.
+        let other = u2u_setup().0;
+        let (_, token) = InitiatorContext::with_options(&creds, 0, opts).unwrap();
+        assert!(KerberosContext::accept_token_u2u(&other, &token, &Default::default()).is_err());
+        let kt = keytab_with(&server_tgt.client, &Key::random(18).unwrap());
+        assert!(KerberosContext::accept_token(&kt, &token).is_err());
+    }
+
+    /// A bare AP-REQ (no GSS framing) and its bare AP-REP, as MIT's
+    /// `krb5_rd_req` and `krb5_mk_rep` exchange them.
+    #[test]
+    fn a_bare_ap_req_is_accepted_and_answered_with_a_bare_ap_rep() {
+        let (server_tgt, creds) = u2u_setup();
+        let (_, token) = InitiatorContext::new(&creds, GSS_C_MUTUAL_FLAG).unwrap();
+        let (_, ap_req) = unframe(&token).unwrap();
+        let (ctx, rep) =
+            KerberosContext::accept_ap_req_u2u(&server_tgt, ap_req, &Default::default()).unwrap();
+        assert_eq!(ctx.client_principal, "alice@EXAMPLE.COM");
+        assert!(ctx.mech_oid.is_empty());
+        // The GSS checksum of a GSS token is not a bare AP-REQ's business.
+        assert_eq!(ctx.gss_flags, 0);
+        assert_eq!(rep[0], 0x6F, "AP-REP, [APPLICATION 15]");
+        // And with a keytab.
+        let service = Principal::parse("host/a.example.com@EXAMPLE.COM").unwrap();
+        let key = Key::random(17).unwrap();
+        let creds = mint(&key, &Key::random(17).unwrap(), &creds.client, &service);
+        let (_, token) = InitiatorContext::new(&creds, 0).unwrap();
+        let (_, ap_req) = unframe(&token).unwrap();
+        let (ctx, rep) = KerberosContext::accept_ap_req(
+            &keytab_with(&service, &key),
+            ap_req,
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(ctx.service_principal, "host/a.example.com@EXAMPLE.COM");
+        assert!(rep.is_empty(), "no AP-REP without MUTUAL-REQUIRED");
+    }
+
+    /// RFC 4120 §3.2.3: the same authenticator twice is refused, by
+    /// default; a new one for the same ticket is not, and nor is anything
+    /// with replay detection off.
+    #[test]
+    fn an_authenticator_is_accepted_once() {
+        let service = Principal::parse("host/r.example.com@EXAMPLE.COM").unwrap();
+        let key = Key::random(20).unwrap();
+        let creds = mint(&key, &Key::random(20).unwrap(), &service, &service);
+        let kt = keytab_with(&service, &key);
+        let (_, token) = InitiatorContext::new(&creds, 0).unwrap();
+        KerberosContext::accept_token(&kt, &token).unwrap();
+        let e = KerberosContext::accept_token(&kt, &token).unwrap_err();
+        assert!(matches!(e, crate::KerberosError::Replay(_)), "{e}");
+        // Bare, the same authenticator is the same replay.
+        let (_, ap_req) = unframe(&token).unwrap();
+        assert!(matches!(
+            KerberosContext::accept_ap_req(&kt, ap_req, &Default::default()),
+            Err(crate::KerberosError::Replay(_))
+        ));
+        let (_, again) = InitiatorContext::new(&creds, 0).unwrap();
+        KerberosContext::accept_token(&kt, &again).unwrap();
+        let off = crate::acceptor::AcceptOptions {
+            replay_cache: None,
+            ..Default::default()
+        };
+        KerberosContext::accept_token_with(&kt, &token, &off).unwrap();
+        KerberosContext::accept_token_with(&kt, &token, &off).unwrap();
     }
 }

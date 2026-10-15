@@ -21,6 +21,15 @@ fn setup() -> (Credentials, Keytab) {
     )
 }
 
+/// Options with a replay cache of their own, to accept an AP-REQ a
+/// second time.
+fn fresh() -> AcceptOptions {
+    AcceptOptions {
+        replay_cache: Some(std::sync::Arc::new(crate::rcache::ReplayCache::new())),
+        ..Default::default()
+    }
+}
+
 /// Wrap tokens both ways at the sequence numbers negotiation left.
 fn exchange(ini: &SpnegoInitiator, acc: &SpnegoAcceptor<'_>) {
     let ti = ini.per_message_tokens().unwrap();
@@ -114,7 +123,12 @@ fn microsofts_kerberos_oid_is_kerberos() {
         .position(|w| w == KRB5_MECH_OID)
         .unwrap();
     ms_token[at..at + 11].copy_from_slice(&MS_KRB5_OID);
-    let (ctx, ap_rep) = KerberosContext::accept_token(&keytab, &ms_token).unwrap();
+    // The same authenticator again: a replay, framed differently or not.
+    assert!(matches!(
+        KerberosContext::accept_token(&keytab, &ms_token),
+        Err(KerberosError::Replay(_))
+    ));
+    let (ctx, ap_rep) = KerberosContext::accept_token_with(&keytab, &ms_token, &fresh()).unwrap();
     assert_eq!(ctx.mech_oid, MS_KRB5_OID);
     assert_eq!(&ap_rep[2..13], &MS_KRB5_OID);
 }
@@ -156,7 +170,7 @@ fn kerberos_second_in_the_list_needs_mics_both_ways() {
 
     // A forged MIC is refused; the real one finishes it.
     let mic = tokens.emit_mic(krb5.send_seq(), &mech_types).unwrap();
-    let mut probe = SpnegoAcceptor::new(&keytab);
+    let mut probe = SpnegoAcceptor::with_options(&keytab, fresh());
     probe.step(&token).unwrap();
     probe
         .step(&encode_resp(ACCEPT_INCOMPLETE, None, Some(&ap_req), None))

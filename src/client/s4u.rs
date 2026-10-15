@@ -35,6 +35,8 @@ pub(super) enum S4u<'a> {
     Proxy {
         evidence: &'a Credentials,
     },
+    /// User-to-user, in the session key of this TGT (the server's).
+    UserToUser(&'a [u8]),
 }
 
 /// A TGS reply with what S4U needs to check it.
@@ -72,7 +74,7 @@ pub(super) fn request_padata(
     subkey: Option<&Key>,
 ) -> Result<Vec<(i32, Vec<u8>)>> {
     match s4u {
-        S4u::None => Ok(Vec::new()),
+        S4u::None | S4u::UserToUser(_) => Ok(Vec::new()),
         S4u::User(user) => {
             // PA-S4U-X509-USER, checksummed with the subkey (MS-SFU 2.2.2).
             let subkey = subkey.expect("S4U2Self always has a subkey");

@@ -7,6 +7,50 @@ may break the API).
 
 ## [Unreleased]
 
+### Added
+
+- A replay cache (RFC 4120 §3.2.3). The acceptor refuses an authenticator
+  it has accepted before while that authenticator could still pass the
+  clock-skew check, with `KerberosError::Replay` (KRB_AP_ERR_REPEAT). It
+  is on by default: `AcceptOptions::replay_cache` defaults to a
+  process-wide in-memory cache (`rcache::ReplayCache::global`), unless
+  `KRB5RCACHETYPE=none` or `KRB5RCACHENAME=none:` as in MIT. As in MIT, an
+  authenticator is known by the checksum that ends its ciphertext.
+  - The cache is sharded and expires entries a whole generation at a
+    time, about 160 ns an AP-REQ on one thread.
+  - `rcache::ReplayStore` lets a service that runs as several processes,
+    or on several hosts, plug in a store they share. MIT's own file cache
+    is not shared: locking it as MIT does needs `fcntl`.
+  - Tested live both ways: a re-sent MIT authenticator is refused, and
+    MIT's acceptor refuses a re-sent one of ours.
+- User-to-user (RFC 4120 §2.9.2).
+  - `KdcClient::user_to_user` asks for a ticket in the session key of a
+    server's TGT (ENC-TKT-IN-SKEY), as `kvno --u2u` does.
+  - `InitOptions::use_session_key` sets USE-SESSION-KEY in the AP-REQ.
+  - `KerberosContext::accept_token_u2u` and `accept_ap_req_u2u` accept
+    such a ticket with the server's TGT.
+  - `CCache::store_user_to_user` and `find_user_to_user` keep these
+    tickets as MIT does (`is_skey`, with the server's TGT as the second
+    ticket).
+  - Tested live with MIT's KDC, MIT's `kvno --u2u`, and MIT's `uuserver`.
+- `KerberosContext::accept_ap_req`: a bare AP-REQ, not wrapped in a
+  GSS-API token, as MIT's `krb5_rd_req` takes one, and a bare AP-REP for
+  mutual authentication.
+
+### Changed
+
+- Breaking: `AcceptOptions` has a new field, `replay_cache`;
+  `InitOptions` has `use_session_key`; `KerberosError` has `Replay`.
+- Accepting the same AP-REQ twice now fails. Code that did so on purpose
+  (tests replaying a captured token) sets `replay_cache: None` or gives
+  each acceptance its own `ReplayCache`.
+
+### Fixed
+
+- `CCache::find`, and so `service_ticket_cached` and `tgt`, no longer
+  return a user-to-user ticket from a cache MIT's `kvno --u2u` wrote,
+  which only the TGT it is in can accept. MIT's lookups skip them too.
+
 ## [0.10.0] - 2026-10-15
 
 ### Added

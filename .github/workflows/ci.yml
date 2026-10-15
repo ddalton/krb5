@@ -129,6 +129,7 @@ jobs:
       - run: cat "$RUNNER_TEMP/krb5test/test.env" >> "$GITHUB_ENV"
       - run: test "$KRB5_TEST_PKINIT_ECDH" = 1
       - run: test "$KRB5_TEST_S4U_REALM" = S4U.TEST
+      - run: command -v uuserver  # the user-to-user interop test's peer
       - run: cargo test --features pkinit --test kdc -- --nocapture
       - run: |
           kill $(cat "$KRB5_TEST_DIR/kdc.pid")  # the KDC and kadmind

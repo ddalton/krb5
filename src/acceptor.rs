@@ -46,6 +46,10 @@ pub enum KerberosError {
     #[error("Channel bindings do not match: {0}")]
     BadBindings(String),
 
+    /// KRB_AP_ERR_REPEAT: the authenticator was accepted before.
+    #[error("Request is a replay: {0}")]
+    Replay(String),
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -548,6 +552,12 @@ pub struct AcceptOptions {
     ///
     /// [`GSS_C_CHANNEL_BOUND_FLAG`]: crate::initiator::GSS_C_CHANNEL_BOUND_FLAG
     pub channel_bindings: Option<crate::ChannelBindings>,
+    /// Where accepted authenticators are recorded, to refuse replays
+    /// ([`KerberosError::Replay`]). The default is the process-wide
+    /// in-memory [`ReplayCache`](crate::rcache::ReplayCache), or none if
+    /// `KRB5RCACHETYPE=none` (see [`crate::rcache`]). `None` turns
+    /// replay detection off.
+    pub replay_cache: Option<std::sync::Arc<dyn crate::rcache::ReplayStore>>,
 }
 
 impl Default for AcceptOptions {
@@ -555,8 +565,17 @@ impl Default for AcceptOptions {
         AcceptOptions {
             max_skew_secs: DEFAULT_CLOCK_SKEW_SECS,
             channel_bindings: None,
+            replay_cache: crate::rcache::default_store(),
         }
     }
+}
+
+/// The key a ticket is in: a service key from a keytab, or (user-to-user)
+/// the session key of our TGT.
+#[derive(Clone, Copy)]
+enum TicketKey<'a> {
+    Keytab(&'a Keytab),
+    Tgt(&'a crate::Credentials),
 }
 
 /// Kerberos key usage constants (RFC 4120 Section 7.5.1)
@@ -1993,7 +2012,53 @@ impl KerberosContext {
         token: &[u8],
         opts: &AcceptOptions,
     ) -> Result<(Self, Vec<u8>)> {
-        Self::accept_token_opts(keytab, token, opts, current_time())
+        Self::accept_token_opts(TicketKey::Keytab(keytab), token, opts, current_time())
+    }
+
+    /// As [`Self::accept_token_with`], for a user-to-user ticket (RFC 4120
+    /// §2.9.2): one the KDC encrypted in the session key of `tgt`, our own
+    /// TGT, which the initiator got with [`KdcClient::user_to_user`]
+    /// rather than from a key in a keytab. The initiator sets
+    /// USE-SESSION-KEY ([`InitOptions::use_session_key`]).
+    ///
+    /// [`KdcClient::user_to_user`]: crate::KdcClient::user_to_user
+    /// [`InitOptions::use_session_key`]: crate::initiator::InitOptions::use_session_key
+    pub fn accept_token_u2u(
+        tgt: &crate::Credentials,
+        token: &[u8],
+        opts: &AcceptOptions,
+    ) -> Result<(Self, Vec<u8>)> {
+        Self::accept_token_opts(TicketKey::Tgt(tgt), token, opts, current_time())
+    }
+
+    /// A bare AP-REQ (RFC 4120 §3.2), not wrapped in a GSS-API token: MIT's
+    /// `krb5_rd_req`, for protocols that carry Kerberos without GSS-API.
+    /// The authenticator checksum is the application's, so `gss_flags` is
+    /// 0 and nothing is delegated, `mech_oid` is empty, and the reply (for
+    /// MUTUAL-REQUIRED; empty otherwise) is a bare AP-REP.
+    pub fn accept_ap_req(
+        keytab: &Keytab,
+        ap_req: &[u8],
+        opts: &AcceptOptions,
+    ) -> Result<(Self, Vec<u8>)> {
+        Self::accept_ap_req_opts(
+            TicketKey::Keytab(keytab),
+            ap_req,
+            opts,
+            current_time(),
+            None,
+        )
+    }
+
+    /// [`Self::accept_ap_req`] for a user-to-user ticket in `tgt`'s
+    /// session key, as MIT's `krb5_rd_req` with
+    /// `krb5_auth_con_setuseruserkey`.
+    pub fn accept_ap_req_u2u(
+        tgt: &crate::Credentials,
+        ap_req: &[u8],
+        opts: &AcceptOptions,
+    ) -> Result<(Self, Vec<u8>)> {
+        Self::accept_ap_req_opts(TicketKey::Tgt(tgt), ap_req, opts, current_time(), None)
     }
 
     /// As [`Self::accept_token_with_skew`], with the clock supplied.
@@ -2010,20 +2075,21 @@ impl KerberosContext {
         max_skew_secs: i64,
         now: i64,
     ) -> Result<(Self, Vec<u8>)> {
+        // A cache of its own: fixtures are accepted by more than one test.
         let opts = AcceptOptions {
             max_skew_secs,
+            replay_cache: Some(std::sync::Arc::new(crate::rcache::ReplayCache::new())),
             ..Default::default()
         };
-        Self::accept_token_opts(keytab, token, &opts, now)
+        Self::accept_token_opts(TicketKey::Keytab(keytab), token, &opts, now)
     }
 
     fn accept_token_opts(
-        keytab: &Keytab,
+        keys: TicketKey<'_>,
         token: &[u8],
         opts: &AcceptOptions,
         now: i64,
     ) -> Result<(Self, Vec<u8>)> {
-        let max_skew_secs = opts.max_skew_secs;
         info!(
             "🔐 Accepting Kerberos GSS token with FULL CRYPTOGRAPHY: {} bytes",
             token.len()
@@ -2091,20 +2157,60 @@ impl KerberosContext {
             ap_req_data.len()
         );
 
+        Self::accept_ap_req_opts(keys, ap_req_data, opts, now, Some(krb5_oid))
+    }
+
+    /// The AP-REQ itself, GSS-framed (`oid`, the mechanism the initiator
+    /// named) or bare (`None`, MIT's `krb5_rd_req`).
+    fn accept_ap_req_opts(
+        keys: TicketKey<'_>,
+        ap_req_data: &[u8],
+        opts: &AcceptOptions,
+        now: i64,
+        oid: Option<&[u8]>,
+    ) -> Result<(Self, Vec<u8>)> {
+        let max_skew_secs = opts.max_skew_secs;
         // Parse AP-REQ structure
         let (ticket, enc_authenticator, ap_options) = Self::parse_ap_req(ap_req_data)?;
 
-        // Find service key for this ticket
         let service_name = ticket.sname.join("/");
-        // Select by the enctype the TICKET declares, not just the name.
-        let service_key = keytab
-            .find_key_for(&service_name, ticket.enc_part.enctype, ticket.enc_part.kvno)
-            .ok_or_else(|| {
-                KerberosError::PrincipalNotFound(format!(
-                    "{} with enctype {:?}",
-                    service_name, ticket.enc_part.enctype
-                ))
-            })?;
+        let service_key = match keys {
+            // Select by the enctype the TICKET declares, not just the name.
+            TicketKey::Keytab(keytab) => keytab
+                .find_key_for(&service_name, ticket.enc_part.enctype, ticket.enc_part.kvno)
+                .ok_or_else(|| {
+                    KerberosError::PrincipalNotFound(format!(
+                        "{} with enctype {:?}",
+                        service_name, ticket.enc_part.enctype
+                    ))
+                })
+                .map(std::borrow::Cow::Borrowed)?,
+            // User-to-user: the ticket is in our TGT's session key. As in
+            // MIT's rd_req, the ticket names the server (an alias of the
+            // TGT's client is allowed); decrypting it is the proof.
+            TicketKey::Tgt(tgt) => {
+                let enctype = EncType::from_i32(tgt.session_key.enctype()).ok_or_else(|| {
+                    KerberosError::DecryptionFailed(format!(
+                        "TGT session key enctype {} is not supported",
+                        tgt.session_key.enctype()
+                    ))
+                })?;
+                if enctype != ticket.enc_part.enctype {
+                    return Err(KerberosError::DecryptionFailed(format!(
+                        "user-to-user ticket is in enctype {:?}, our TGT's session key {:?}",
+                        ticket.enc_part.enctype, enctype
+                    )));
+                }
+                std::borrow::Cow::Owned(ServiceKey {
+                    principal: service_name.clone(),
+                    realm: ticket.realm.clone(),
+                    kvno: 0,
+                    enctype,
+                    key: tgt.session_key.bytes().to_vec(),
+                })
+            }
+        };
+        let service_key = &*service_key;
 
         info!(
             "   Found service key: {}@{}",
@@ -2130,6 +2236,20 @@ impl KerberosContext {
         let authenticator = Authenticator::parse_and_decrypt(&enc_authenticator, &session_key)?;
         authenticator.validate(now, max_skew_secs)?;
 
+        // RFC 4120 §3.2.3, after the skew check as in MIT's rd_req: an
+        // authenticator accepted already, while it could still pass that
+        // check, is a replay.
+        if let Some(rc) = &opts.replay_cache {
+            let tag = crate::rcache::tag(session_key.enctype.etype(), &enc_authenticator);
+            if !rc.insert(tag, now, authenticator.ctime + max_skew_secs)? {
+                return Err(KerberosError::Replay(format!(
+                    "an authenticator from {}@{} was presented again",
+                    enc_ticket_part.cname.join("/"),
+                    enc_ticket_part.crealm
+                )));
+            }
+        }
+
         info!(
             "   ✅ Authenticator validated: time_skew={}s",
             current_time() - authenticator.ctime
@@ -2149,7 +2269,7 @@ impl KerberosContext {
 
         let mut cb_match = false;
         let (mut gss_flags, delegated) = match &authenticator.cksum {
-            Some((0x8003, ck)) => {
+            Some((0x8003, ck)) if oid.is_some() => {
                 let (flags, bnd, deleg) = parse_gss_checksum(ck)?;
                 // MIT's process_checksum: bindings sent must match ours;
                 // none sent (all zero) is not a mismatch.
@@ -2203,7 +2323,7 @@ impl KerberosContext {
             used_initiator_subkey,
             initiator_seq,
             acceptor_seq: if mutual { 0 } else { initiator_seq },
-            mech_oid: krb5_oid.to_vec(),
+            mech_oid: oid.map(<[u8]>::to_vec).unwrap_or_default(),
             pac,
         };
 
@@ -2215,7 +2335,7 @@ impl KerberosContext {
                 &session_key,
                 authenticator.ctime,
                 authenticator.cusec,
-                krb5_oid,
+                oid,
             )?
         } else {
             debug!("   No MUTUAL-REQUIRED in ap-options — replying with an empty token");
@@ -2336,7 +2456,7 @@ impl KerberosContext {
         session_key: &SessionKey,
         ctime: i64,
         cusec: u32,
-        krb5_oid: &[u8],
+        krb5_oid: Option<&[u8]>,
     ) -> Result<Vec<u8>> {
         debug!("   Generating AP-REP with encryption");
 
@@ -2366,6 +2486,9 @@ impl KerberosContext {
         let mut ap_rep = vec![0x6F];
         Self::encode_length(&mut ap_rep, ap_rep_seq.len());
         ap_rep.extend_from_slice(&ap_rep_seq);
+        let Some(krb5_oid) = krb5_oid else {
+            return Ok(ap_rep);
+        };
 
         // Wrap in GSS-API. The TOK_ID (RFC 4121 §4.1) is NOT optional —
         // an initiator reading this reply expects 02 00 before the
@@ -2400,6 +2523,36 @@ impl KerberosContext {
 
 #[cfg(test)]
 mod tests {
+    /// A replay is refused for as long as its authenticator could pass
+    /// the skew check (until ctime + skew), and not past that.
+    #[test]
+    fn a_replay_is_refused_for_the_whole_skew_window() {
+        use super::{AcceptOptions, KerberosContext, KerberosError, TicketKey};
+        use crate::initiator::InitiatorContext;
+        use crate::initiator::tests::{keytab_with, mint};
+        let service = crate::Principal::parse("host/w.example.com@EXAMPLE.COM").unwrap();
+        let key = crate::Key::random(18).unwrap();
+        let creds = mint(&key, &crate::Key::random(18).unwrap(), &service, &service);
+        let kt = keytab_with(&service, &key);
+        let opts = AcceptOptions {
+            max_skew_secs: 300,
+            replay_cache: Some(std::sync::Arc::new(crate::rcache::ReplayCache::new())),
+            ..Default::default()
+        };
+        let (_, token) = InitiatorContext::new(&creds, 0).unwrap();
+        let now = super::current_time();
+        let at = |t| KerberosContext::accept_token_opts(TicketKey::Keytab(&kt), &token, &opts, t);
+        // Accepted at the start of its window, it is a replay at the end
+        // of it (the authenticator's ctime is now, give or take a second).
+        at(now - 298).unwrap();
+        assert!(matches!(at(now + 298), Err(KerberosError::Replay(_))));
+        // Past the window it is refused for its skew, not as a replay.
+        assert!(matches!(
+            at(now + 302),
+            Err(KerberosError::InvalidAuthenticator(_))
+        ));
+    }
+
     #[test]
     fn written_keytabs_read_back_with_32_bit_kvnos() {
         let key = |kvno, et: EncType, b: u8| ServiceKey {

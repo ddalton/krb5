@@ -369,9 +369,37 @@ impl CCache {
 
     /// The default principal's unexpired credentials for `server`, the
     /// one with the latest endtime if there are several. `now` is Unix
-    /// seconds.
+    /// seconds. User-to-user tickets are not candidates, as in MIT's
+    /// lookups (`KRB5_TC_MATCH_IS_SKEY`): they are for one server TGT,
+    /// not the server's keytab (see [`CCache::find_user_to_user`]).
     pub fn find(&self, server: &Principal, now: i64) -> Option<Credentials> {
-        self.credentials()
+        self.find_where(server, now, |e| !e.is_skey)
+    }
+
+    /// The default principal's unexpired user-to-user ticket for
+    /// `server`, in the session key of `server_tgt` (the server's TGT, as
+    /// [`KdcClient::user_to_user`](crate::KdcClient::user_to_user) was
+    /// given it): as `kvno --u2u` stores one, matched as MIT matches it
+    /// (`KRB5_TC_MATCH_IS_SKEY | KRB5_TC_MATCH_2ND_TKT`).
+    pub fn find_user_to_user(
+        &self,
+        server: &Principal,
+        server_tgt: &[u8],
+        now: i64,
+    ) -> Option<Credentials> {
+        self.find_where(server, now, |e| e.is_skey && e.second_ticket == server_tgt)
+    }
+
+    fn find_where(
+        &self,
+        server: &Principal,
+        now: i64,
+        want: impl Fn(&Entry) -> bool,
+    ) -> Option<Credentials> {
+        self.entries
+            .iter()
+            .filter(|e| want(e))
+            .filter_map(Entry::credentials)
             .filter(|c| {
                 same_principal(&c.client, &self.principal)
                     && same_principal(&c.server, server)
@@ -396,11 +424,31 @@ impl CCache {
     /// (MIT appends and lets the newest copy shadow the old one; a
     /// rewrite can simply drop it.) Removed entries are dropped too.
     pub fn store(&mut self, creds: &Credentials) {
+        self.store_entry(Entry::from_credentials(creds));
+    }
+
+    /// Store `creds`, a user-to-user ticket in the session key of
+    /// `server_tgt`, as MIT records one: `is_skey` set, the server's TGT
+    /// as the second ticket. Only [`CCache::find_user_to_user`] finds it,
+    /// in this crate and in MIT.
+    pub fn store_user_to_user(&mut self, creds: &Credentials, server_tgt: &[u8]) {
+        let mut e = Entry::from_credentials(creds);
+        e.is_skey = true;
+        e.second_ticket = server_tgt.to_vec();
+        self.store_entry(e);
+    }
+
+    /// Replace any entry for the same client and server, of the same kind:
+    /// ordinary, or user-to-user for the same server TGT. (Only
+    /// user-to-user entries have a second ticket.)
+    fn store_entry(&mut self, new: Entry) {
         let replaced = |e: &Entry| {
-            same_principal(&e.client, &creds.client) && same_principal(&e.server, &creds.server)
+            same_principal(&e.client, &new.client)
+                && same_principal(&e.server, &new.server)
+                && e.second_ticket == new.second_ticket
         };
         self.entries.retain(|e| !e.is_removed() && !replaced(e));
-        self.entries.push(Entry::from_credentials(creds));
+        self.entries.push(new);
     }
 
     /// Set configuration entry `key` (optionally associated with
@@ -1021,6 +1069,36 @@ mod tests {
     const A: u32 = 1 << 21;
     const T: u32 = 1 << 19;
     const E: u32 = 1 << 16;
+
+    /// A user-to-user ticket and an ordinary one for the same server side
+    /// by side, as MIT keeps them: each lookup finds its own, and the
+    /// marking survives the file.
+    #[test]
+    fn user_to_user_tickets_are_kept_apart() {
+        let mut c = CCache::decode(&fixture(4)).unwrap();
+        let creds: Vec<Credentials> = c.credentials().collect();
+        let (tgt, svc) = (&creds[0], &creds[1]);
+        let now = svc.authtime;
+        let mut u2u = svc.clone();
+        u2u.session_key = Key::random(18).unwrap();
+        c.store_user_to_user(&u2u, &tgt.ticket);
+        let c = CCache::decode(&c.encode()).unwrap();
+        let e = c.entries.iter().find(|e| e.is_skey).unwrap();
+        assert_eq!(e.second_ticket, tgt.ticket);
+        assert_eq!(c.credentials().count(), 3);
+
+        let found = c.find(&svc.server, now).unwrap();
+        assert_eq!(found.session_key, svc.session_key);
+        let found = c.find_user_to_user(&svc.server, &tgt.ticket, now).unwrap();
+        assert_eq!(found.session_key, u2u.session_key);
+        assert!(c.find_user_to_user(&svc.server, &svc.ticket, now).is_none());
+
+        // Storing either again replaces only its own kind.
+        let mut c = c;
+        c.store(svc);
+        c.store_user_to_user(&u2u, &tgt.ticket);
+        assert_eq!(c.credentials().count(), 3);
+    }
 
     #[test]
     fn mit_caches_of_every_version_read_as_klist_shows_them() {
