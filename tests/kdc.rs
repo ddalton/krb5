@@ -1472,11 +1472,10 @@ fn a_postdated_tgt_is_validated_after_its_start() {
     let valid = kdc.validate(&tgt).unwrap();
     assert!(!valid.is_invalid());
     assert_eq!(valid.flags & POSTDATED, POSTDATED);
-    assert_eq!(
-        (valid.starttime, valid.endtime),
-        (tgt.starttime, tgt.endtime),
-        "validation keeps the times"
-    );
+    // MIT 1.21 and later keep the times; 1.20 starts the ticket at the
+    // validation instead.
+    assert_eq!(valid.endtime, tgt.endtime, "validation keeps the end time");
+    assert!(valid.starttime >= tgt.starttime, "{valid:?}");
     let svc = kdc
         .service_ticket(&valid, &e.p("host/svc.krb5.test"))
         .unwrap();

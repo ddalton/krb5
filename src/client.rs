@@ -1155,7 +1155,8 @@ impl KdcClient {
 
     /// `creds`, a postdated ticket, made valid (`kinit -v`, MIT's
     /// `krb5_get_validated_creds`): a TGS request presenting it with the
-    /// VALIDATE option. The KDC keeps its times and flags, clears
+    /// VALIDATE option. The KDC keeps its flags and end time (MIT 1.21 and
+    /// later its start time too; 1.20 starts it at the validation), clears
     /// `invalid`, and refuses (`KRB_AP_ERR_TKT_NYV`) before its start time,
     /// or (`KDC_ERR_BADOPTION`) a ticket that is valid already.
     pub fn validate(&self, creds: &Credentials) -> Result<Credentials> {
