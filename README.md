@@ -145,10 +145,8 @@ use krb5::spnego::SpnegoAcceptor;
 use krb5::{ChannelBindings, Keytab};
 
 let keytab = Keytab::load("/etc/krb5.keytab")?;
-let opts = AcceptOptions {
-    channel_bindings: ChannelBindings::tls_server_end_point(&server_cert_der),
-    ..Default::default()
-};
+let mut opts = AcceptOptions::default();
+opts.channel_bindings = ChannelBindings::tls_server_end_point(&server_cert_der);
 let mut acc = SpnegoAcceptor::with_options(&keytab, opts);
 // token: base64-decoded from "Authorization: Negotiate <token>"
 let reply = acc.step(&token)?; // base64 into "WWW-Authenticate: Negotiate <reply>"
@@ -211,6 +209,32 @@ let creds = kdc.service_ticket(&tgt, &Principal::parse("nfs/server.example.com@E
 ```
 
 `examples/gss_client.rs` is a complete client.
+
+## Features
+
+| Feature | Adds | Dependencies |
+|---|---|---|
+| (default) | everything not listed below | `aes`, `hmac`, `sha1`, `sha2`, `chrono`, `rand`, `thiserror`, `tracing` |
+| `spake-nist` | SPAKE over P-256, P-384 and P-521 | `p256`, `p384`, `p521` |
+| `pkinit` | `krb5::pkinit` (implies `spake-nist`) | `crypto-bigint`, `des`, `rc2`, `pbkdf2` |
+| `tokio` | `AsyncKdcClient`, kpasswd's `_async` functions | `tokio` (`net`, `time`, `io-util`) |
+
+No third-party type appears in the public API, so these dependencies can
+move to new major versions without a major version of this crate.
+
+## Rust version and stability
+
+The minimum supported Rust version is 1.85 (`rust-version` in
+`Cargo.toml`, tested in CI). It is raised only in a minor release, noted
+in the changelog, and only to a version at least six months old.
+
+The crate follows [Semantic Versioning](https://semver.org/). Error
+enums, structs the crate returns, and option structs are
+`#[non_exhaustive]`, so variants and fields can be added in a minor
+release: match errors with a `_` arm, and build options from `Default`,
+setting fields (`let mut o = AcceptOptions::default(); o.max_skew_secs =
+60;`). Types that mirror a fixed wire structure (`Principal`,
+`ChannelBindings`, a PAC's `Sid` and `GroupMembership`) are not.
 
 ## Testing
 

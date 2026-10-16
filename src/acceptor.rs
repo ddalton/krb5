@@ -19,22 +19,32 @@ use tracing::{debug, info};
 
 /// Kerberos error types
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum KerberosError {
+    /// The keytab could not be read.
     #[error("Failed to load keytab: {0}")]
     KeytabLoad(String),
 
+    /// The keytab has no key for the ticket's server, enctype and kvno.
     #[error("Service principal not found in keytab: {0}")]
     PrincipalNotFound(String),
 
+    /// The ticket or another encrypted part did not decrypt, or its key
+    /// is of an unsupported enctype.
     #[error("Failed to decrypt ticket: {0}")]
     DecryptionFailed(String),
 
+    /// The token, keytab or a message inside it is malformed.
     #[error("Failed to parse Kerberos token: {0}")]
     ParseError(String),
 
+    /// The authenticator is malformed, outside the clock skew, or carries
+    /// a bad GSS checksum, authorization data or delegated credentials.
     #[error("Invalid authenticator: {0}")]
     InvalidAuthenticator(String),
 
+    /// The ticket has expired, is not yet valid, or carries the INVALID
+    /// flag (RFC 4120 §3.2.3).
     #[error("Ticket is not valid now: {0}")]
     TicketNotValid(String),
 
@@ -50,23 +60,31 @@ pub enum KerberosError {
     #[error("Request is a replay: {0}")]
     Replay(String),
 
+    /// Reading the keytab or writing the replay cache failed.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
 
+/// A result with a [`KerberosError`].
 pub type Result<T> = std::result::Result<T, KerberosError>;
 
 /// Kerberos encryption type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
+#[non_exhaustive]
 pub enum EncType {
+    /// `aes256-cts-hmac-sha1-96` (RFC 3962).
     AES256CtsHmacSha196 = 18,
+    /// `aes128-cts-hmac-sha1-96` (RFC 3962).
     AES128CtsHmacSha196 = 17,
+    /// `aes256-cts-hmac-sha384-192` (RFC 8009).
     AES256CtsHmacSha384192 = 20,
+    /// `aes128-cts-hmac-sha256-128` (RFC 8009).
     AES128CtsHmacSha256128 = 19,
 }
 
 impl EncType {
+    /// The enctype numbered `value`, if this crate supports it.
     pub fn from_i32(value: i32) -> Option<Self> {
         match value {
             17 => Some(EncType::AES128CtsHmacSha196),
@@ -77,12 +95,11 @@ impl EncType {
         }
     }
 
-    /// REMOVED. Key sizes now come from [`crate::kdf`], which is the
-    /// only thing that derives keys. One `key_size()` could never express
-    /// enctype 20 anyway — RFC 8009 gives it Ke = 32 but Kc = Ki = 24, and
-    /// collapsing those to one number is what made the old `derive_key_aes_sha2`
-    /// hand back 32-octet Kc/Ki that truncation then accepted in silence.
-    /// This enum is now an IDENTIFIER for the wire and the keytab, nothing more.
+    /// The enctype's number on the wire and in keytabs (RFC 3961 §8).
+    ///
+    /// This enum only names an enctype; key sizes and derivation live with
+    /// the crypto, where RFC 8009's enctype 20 can have Ke of 32 octets
+    /// and Kc and Ki of 24.
     pub fn etype(&self) -> i32 {
         *self as i32
     }
@@ -90,12 +107,39 @@ impl EncType {
 
 /// Service key from keytab
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ServiceKey {
+    /// The principal's name without the realm, components joined by `/`.
     pub principal: String,
+    /// The principal's realm.
     pub realm: String,
+    /// The key version number.
     pub kvno: u32, // Key version number
+    /// The key's enctype.
     pub enctype: EncType,
+    /// The key's bytes.
     pub key: Vec<u8>,
+}
+
+impl ServiceKey {
+    /// The key `key` of enctype `enctype` and version `kvno` for
+    /// `principal` (its name without the realm, `host/h.example.com`) in
+    /// `realm`.
+    pub fn new(
+        principal: impl Into<String>,
+        realm: impl Into<String>,
+        kvno: u32,
+        enctype: EncType,
+        key: impl Into<Vec<u8>>,
+    ) -> Self {
+        ServiceKey {
+            principal: principal.into(),
+            realm: realm.into(),
+            kvno,
+            enctype,
+            key: key.into(),
+        }
+    }
 }
 
 /// Kerberos keytab
@@ -481,12 +525,19 @@ fn create_private(path: &Path, truncate: bool) -> std::io::Result<File> {
 
 /// GSS-API Kerberos context
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct KerberosContext {
+    /// The ticket's client, `name@REALM`.
     pub client_principal: String,
+    /// The ticket's server, `name@REALM`.
     pub service_principal: String,
+    /// The ticket session key, which seals the AP-REP.
     pub session_key: Vec<u8>,
+    /// The ticket session key's enctype.
     pub enctype: EncType,
+    /// True once the AP-REQ has been accepted.
     pub established: bool,
+    /// The ticket client's realm.
     pub client_realm: String,
     /// The RFC 4121 §2 base key for PER-MESSAGE tokens: "the acceptor
     /// subkey, if the acceptor asserted one; otherwise the initiator
@@ -502,6 +553,7 @@ pub struct KerberosContext {
     /// part is always sealed with the TICKET SESSION KEY (RFC 4120
     /// §5.5.2), so both have to be carried.
     pub base_key: Vec<u8>,
+    /// [`Self::base_key`]'s enctype.
     pub base_key_enctype: EncType,
     /// True when the initiator supplied a subkey and it was adopted.
     pub used_initiator_subkey: bool,
@@ -539,6 +591,7 @@ pub struct KerberosContext {
 /// What [`KerberosContext::accept_token_with`] takes besides the keytab
 /// and the token.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct AcceptOptions {
     /// Clock-skew tolerance in seconds (default
     /// [`DEFAULT_CLOCK_SKEW_SECS`]; [`Krb5Conf::clockskew`](crate::Krb5Conf::clockskew)).
@@ -1985,14 +2038,14 @@ impl KerberosContext {
         ))
     }
 
-    /// Accept a GSS-API Kerberos AP-REQ token with FULL CRYPTOGRAPHY
+    /// Accept an initiator's GSS-API token (RFC 4121 §4.1) holding an
+    /// AP-REQ: decrypt the ticket with the keytab's key for its server,
+    /// enctype and kvno, check the ticket's validity and the
+    /// authenticator against the clock ([`DEFAULT_CLOCK_SKEW_SECS`]) and
+    /// the default replay cache, as MIT's `krb5_rd_req` does.
     ///
-    /// This implements complete Kerberos crypto:
-    /// 1. Parse GSS-API wrapper and extract AP-REQ
-    /// 2. Decrypt ticket with service key
-    /// 3. Extract session key from ticket
-    /// 4. Decrypt and validate authenticator
-    /// 5. Generate cryptographically valid AP-REP
+    /// Returns the context and the AP-REP token to send back, which is
+    /// empty unless the initiator asked for mutual authentication.
     pub fn accept_token(keytab: &Keytab, token: &[u8]) -> Result<(Self, Vec<u8>)> {
         Self::accept_token_with_skew(keytab, token, DEFAULT_CLOCK_SKEW_SECS)
     }

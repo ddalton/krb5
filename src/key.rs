@@ -30,13 +30,19 @@ impl fmt::Debug for Key {
 /// integrity check that did not verify.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
-pub struct KeyError(pub String);
+#[non_exhaustive]
+pub struct KeyError(
+    /// What went wrong.
+    pub String,
+);
 
 fn enctype(etype: i32) -> Result<Enctype, KeyError> {
     Enctype::from_i32(etype).map_err(|e| KeyError(e.to_string()))
 }
 
 impl Key {
+    /// A key of enctype `etype` from its raw octets, which must be exactly
+    /// the enctype's key size.
     pub fn new(etype: i32, bytes: Vec<u8>) -> Result<Self, KeyError> {
         let enctype = enctype(etype)?;
         if bytes.len() != enctype.key_size() {
@@ -70,10 +76,12 @@ impl Key {
         Key::new(etype, bytes)
     }
 
+    /// The RFC 3961 enctype number.
     pub fn enctype(&self) -> i32 {
         self.enctype.etype()
     }
 
+    /// The raw key octets.
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }

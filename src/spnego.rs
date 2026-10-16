@@ -386,6 +386,8 @@ impl SpnegoInitiator {
         }))
     }
 
+    /// True once negotiation is complete (RFC 4178 negState accept-completed)
+    /// and no further token need be sent.
     pub fn is_established(&self) -> bool {
         self.established
     }
@@ -587,6 +589,8 @@ impl<'k> SpnegoAcceptor<'k> {
         Ok(outcome.send.then_some((state, outcome.mic)))
     }
 
+    /// True once negotiation is complete (RFC 4178 negState accept-completed)
+    /// and the Kerberos context is available.
     pub fn is_established(&self) -> bool {
         self.established
     }

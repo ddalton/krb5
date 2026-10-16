@@ -29,8 +29,8 @@
 //! * **EC and RRC are zeroed in the crypto's copy of the header, but by
 //!   different rules that sit one paragraph apart.** With confidentiality
 //!   *only RRC* is zeroed and EC keeps its real value; without
-//!   confidentiality *both* are zeroed. See [`header_for_seal`] and
-//!   [`header_for_sign`].
+//!   confidentiality *both* are zeroed (`header_for_seal` and
+//!   `header_for_sign`, below).
 //!
 //! RFC 4121 publishes no test vectors at all — not one hex string beyond the
 //! fixed constants — and it cannot, because EC, RRC, the filler octets and
@@ -109,7 +109,9 @@ pub const KG_USAGE_INITIATOR_SIGN: u32 = 25;
 /// role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
+    /// The client, which sent the AP-REQ.
     Initiator,
+    /// The server, which accepted the AP-REQ; sets SentByAcceptor.
     Acceptor,
 }
 
@@ -155,47 +157,94 @@ impl Role {
 // Errors
 // ---------------------------------------------------------------------------
 
+/// A per-message token (RFC 4121 §4.2) failed to parse, verify or build.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum TokenError {
+    /// The token is shorter than its header or its declared EC/RRC.
     #[error("token truncated: {got} octets, need {need}")]
-    Truncated { got: usize, need: usize },
+    Truncated {
+        /// Octets received.
+        got: usize,
+        /// Octets required.
+        need: usize,
+    },
 
+    /// TOK_ID is not the one for this token type (RFC 4121 §4.2.6).
     #[error("bad TOK_ID {got:02x?}, expected {want:02x?}")]
-    BadTokId { got: [u8; 2], want: [u8; 2] },
+    BadTokId {
+        /// TOK_ID received.
+        got: [u8; 2],
+        /// TOK_ID expected.
+        want: [u8; 2],
+    },
 
     #[error("bad filler octets (RFC 4121 §4.2.6 requires 0xFF)")]
+    /// A Filler octet is not 0xFF.
     BadFiller,
 
+    /// SentByAcceptor names this endpoint's own role: a reflected token.
     #[error(
         "wrong direction: token claims SentByAcceptor={claimed}, \
          but this endpoint is the {local:?} — a reflected token"
     )]
-    WrongDirection { claimed: bool, local: Role },
+    WrongDirection {
+        /// The SentByAcceptor flag as received.
+        claimed: bool,
+        /// This endpoint's role.
+        local: Role,
+    },
 
     #[error("Sealed flag set in a MIC token (RFC 4121 §4.2.2: it SHALL NOT be set)")]
+    /// A MIC token has the Sealed flag set.
     SealedMic,
 
+    /// AcceptorSubkey is set but the AP-REP carried no acceptor subkey.
     #[error(
         "token is flagged AcceptorSubkey but the acceptor asserted no subkey \
          on this context (RFC 4121 §2)"
     )]
     UnexpectedAcceptorSubkey,
 
+    /// A Wrap token's Sealed flag does not match the service asked for
+    /// (`GSS_Unwrap` with or without confidentiality).
     #[error("Wrap token has Sealed={got}, but the {want} service was requested")]
-    WrongService { got: bool, want: &'static str },
+    WrongService {
+        /// The Sealed flag as received.
+        got: bool,
+        /// The service requested: `"privacy"` or `"integrity"`.
+        want: &'static str,
+    },
 
+    /// An unsealed Wrap token's EC is not the checksum length (RFC 4121 §4.2.4).
     #[error("EC is {got} but this enctype's checksum is {want} octets")]
-    BadExtraCount { got: usize, want: usize },
+    BadExtraCount {
+        /// EC as received.
+        got: usize,
+        /// The enctype's checksum length.
+        want: usize,
+    },
 
+    /// The checksum or the ciphertext's integrity tag did not verify.
     #[error("integrity check failed")]
     IntegrityCheckFailed,
 
+    /// The encrypted copy of the header in a sealed Wrap token differs from
+    /// the cleartext header (RFC 4121 §4.2.4).
     #[error("the header bound into the ciphertext does not match the transmitted header")]
     HeaderMismatch,
 
+    /// A caller-supplied confounder has the wrong length for the enctype.
     #[error("confounder must be {want} octets, got {got}")]
-    BadConfounder { got: usize, want: usize },
+    BadConfounder {
+        /// Length supplied.
+        got: usize,
+        /// The enctype's confounder length.
+        want: usize,
+    },
 
+    /// The underlying RFC 3961 crypto failed: unsupported enctype, bad key
+    /// length, or a key derivation error.
     #[error("crypto: {0}")]
     Crypto(String),
 }
@@ -214,7 +263,10 @@ pub enum TokenError {
 /// Wrap token unpinnable; [`PerMessageCrypto::encrypt`] therefore accepts an
 /// optional confounder so the tests can assert exact token octets instead of
 /// falling back to round-tripping the implementation against itself.
-pub trait PerMessageCrypto {
+///
+/// [`ContextKey`] is the implementation; the trait is sealed, so it can
+/// grow without breaking anyone.
+pub trait PerMessageCrypto: sealed::Sealed {
     /// `h` for the enctype — the truncated-HMAC length. 12 for enctypes
     /// 17/18, 16 for 19, 24 for 20. NOT the key size, and it does not scale
     /// with it: aes256-cts-hmac-sha1-96 still has h = 12.
@@ -259,6 +311,11 @@ pub trait PerMessageCrypto {
     }
 }
 
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for super::ContextKey {}
+}
+
 /// Constant-time equality.
 ///
 /// Every comparison in this module is over attacker-supplied bytes against a
@@ -284,7 +341,7 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 /// Build the 16-octet MIC header — RFC 4121 §4.2.6.1.
 ///
 /// `04 04 | Flags | FF FF FF FF FF | SND_SEQ(8, big-endian)`.
-pub fn mic_header(flags: u8, seq: u64) -> [u8; HEADER_LEN] {
+pub(crate) fn mic_header(flags: u8, seq: u64) -> [u8; HEADER_LEN] {
     let mut h = [0u8; HEADER_LEN];
     h[0..2].copy_from_slice(&TOK_ID_MIC);
     h[2] = flags;
@@ -300,7 +357,7 @@ pub fn mic_header(flags: u8, seq: u64) -> [u8; HEADER_LEN] {
 /// EC and RRC are big-endian here. RFC 4121 §4.1.1's authenticator-checksum
 /// fields are *little*-endian — the same document uses both orders — so do not
 /// carry an endianness helper across that boundary.
-pub fn wrap_header(flags: u8, ec: u16, rrc: u16, seq: u64) -> [u8; HEADER_LEN] {
+pub(crate) fn wrap_header(flags: u8, ec: u16, rrc: u16, seq: u64) -> [u8; HEADER_LEN] {
     let mut h = [0u8; HEADER_LEN];
     h[0..2].copy_from_slice(&TOK_ID_WRAP);
     h[2] = flags;
@@ -318,7 +375,7 @@ pub fn wrap_header(flags: u8, ec: u16, rrc: u16, seq: u64) -> [u8; HEADER_LEN] {
 /// Only RRC is zeroed. EC keeps its real value. Zeroing EC as well is a
 /// widespread bug that is invisible whenever EC is 0 (the normal case for
 /// AES) and breaks against any peer that sends filler.
-pub fn header_for_seal(transmitted: &[u8; HEADER_LEN]) -> [u8; HEADER_LEN] {
+pub(crate) fn header_for_seal(transmitted: &[u8; HEADER_LEN]) -> [u8; HEADER_LEN] {
     let mut h = *transmitted;
     h[6] = 0;
     h[7] = 0;
@@ -333,7 +390,7 @@ pub fn header_for_seal(transmitted: &[u8; HEADER_LEN]) -> [u8; HEADER_LEN] {
 /// The opposite rule from [`header_for_seal`], one paragraph away in the same
 /// section. Read EC off the wire *before* calling this: EC is what tells you
 /// where the checksum starts, and zeroing the working header first loses it.
-pub fn header_for_sign(transmitted: &[u8; HEADER_LEN]) -> [u8; HEADER_LEN] {
+pub(crate) fn header_for_sign(transmitted: &[u8; HEADER_LEN]) -> [u8; HEADER_LEN] {
     let mut h = *transmitted;
     h[4] = 0;
     h[5] = 0;
@@ -358,7 +415,7 @@ pub fn header_for_sign(transmitted: &[u8; HEADER_LEN]) -> [u8; HEADER_LEN] {
 /// 8-octet body is legal on the wire, and an unreduced index would be a
 /// remotely triggerable panic. The empty-body guard is the same hazard: a
 /// bare 16-octet token divides by zero.
-pub fn rotate_right(body: &[u8], rrc: u16) -> Vec<u8> {
+pub(crate) fn rotate_right(body: &[u8], rrc: u16) -> Vec<u8> {
     if body.is_empty() {
         return Vec::new();
     }
@@ -374,7 +431,7 @@ pub fn rotate_right(body: &[u8], rrc: u16) -> Vec<u8> {
 /// It rotates LEFT. Rotating right a second time is a no-op only when
 /// `2·rrc ≡ 0 (mod n)`, so it appears to work at RRC = 0 and breaks on the
 /// first peer that picks anything else.
-pub fn rotate_left(body: &[u8], rrc: u16) -> Vec<u8> {
+pub(crate) fn rotate_left(body: &[u8], rrc: u16) -> Vec<u8> {
     if body.is_empty() {
         return Vec::new();
     }
@@ -393,6 +450,7 @@ pub fn rotate_left(body: &[u8], rrc: u16) -> Vec<u8> {
 /// integrity check passed — SND_SEQ and Flags travel in clear text and are
 /// authenticated solely by being bound into the MAC or the ciphertext.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Verified {
     /// SND_SEQ, RFC 4121 §4.2.1. Do **not** enforce ordering on this under
     /// RPCSEC_GSS: RFC 2203 §5.2.2 requires replay/sequence detection to be
@@ -432,10 +490,12 @@ impl<C: PerMessageCrypto> PerMessageTokens<C> {
         }
     }
 
+    /// This endpoint's role.
     pub fn role(&self) -> Role {
         self.role
     }
 
+    /// The crypto the tokens are computed with.
     pub fn crypto(&self) -> &C {
         &self.crypto
     }
@@ -777,35 +837,12 @@ impl<C: PerMessageCrypto> PerMessageTokens<C> {
     }
 }
 
-/// The exact buffer RFC 4121 §4.2.4 encrypts for a sealed Wrap token:
-/// `plaintext | filler | header` with RRC zeroed in the header copy.
-///
-/// Exposed so a test can assert it byte-for-byte. That assertion is the point:
-/// the data-then-header order and the zero-RRC-but-keep-EC rule are invisible
-/// to any round-trip, because a sender and receiver that are both wrong agree.
-pub fn seal_input(plaintext: &[u8], ec: u16, transmitted: &[u8; HEADER_LEN]) -> Vec<u8> {
-    let ec = ec as usize;
-    let mut out = Vec::with_capacity(plaintext.len() + ec + HEADER_LEN);
-    out.extend_from_slice(plaintext);
-    // §4.2.4: "The values and size of the filler octets are chosen by
-    // implementations". Zeros are fine; only the count is on the wire.
-    out.resize(plaintext.len() + ec, 0);
-    out.extend_from_slice(&header_for_seal(transmitted));
-    out
-}
-
-/// The exact buffer RFC 4121 §4.2.4 checksums for an unsealed Wrap token:
-/// `plaintext | header` with **both** EC and RRC zeroed.
-pub fn sign_input(plaintext: &[u8], transmitted: &[u8; HEADER_LEN]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(plaintext.len() + HEADER_LEN);
-    out.extend_from_slice(plaintext);
-    out.extend_from_slice(&header_for_sign(transmitted));
-    out
-}
-
 /// The exact buffer RFC 4121 §4.2.4 checksums for a MIC token:
 /// `message | header`, header verbatim — a MIC token has no EC or RRC to zero.
-pub fn mic_input(message: &[u8], header: &[u8; HEADER_LEN]) -> Vec<u8> {
+/// A test asserts it byte-for-byte: the data-then-header order is
+/// invisible to a round-trip, as a sender and receiver both wrong agree.
+#[cfg(test)]
+pub(crate) fn mic_input(message: &[u8], header: &[u8; HEADER_LEN]) -> Vec<u8> {
     let mut out = Vec::with_capacity(message.len() + HEADER_LEN);
     out.extend_from_slice(message);
     out.extend_from_slice(header);
@@ -877,6 +914,7 @@ impl ContextKey {
         })
     }
 
+    /// The base key's enctype.
     pub fn enctype(&self) -> profile::Enctype {
         self.enctype
     }
@@ -1028,6 +1066,8 @@ mod tests {
             }
         }
     }
+
+    impl super::sealed::Sealed for Stub {}
 
     impl PerMessageCrypto for Stub {
         fn checksum_len(&self) -> usize {

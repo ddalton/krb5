@@ -46,11 +46,17 @@ const OP_GET_CRED_LIST: u16 = 13001;
 const OP_REPLACE: u16 = 13002;
 
 // krb5 error codes (krb5_err.et) that KCM daemons send back.
+/// `KRB5_CC_NOTFOUND`: no matching credential.
 pub const KRB5_CC_NOTFOUND: i32 = -1765328243;
+/// `KRB5_CC_END`: the end of the cache was reached.
 pub const KRB5_CC_END: i32 = -1765328242;
+/// `KRB5_CC_IO`: the cache operation failed.
 pub const KRB5_CC_IO: i32 = -1765328191;
+/// `KRB5_FCC_NOFILE`: no such cache.
 pub const KRB5_FCC_NOFILE: i32 = -1765328189;
+/// `KRB5_FCC_INTERNAL`: an internal cache error.
 pub const KRB5_FCC_INTERNAL: i32 = -1765328188;
+/// `KRB5_CC_NOSUPP`: the operation is not supported.
 pub const KRB5_CC_NOSUPP: i32 = -1765328137;
 
 /// MIT's `unsupported_op_error`: Heimdal answers an unknown opcode with
@@ -90,6 +96,8 @@ pub struct Kcm {
 }
 
 impl Kcm {
+    /// Connect to the daemon at `socket`, with a 30-second read and write
+    /// timeout.
     pub fn connect(socket: &Path) -> Result<Self> {
         let stream = UnixStream::connect(socket).map_err(|source| CacheError::KcmUnavailable {
             socket: socket.to_path_buf(),

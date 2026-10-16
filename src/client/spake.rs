@@ -38,6 +38,7 @@ const SF_NONE: i64 = 1;
 
 /// A SPAKE group (the IANA "Kerberos SPAKE Groups" registry).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum SpakeGroup {
     /// edwards25519 (RFC 7748), MIT's client default.
     Edwards25519,
@@ -84,6 +85,7 @@ impl SpakeGroup {
         }
     }
 
+    /// The group with registry number `id`, if this crate knows it.
     pub fn from_id(id: i32) -> Option<SpakeGroup> {
         Self::ALL.into_iter().find(|g| g.id() == id)
     }

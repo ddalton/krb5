@@ -557,6 +557,7 @@ fn dns_answers_agree_with_dig() {
                     weight,
                     target,
                 } => format!("{priority} {weight} \"{target}\"").to_ascii_lowercase(),
+                other => panic!("asked for SRV and URI records, got {other:?}"),
             })
             .collect();
         want.sort();
@@ -1337,10 +1338,8 @@ fn mits_acceptor_checks_our_channel_bindings() {
             let Some(mut mit) = MitPeer::spawn(&e, "MEMORY:", &["accept", "--cb", &cb_hex]) else {
                 return;
             };
-            let opts = krb5::initiator::InitOptions {
-                channel_bindings: ours,
-                ..Default::default()
-            };
+            let mut opts = krb5::initiator::InitOptions::default();
+            opts.channel_bindings = ours;
             let flags = MUTUAL_INTEG_CONF | extra;
             let label = format!(
                 "spnego {spnego}, bindings {:?}, flags {extra:#x}",
@@ -1425,10 +1424,8 @@ fn our_acceptor_checks_mits_channel_bindings() {
             let Some(mut mit) = MitPeer::spawn_with(&e, &name, cbt_conf, &args) else {
                 return;
             };
-            let opts = krb5::acceptor::AcceptOptions {
-                channel_bindings: Some(ours.clone()),
-                ..Default::default()
-            };
+            let mut opts = krb5::acceptor::AcceptOptions::default();
+            opts.channel_bindings = Some(ours.clone());
             let mut acc = krb5::spnego::SpnegoAcceptor::with_options(&keytab, opts);
             let token = mit.token().unwrap().unwrap();
             let label = format!("spnego {spnego}, MIT {extra:?}, CBT {cbt}");
@@ -1699,10 +1696,9 @@ fn bob_tgt(e: &Env) -> Credentials {
 }
 
 fn u2u_opts() -> krb5::initiator::InitOptions<'static> {
-    krb5::initiator::InitOptions {
-        use_session_key: true,
-        ..Default::default()
-    }
+    let mut opts = krb5::initiator::InitOptions::default();
+    opts.use_session_key = true;
+    opts
 }
 
 /// Our client asks MIT's KDC for a ticket in the session key of bob's
@@ -2056,11 +2052,7 @@ fn otp_login_through_fast_and_radius() {
     // MIT's KDC describes one token and nothing about it.
     kdc.login_with_otp_by(&user, |ch| {
         assert_eq!((ch.tokens.len(), ch.service.as_deref()), (1, None));
-        Ok(OtpAnswer {
-            token: 0,
-            value: "424242".into(),
-            pin: None,
-        })
+        Ok(OtpAnswer::new(0, "424242"))
     })
     .unwrap();
     let err = e.client.login_with_otp(&user, "424242").unwrap_err();
@@ -3237,11 +3229,9 @@ mod kadmin {
         let (e, server) = kadm!();
         let mut a = admin(&e, &server);
         let p = fresh(&e, "made");
-        let changes = PrincipalChanges {
-            max_life: Some(3600),
-            max_renewable_life: Some(7200),
-            ..PrincipalChanges::default()
-        };
+        let mut changes = PrincipalChanges::default();
+        changes.max_life = Some(3600);
+        changes.max_renewable_life = Some(7200);
         a.create_principal(&p, &changes, Some("first-pw-1"))
             .unwrap();
         let err = a.create_principal(&p, &changes, Some("again")).unwrap_err();
@@ -3348,14 +3338,12 @@ mod kadmin {
         let (e, server) = kadm!();
         let mut a = admin(&e, &server);
         let name = format!("pol{}", std::process::id());
-        let pol = Policy {
-            name: name.clone(),
-            pw_min_length: 12,
-            pw_min_classes: 2,
-            pw_max_fail: 5,
-            pw_lockout_duration: 600,
-            ..Policy::default()
-        };
+        let mut pol = Policy::default();
+        pol.name = name.clone();
+        pol.pw_min_length = 12;
+        pol.pw_min_classes = 2;
+        pol.pw_max_fail = 5;
+        pol.pw_lockout_duration = 600;
         a.create_policy(&pol).unwrap();
         let got = a.get_policy(&name).unwrap();
         assert_eq!(
@@ -3366,19 +3354,15 @@ mod kadmin {
         if let Some(out) = mit_kadmin(&e, &format!("getpol {name}")) {
             assert!(out.contains("Minimum password length: 12"), "{out}");
         }
-        a.modify_policy(&Policy {
-            pw_min_length: 14,
-            ..pol.clone()
-        })
-        .unwrap();
+        let mut longer = pol.clone();
+        longer.pw_min_length = 14;
+        a.modify_policy(&longer).unwrap();
         assert_eq!(a.get_policy(&name).unwrap().pw_min_length, 14);
 
         // A principal under the policy: a short password is refused.
         let p = fresh(&e, "pol");
-        let under = PrincipalChanges {
-            policy: Some(Some(name.clone())),
-            ..PrincipalChanges::default()
-        };
+        let mut under = PrincipalChanges::default();
+        under.policy = Some(Some(name.clone()));
         let err = a.create_principal(&p, &under, Some("short1A")).unwrap_err();
         assert_eq!(
             err.code().and_then(|c| c.name()),
@@ -3415,14 +3399,9 @@ mod kadmin {
                 .any(|(k, _)| k == "session_enctypes")
         );
 
-        a.modify_principal(
-            &p,
-            &PrincipalChanges {
-                policy: Some(None),
-                ..PrincipalChanges::default()
-            },
-        )
-        .unwrap();
+        let mut off = PrincipalChanges::default();
+        off.policy = Some(None);
+        a.modify_principal(&p, &off).unwrap();
         assert_eq!(a.get_principal(&p).unwrap().policy, None);
         a.delete_principal(&p).unwrap();
         a.delete_policy(&name).unwrap();
@@ -3498,20 +3477,13 @@ mod kadmin {
 
         // Policy refusals come back with kadmind's reason.
         let name = format!("kpwpol{}", std::process::id());
-        a.create_policy(&Policy {
-            name: name.clone(),
-            pw_min_length: 20,
-            ..Policy::default()
-        })
-        .unwrap();
-        a.modify_principal(
-            &p,
-            &PrincipalChanges {
-                policy: Some(Some(name.clone())),
-                ..PrincipalChanges::default()
-            },
-        )
-        .unwrap();
+        let mut pol = Policy::default();
+        pol.name = name.clone();
+        pol.pw_min_length = 20;
+        a.create_policy(&pol).unwrap();
+        let mut under = PrincipalChanges::default();
+        under.policy = Some(Some(name.clone()));
+        a.modify_principal(&p, &under).unwrap();
         let err = kpasswd::change_password(&e.client, &p, "kpw-set-3", "short", &kp).unwrap_err();
         match err {
             kpasswd::Error::Refused { code, message } => {

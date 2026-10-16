@@ -22,10 +22,16 @@ use crate::der::Reader;
 /// (`GSS_C_AF_UNSPEC`), as MIT, Windows and every TLS binding leave them.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ChannelBindings {
+    /// `initiator_addrtype`: the `GSS_C_AF_*` family of `initiator_address`.
     pub initiator_addrtype: u32,
+    /// `initiator_address`: the initiator's network address.
     pub initiator_address: Vec<u8>,
+    /// `acceptor_addrtype`: the `GSS_C_AF_*` family of `acceptor_address`.
     pub acceptor_addrtype: u32,
+    /// `acceptor_address`: the acceptor's network address.
     pub acceptor_address: Vec<u8>,
+    /// `application_data`: the channel's binding data, e.g. RFC 5929
+    /// `tls-server-end-point`.
     pub application_data: Vec<u8>,
 }
 

@@ -58,27 +58,51 @@ const TAG_DELTATIME: u16 = 1;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum CacheError {
+    /// Reading or writing `path` failed.
     #[error("{}: {source}", path.display())]
-    Io { path: PathBuf, source: io::Error },
+    Io {
+        /// The cache file, directory or KCM socket.
+        path: PathBuf,
+        /// The underlying error.
+        source: io::Error,
+    },
+    /// `path` is not in the ccache file format.
     #[error("{}: not a credential cache: {msg}", path.display())]
-    Format { path: PathBuf, msg: String },
+    Format {
+        /// The cache file.
+        path: PathBuf,
+        /// What is wrong with it.
+        msg: String,
+    },
     /// A cache type this crate does not implement (`KEYRING`, `API`, ...).
     #[error("credential cache type {0:?} is not supported (only FILE, DIR and KCM)")]
     UnsupportedType(String),
     /// No KCM daemon is listening (or KCM is disabled with
     /// `kcm_socket = -`).
     #[error("no KCM daemon at {}: {source}{}", socket.display(), if cfg!(target_os = "macos") { " (macOS's own KCM uses Mach IPC, which this crate does not speak)" } else { "" })]
-    KcmUnavailable { socket: PathBuf, source: io::Error },
+    KcmUnavailable {
+        /// The daemon's socket.
+        socket: PathBuf,
+        /// The error connecting to it.
+        source: io::Error,
+    },
     /// The KCM daemon refused an operation with a krb5 error code.
     #[error("KCM {op} failed: {} ({code})", kcm_error_name(*code))]
-    Kcm { op: &'static str, code: i32 },
+    Kcm {
+        /// The KCM operation, as MIT names it (`GET_PRINCIPAL`).
+        op: &'static str,
+        /// The krb5 error code; see [`kcm::error_name`].
+        code: i32,
+    },
     /// A KCM cache has no file path.
     #[error("{0} is not a file cache")]
     NotAFile(String),
+    /// A cache name (the first field) that does not parse, and why.
     #[error("bad credential cache name {0:?}: {1}")]
     BadName(String, String),
 }
 
+/// A result with a [`CacheError`].
 pub type Result<T> = std::result::Result<T, CacheError>;
 
 fn kcm_error_name(code: i32) -> &'static str {
@@ -98,20 +122,38 @@ fn kcm_error_name(code: i32) -> &'static str {
 ///
 /// Times are the file's unsigned 32-bit seconds; 0 means unset.
 #[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Entry {
+    /// The client principal.
     pub client: Principal,
+    /// The server principal the ticket is for.
     pub server: Principal,
+    /// The session key's enctype (the keyblock's).
     pub enctype: i32,
+    /// The session key.
     pub key: Vec<u8>,
+    /// When the initial authentication happened, in seconds since the
+    /// epoch.
     pub authtime: u32,
+    /// When the ticket becomes valid, in seconds since the epoch.
     pub starttime: u32,
+    /// When the ticket expires, in seconds since the epoch.
     pub endtime: u32,
+    /// The latest a renewal may extend the ticket to, in seconds since the
+    /// epoch.
     pub renew_till: u32,
+    /// MIT's `is_skey`: the ticket is user-to-user, in the session key of
+    /// `second_ticket`.
     pub is_skey: bool,
+    /// The ticket flags (RFC 4120 §5.3), bit 0 the most significant.
     pub flags: u32,
+    /// The ticket's client addresses, `(addrtype, address)`.
     pub addresses: Vec<(u16, Vec<u8>)>,
+    /// The ticket's authorization data, `(ad-type, ad-data)`.
     pub authdata: Vec<(u16, Vec<u8>)>,
+    /// The DER `Ticket`; a configuration entry's value.
     pub ticket: Vec<u8>,
+    /// The DER second ticket of a user-to-user request; empty if none.
     pub second_ticket: Vec<u8>,
 }
 
@@ -217,12 +259,14 @@ pub fn same_principal(a: &Principal, b: &Principal) -> bool {
 
 /// The contents of one `FILE:` credential cache.
 #[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CCache {
     /// The default principal: whose tickets these are.
     pub principal: Principal,
     /// Version-4 header fields, `(tag, value)`, kept for a rewrite. Tag 1
     /// is the KDC time offset; see [`CCache::time_offset`].
     pub header: Vec<(u16, Vec<u8>)>,
+    /// The credentials and configuration entries, in file order.
     pub entries: Vec<Entry>,
 }
 
@@ -728,7 +772,9 @@ pub enum CacheName {
     /// `KCM:name`, or `KCM:` for the daemon's primary cache. `socket` is
     /// `None` when `kcm_socket = -` disables KCM.
     Kcm {
+        /// The cache's name in the daemon; empty for its primary cache.
         name: String,
+        /// The daemon's socket.
         socket: Option<PathBuf>,
     },
 }

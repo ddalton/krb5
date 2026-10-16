@@ -33,7 +33,43 @@ may break the API).
 
 ### Changed
 
+The public API is settled for 1.0: what it promises is smaller, and what
+remains can grow in minor releases.
+
+- The raw crypto is no longer public: the `kdf`, `nfold` and `profile`
+  modules, and `token`'s header and rotation helpers (`mic_header`,
+  `wrap_header`, `header_for_seal`, `header_for_sign`, `rotate_left`,
+  `rotate_right`, `seal_input`, `sign_input`, `mic_input`). Keys,
+  encryption and checksums are reached through `Key`, and per-message
+  tokens through `token::PerMessageTokens` and `ContextKey`, as before.
+  This also drops the duplicate enctype enums `kdf::Enctype` and
+  `profile::Enctype`; `EncType` names enctypes.
+- `token::PerMessageCrypto` is sealed: `ContextKey` implements it, and
+  no one else can, so it can gain methods.
+- `#[non_exhaustive]` on the error enums (`KerberosError`, `PacError`,
+  `TokenError`, and `KeyError`), on enums that may grow (`EncType`,
+  `Transport`, `SpakeGroup`, `dns::Record`, `kpasswd::ResultCode`), and on
+  the structs with public fields (`Credentials`, `KerberosContext`,
+  `ServiceKey`, `CCache`, `ccache::Entry`, `ClientDefaults`,
+  `dns::Resolver`, the OTP, kadmin and PAC structs, `token::Verified`) and
+  options (`AcceptOptions`, `InitOptions`, `PrincipalChanges`, `Policy`,
+  `OtpAnswer`). Their fields stay public. Build options from `Default`
+  and set fields: `let mut o = AcceptOptions::default(); o.max_skew_secs
+  = 60;`. New constructors for the ones built by hand:
+  `ServiceKey::new`, and `OtpAnswer::new` with `with_pin`. `Principal`,
+  `ChannelBindings`, and the PAC's `Sid` and `GroupMembership`, which
+  mirror fixed wire structures, are unchanged.
 - `KdcClient::login_with_otp_by`'s callback must be `Sync`.
+
+### Documentation
+
+- Every public item is documented (`#![warn(missing_docs)]`, an error in
+  CI), and docs.rs marks the items each feature adds.
+- The README lists the features and their dependencies, and states the
+  MSRV policy (1.85; raised only in a minor release, to a version at
+  least six months old) and what `#[non_exhaustive]` allows.
+- 0.13.1's notes counted the default build's direct dependencies as 9;
+  there are 8.
 
 ## [0.13.1] - 2026-10-15
 

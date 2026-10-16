@@ -26,10 +26,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// RFC 2743 / RFC 4121 §4.1.1.1 context flags.
 pub const GSS_C_DELEG_FLAG: u32 = 1;
+/// `GSS_C_MUTUAL_FLAG`: the acceptor authenticates back with an AP-REP.
 pub const GSS_C_MUTUAL_FLAG: u32 = 2;
+/// `GSS_C_REPLAY_FLAG`: detect replayed per-message tokens.
 pub const GSS_C_REPLAY_FLAG: u32 = 4;
+/// `GSS_C_SEQUENCE_FLAG`: detect out-of-sequence per-message tokens.
 pub const GSS_C_SEQUENCE_FLAG: u32 = 8;
+/// `GSS_C_CONF_FLAG`: Wrap tokens may be sealed (confidentiality).
 pub const GSS_C_CONF_FLAG: u32 = 16;
+/// `GSS_C_INTEG_FLAG`: MIC and Wrap tokens are available (integrity).
 pub const GSS_C_INTEG_FLAG: u32 = 32;
 /// MIT's `GSS_C_CHANNEL_BOUND_FLAG` (MS-KILE `KERB_AP_OPTIONS_CBT`): asked
 /// for, the initiator tells the acceptor it sends channel bindings, so an
@@ -67,6 +72,7 @@ const KERB_AP_OPTIONS_CBT: u32 = 0x4000;
 /// What [`InitiatorContext::with_options`] takes besides the ticket and
 /// flags.
 #[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct InitOptions<'a> {
     /// A forwarded TGT to delegate (see
     /// [`InitiatorContext::new_delegating`]).
@@ -240,6 +246,8 @@ impl InitiatorContext {
         Ok(())
     }
 
+    /// True once the context is complete: after the AP-REQ without
+    /// `GSS_C_MUTUAL_FLAG`, or after a verified AP-REP with it.
     pub fn is_established(&self) -> bool {
         self.established
     }

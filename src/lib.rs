@@ -111,6 +111,8 @@
 //! # Ok(())
 //! # }
 //! ```
+#![cfg_attr(docsrs, feature(doc_cfg))]
+#![warn(missing_docs)]
 
 pub mod acceptor;
 pub mod bindings; // GSS-API channel bindings (RFC 4121 §4.1.1.2, RFC 5929)
@@ -121,16 +123,16 @@ mod der;
 pub mod dns; // KDC discovery: URI and SRV records, stub resolver
 pub mod initiator;
 pub mod kadmin; // kadmind's kadm5 RPC protocol: what kadmin does
-pub mod kdf; // RFC 3961 §5.1 DR/DK, RFC 3962 §4, RFC 8009 §3
+mod kdf; // RFC 3961 §5.1 DR/DK, RFC 3962 §4, RFC 8009 §3
 pub mod key;
 pub mod kpasswd; // password changes over the kpasswd protocol (RFC 3244)
 mod md5; // RFC 1321 and HMAC-MD5: channel bindings, PAC signatures, MS-SFU
 mod net; // the sockets, blocking or tokio's
-pub mod nfold; // RFC 3961 §5.1 n-fold
+mod nfold; // RFC 3961 §5.1 n-fold
 pub mod pac; // MS-PAC: the authorization data Windows and MIT put in tickets
 #[cfg(feature = "pkinit")]
 pub mod pkinit; // RFC 4556 PKINIT, RFC 8062 anonymous PKINIT
-pub mod profile; // RFC 3961 §5.3 simplified profile (confounder + HMAC)
+mod profile; // RFC 3961 §5.3 simplified profile (confounder + HMAC)
 pub mod rcache; // replay detection for AP-REQs (RFC 4120 §3.2.3)
 pub mod spnego; // RFC 4178 SPNEGO, for HTTP Negotiate, SMB and Windows
 pub mod token; // RFC 4121 §4.2 per-message Wrap and MIC tokens

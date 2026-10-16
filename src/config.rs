@@ -41,34 +41,65 @@ const MAX_INCLUDE_DEPTH: usize = 16;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ConfigError {
+    /// A file could not be read.
     #[error("{}: {source}", path.display())]
-    Io { path: PathBuf, source: io::Error },
+    Io {
+        /// The file.
+        path: PathBuf,
+        /// The read error.
+        source: io::Error,
+    },
     /// A syntax error, with MIT's error name where it has one.
     #[error("{}line {line}: {msg}", origin(path))]
     Syntax {
+        /// The file, or `None` for text given to [`Krb5Conf::parse`].
         path: Option<PathBuf>,
+        /// The line number, from 1.
         line: usize,
+        /// What is wrong.
         msg: String,
     },
+    /// The realm's `kdc` relations are all of kinds this crate cannot use.
     #[error("[realms] {realm} has no usable kdc entry{}", if skipped.is_empty() { String::new() } else { format!(" (unsupported: {})", skipped.join(", ")) })]
-    NoKdcs { realm: String, skipped: Vec<String> },
+    NoKdcs {
+        /// The realm.
+        realm: String,
+        /// The entries passed over as unsupported.
+        skipped: Vec<String>,
+    },
+    /// A `kdc` relation that is not a valid `host[:port]`.
     #[error("[realms] {realm}: bad kdc entry {entry:?}")]
-    BadKdc { realm: String, entry: String },
+    BadKdc {
+        /// The realm.
+        realm: String,
+        /// The entry as written.
+        entry: String,
+    },
     /// Neither krb5.conf nor DNS (`_kerberos` URI, `_kerberos._tcp` /
     /// `_udp` SRV) names a KDC for the realm.
     #[error("no KDC for {realm} in krb5.conf{}", if *dns { " or DNS" } else { " (DNS lookup is off: dns_lookup_kdc)" })]
-    NoKdcFound { realm: String, dns: bool },
+    NoKdcFound {
+        /// The realm.
+        realm: String,
+        /// Whether DNS was consulted (`dns_lookup_kdc`).
+        dns: bool,
+    },
     /// The DNS lookup itself failed (no nameserver answered).
     #[error("looking up the KDCs for {realm} in DNS: {source}")]
     Dns {
+        /// The realm.
         realm: String,
+        /// The resolver error.
         source: std::io::Error,
     },
     /// A `[libdefaults]` value that does not parse or leaves nothing usable.
     #[error("[libdefaults] {tag} = {value:?}: {why}")]
     BadValue {
+        /// The relation name, such as `ticket_lifetime`.
         tag: String,
+        /// The value as written.
         value: String,
+        /// What is wrong with it.
         why: String,
     },
 }
@@ -79,6 +110,7 @@ fn origin(path: &Option<PathBuf>) -> String {
         .unwrap_or_default()
 }
 
+/// A result with a [`ConfigError`].
 pub type Result<T> = std::result::Result<T, ConfigError>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -269,6 +301,7 @@ impl Krb5Conf {
 /// What `[libdefaults]` says about the tickets a client asks for, for one
 /// realm (see [`Krb5Conf::client_defaults`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ClientDefaults {
     /// Enctypes for initial tickets (`default_tkt_enctypes`), AES only.
     pub tkt_enctypes: Vec<i32>,

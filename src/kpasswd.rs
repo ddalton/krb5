@@ -42,16 +42,25 @@ const ADDRTYPE_INET6: i32 = 24;
 
 /// What the server answered (RFC 3244 §2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ResultCode {
+    /// `KRB5_KPASSWD_MALFORMED` (1): the request was malformed.
     Malformed,
+    /// `KRB5_KPASSWD_HARDERROR` (2): the server failed processing it.
     HardError,
+    /// `KRB5_KPASSWD_AUTHERROR` (3): authentication failed.
     AuthError,
     /// The new password was refused (quality, history, minimum life).
     SoftError,
+    /// `KRB5_KPASSWD_ACCESSDENIED` (5): the requester may not make this
+    /// change.
     AccessDenied,
+    /// `KRB5_KPASSWD_BAD_VERSION` (6): the protocol version is not
+    /// supported.
     BadVersion,
     /// The ticket must be an initial one (from the old password).
     InitialFlagNeeded,
+    /// Any other nonzero code.
     Other(u16),
 }
 
@@ -76,13 +85,24 @@ impl ResultCode {
 pub enum Error {
     /// The server refused the change, saying why.
     #[error("password change refused ({code:?}): {message}")]
-    Refused { code: ResultCode, message: String },
+    Refused {
+        /// The result code.
+        code: ResultCode,
+        /// The server's result string.
+        message: String,
+    },
+    /// Getting the `kadmin/changepw` ticket failed, or the server sent a
+    /// KRB-ERROR.
     #[error(transparent)]
     Client(#[from] ClientError),
+    /// Reaching the server failed.
     #[error("kpasswd: {0}")]
     Io(std::io::Error),
+    /// The server's reply is malformed or does not decrypt.
     #[error("kpasswd protocol: {0}")]
     Protocol(String),
+    /// No server is configured for the realm, or its name does not
+    /// resolve.
     #[error("kpasswd: {0}")]
     Config(String),
 }
@@ -93,6 +113,7 @@ impl From<der::DerError> for Error {
     }
 }
 
+/// A result with a kpasswd [`Error`].
 pub type Result<T> = std::result::Result<T, Error>;
 
 fn bad<T>(msg: impl Into<String>) -> Result<T> {

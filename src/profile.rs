@@ -61,9 +61,9 @@
 //! 4120 EncryptedData and RFC 4121 per-message tokens each encrypt from the
 //! initial state, so nothing in this crate chains one. RFC 8009 Appendix A notes
 //! that *all* its samples use the default cipher state, so the chaining rule
-//! has no published vector at all — we expose [`cts_next_iv`] (which RFC 3962
-//! Appendix B *does* pin, as "Next IV") but deliberately do not build a
-//! stateful encrypt API on top of unverifiable ground.
+//! has no published vector at all — the tests check `cts_next_iv` against
+//! RFC 3962 Appendix B, which *does* pin it ("Next IV"), but nothing builds a
+//! stateful encrypt on top of unverifiable ground.
 
 use aes::cipher::{Array, BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
 use hmac::{Hmac, Mac};
@@ -349,6 +349,7 @@ fn xor_into(dst: &mut [u8; BLOCK_SIZE], src: &[u8]) {
 ///
 /// `iv` is the cipher state. Kerberos always supplies the initial (all-zero)
 /// state; see the module docs.
+#[cfg(test)]
 pub fn aes_cts_encrypt(key: &[u8], iv: &[u8; BLOCK_SIZE], plaintext: &[u8]) -> Result<Vec<u8>> {
     if plaintext.len() < BLOCK_SIZE {
         return Err(ProfileError::CtsInputTooShort(plaintext.len()));
@@ -358,7 +359,7 @@ pub fn aes_cts_encrypt(key: &[u8], iv: &[u8; BLOCK_SIZE], plaintext: &[u8]) -> R
     Ok(out)
 }
 
-/// [`aes_cts_encrypt`] over `buf`, in place.
+/// `aes_cts_encrypt` over `buf`, in place.
 fn cts_encrypt_in_place(cipher: &Aes, iv: &[u8; BLOCK_SIZE], buf: &mut [u8]) -> Result<()> {
     let n = buf.len();
     if n < BLOCK_SIZE {
@@ -407,11 +408,12 @@ fn cts_encrypt_in_place(cipher: &Aes, iv: &[u8; BLOCK_SIZE], buf: &mut [u8]) -> 
     Ok(())
 }
 
-/// Inverse of [`aes_cts_encrypt`].
+/// Inverse of `aes_cts_encrypt`.
 ///
 /// The final two blocks cannot be walked left-to-right like the rest: the
 /// octets stolen from `C_{n-1}` have to be recovered out of the decryption of
 /// `C_n` before `C_{n-1}` can be decrypted at all.
+#[cfg(test)]
 pub fn aes_cts_decrypt(key: &[u8], iv: &[u8; BLOCK_SIZE], ciphertext: &[u8]) -> Result<Vec<u8>> {
     if ciphertext.len() < BLOCK_SIZE {
         return Err(ProfileError::CtsInputTooShort(ciphertext.len()));
@@ -494,6 +496,7 @@ fn cts_decrypt(cipher: &Aes, iv: &[u8; BLOCK_SIZE], ciphertext: &[u8]) -> Result
 ///
 /// Nothing in this crate chains a cipher state (see the module docs); this exists
 /// so that if something ever does, the rule is already pinned.
+#[cfg(test)]
 pub fn cts_next_iv(ciphertext: &[u8]) -> Result<[u8; BLOCK_SIZE]> {
     let n = ciphertext.len();
     if n < BLOCK_SIZE {
@@ -586,6 +589,7 @@ pub fn encrypt(enctype: Enctype, ke: &[u8], ki: &[u8], plaintext: &[u8]) -> Resu
 /// Production callers want [`encrypt`]. Passing a fixed or predictable
 /// confounder outside a test destroys the non-malleability the profile
 /// requires.
+#[cfg(test)]
 pub fn encrypt_with_confounder(
     enctype: Enctype,
     ke: &[u8],
@@ -604,7 +608,7 @@ pub fn encrypt_parts(enctype: Enctype, ke: &[u8], ki: &[u8], parts: &[&[u8]]) ->
     encrypt_parts_with_confounder(enctype, ke, ki, conf, parts)
 }
 
-/// [`encrypt_with_confounder`] of the concatenation of `parts`.
+/// `encrypt_with_confounder` of the concatenation of `parts`.
 pub fn encrypt_parts_with_confounder(
     enctype: Enctype,
     ke: &[u8],

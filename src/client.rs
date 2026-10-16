@@ -51,7 +51,9 @@ use crate::pkinit;
 
 /// RFC 4120 §6.2 name types.
 pub const NT_PRINCIPAL: i32 = 1;
+/// A service and an instance, such as `krbtgt/REALM`.
 pub const NT_SRV_INST: i32 = 2;
+/// A service with a host name as its instance, such as `host/fqdn`.
 pub const NT_SRV_HST: i32 = 3;
 
 /// The enctypes requested by default, in MIT's preference order.
@@ -74,11 +76,17 @@ const PA_ETYPE_INFO2: i32 = 19;
 const PA_FX_COOKIE: i32 = 133;
 
 // RFC 4120 §7.5.9 error codes the client acts on.
+/// The client is not in the KDC's database.
 pub const KDC_ERR_C_PRINCIPAL_UNKNOWN: i32 = 6;
+/// The server is not in the KDC's database.
 pub const KDC_ERR_S_PRINCIPAL_UNKNOWN: i32 = 7;
+/// The KDC has no key in any of the enctypes requested.
 pub const KDC_ERR_ETYPE_NOSUPP: i32 = 14;
+/// Pre-authentication did not verify: usually a wrong password or key.
 pub const KDC_ERR_PREAUTH_FAILED: i32 = 24;
+/// The KDC wants pre-authentication; the e-data lists the methods it takes.
 pub const KDC_ERR_PREAUTH_REQUIRED: i32 = 25;
+/// The client's clock is too far from the KDC's.
 pub const KRB_AP_ERR_SKEW: i32 = 37;
 
 /// The largest reply accepted from a KDC.
@@ -90,23 +98,42 @@ const MAX_REPLY: usize = 1 << 20;
 pub enum ClientError {
     /// The KDC answered with a KRB-ERROR.
     #[error("KDC error {code} ({}){}", kdc_error_name(*code), text.as_ref().map(|t| format!(": {t}")).unwrap_or_default())]
-    Kdc { code: i32, text: Option<String> },
+    Kdc {
+        /// The `error-code` (RFC 4120 §7.5.9).
+        code: i32,
+        /// The `e-text`, if any.
+        text: Option<String>,
+    },
     /// No configured KDC could be reached.
     #[error("no KDC for {realm} answered: {last}")]
-    Unreachable { realm: String, last: std::io::Error },
+    Unreachable {
+        /// The realm whose KDCs were tried.
+        realm: String,
+        /// The error from the last attempt.
+        last: std::io::Error,
+    },
+    /// A message from the KDC, or one passed in, did not decode or did not
+    /// match the request.
     #[error("malformed Kerberos message: {0}")]
     Protocol(String),
+    /// Encryption, decryption or a checksum failed.
     #[error("crypto: {0}")]
     Crypto(#[from] KeyError),
     /// Neither the password path nor the keytab could supply a key the
     /// KDC will accept.
     #[error("no usable key: {0}")]
     NoKey(String),
+    /// The credential cache could not be read or written.
     #[error("credential cache: {0}")]
     Cache(#[from] CacheError),
     /// The cache holds no unexpired ticket-granting ticket.
     #[error("no valid TGT for {principal} in {cache} (run kinit)")]
-    NoTgt { principal: String, cache: String },
+    NoTgt {
+        /// The client principal looked for.
+        principal: String,
+        /// The cache searched.
+        cache: String,
+    },
     /// Another realm's KDCs could not be located.
     #[error(transparent)]
     Config(#[from] ConfigError),
@@ -136,6 +163,7 @@ impl ClientError {
     }
 }
 
+/// A result with a [`ClientError`].
 pub type Result<T> = std::result::Result<T, ClientError>;
 
 fn protocol<T>(msg: impl Into<String>) -> Result<T> {
@@ -179,12 +207,16 @@ pub fn kdc_error_name(code: i32) -> &'static str {
 /// A Kerberos principal: name type, name components and realm.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Principal {
+    /// The name type (RFC 4120 §6.2), such as [`NT_PRINCIPAL`].
     pub name_type: i32,
+    /// The name components: `host` and `fqdn` for `host/fqdn@REALM`.
     pub components: Vec<String>,
+    /// The realm.
     pub realm: String,
 }
 
 impl Principal {
+    /// A principal from its name type, components and realm.
     pub fn new<I, S>(name_type: i32, components: I, realm: impl Into<String>) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -283,9 +315,13 @@ impl fmt::Display for Principal {
 
 /// A ticket and the session key that goes with it.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Credentials {
+    /// The client the ticket was issued to.
     pub client: Principal,
+    /// The service the ticket is for, as requested.
     pub server: Principal,
+    /// The session key shared with the service.
     pub session_key: Key,
     /// The DER `Ticket`, opaque to the client and sent back verbatim.
     pub ticket: Vec<u8>,
@@ -293,9 +329,15 @@ pub struct Credentials {
     pub ticket_enctype: i32,
     /// RFC 4120 §5.3 TicketFlags, bit 0 = MSB.
     pub flags: u32,
+    /// When the client first authenticated, in seconds since the epoch.
     pub authtime: i64,
+    /// When the ticket becomes valid, in seconds since the epoch, if not
+    /// `authtime`.
     pub starttime: Option<i64>,
+    /// When the ticket expires, in seconds since the epoch.
     pub endtime: i64,
+    /// The latest the ticket can be renewed to, in seconds since the epoch,
+    /// if it is renewable.
     pub renew_till: Option<i64>,
 }
 
@@ -425,8 +467,11 @@ pub const KRB_ERR_RESPONSE_TOO_BIG: i32 = 52;
 
 /// How a KDC address may be reached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Transport {
+    /// TCP only.
     Tcp,
+    /// UDP only.
     Udp,
     /// Either, preferred by request size (`krb5.conf` entries, and DNS
     /// `_udp` records, which this crate also tries over TCP).
@@ -906,6 +951,7 @@ impl KdcClient {
         self
     }
 
+    /// The client's realm.
     pub fn realm(&self) -> &str {
         &self.realm
     }

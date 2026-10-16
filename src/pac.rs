@@ -25,19 +25,33 @@ use crate::der::{self, Fields, Reader};
 use crate::key::Key;
 
 // PAC_INFO_BUFFER ulType (MS-PAC 2.4).
+/// `KERB_VALIDATION_INFO`: the user's identity and groups (MS-PAC 2.5).
 pub const PAC_LOGON_INFO: u32 = 1;
+/// `PAC_CREDENTIAL_INFO`: encrypted credentials from PKINIT (MS-PAC 2.6).
 pub const PAC_CREDENTIALS_INFO: u32 = 2;
+/// The server signature over the PAC, keyed with the service's key (MS-PAC 2.8).
 pub const PAC_SERVER_CHECKSUM: u32 = 6;
+/// The KDC signature over the server signature, keyed with `krbtgt` (MS-PAC 2.8).
 pub const PAC_PRIVSVR_CHECKSUM: u32 = 7;
+/// `PAC_CLIENT_INFO`: the client's name and authtime (MS-PAC 2.7).
 pub const PAC_CLIENT_INFO: u32 = 10;
+/// `S4U_DELEGATION_INFO`: the services an S4U2Proxy ticket passed through (MS-PAC 2.9).
 pub const PAC_DELEGATION_INFO: u32 = 11;
+/// `UPN_DNS_INFO`: the UPN and DNS domain (MS-PAC 2.10).
 pub const PAC_UPN_DNS_INFO: u32 = 12;
+/// The client's claims (MS-PAC 2.11).
 pub const PAC_CLIENT_CLAIMS: u32 = 13;
+/// `PAC_DEVICE_INFO`: the device's identity and groups, for compound identity (MS-PAC 2.12).
 pub const PAC_DEVICE_INFO: u32 = 14;
+/// The device's claims (MS-PAC 2.13).
 pub const PAC_DEVICE_CLAIMS: u32 = 15;
+/// The ticket signature: the KDC's over the ticket's EncTicketPart, keyed with `krbtgt` (MS-PAC 2.8).
 pub const PAC_TICKET_CHECKSUM: u32 = 16;
+/// `PAC_ATTRIBUTES_INFO`: whether the PAC was requested (MS-PAC 2.14).
 pub const PAC_ATTRIBUTES_INFO: u32 = 17;
+/// `PAC_REQUESTOR`: the SID of the client the TGT was issued to (MS-PAC 2.15).
 pub const PAC_REQUESTOR: u32 = 18;
+/// The extended KDC signature over the whole PAC, keyed with `krbtgt` (MS-PAC 2.8).
 pub const PAC_FULL_CHECKSUM: u32 = 19;
 
 /// AD-WIN2K-PAC, inside AD-IF-RELEVANT (RFC 4120 §7.5.4).
@@ -52,8 +66,11 @@ const CKSUM_HMAC_MD5: i32 = -138;
 /// MIT's limit on the buffer count.
 const MAX_BUFFERS: u32 = 4096;
 
+/// A PAC that cannot be used.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum PacError {
+    /// The PAC or one of its buffers does not decode.
     #[error("malformed PAC: {0}")]
     Malformed(String),
     /// A signature did not verify (MIT's KRB5KRB_AP_ERR_MODIFIED).
@@ -471,9 +488,11 @@ impl FileTime {
 /// A security identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Sid {
+    /// The SID revision, 1.
     pub revision: u8,
     /// The 48-bit identifier authority.
     pub authority: u64,
+    /// The sub-authorities; in a domain account's SID the last is its RID.
     pub sub_authorities: Vec<u32>,
 }
 
@@ -529,8 +548,11 @@ impl fmt::Display for Sid {
 
 /// PAC_CLIENT_INFO.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ClientInfo {
+    /// `ClientId`: the ticket's authtime.
     pub authtime: FileTime,
+    /// The client's principal name, without the realm.
     pub name: String,
 }
 
@@ -550,14 +572,18 @@ impl ClientInfo {
 
 /// UPN_DNS_INFO (MS-PAC 2.10).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct UpnDnsInfo {
+    /// The user principal name.
     pub upn: String,
+    /// The DNS name of the user's domain.
     pub dns_domain: String,
     /// Flag U (1): the account has no UPN; this one was made up from the
     /// SAM name and domain.
     pub upn_constructed: bool,
     /// With flag S (2): the SAM account name and the user's SID.
     pub sam_name: Option<String>,
+    /// The user's SID, with flag S.
     pub sid: Option<Sid>,
 }
 
@@ -588,44 +614,76 @@ impl UpnDnsInfo {
 /// A group membership: a relative ID and its SE_GROUP_* attributes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GroupMembership {
+    /// `RelativeId`: the group's RID in its domain.
     pub rid: u32,
+    /// `Attributes`: SE_GROUP_* flags.
     pub attributes: u32,
 }
 
 /// PAC_LOGON_INFO: `KERB_VALIDATION_INFO` (MS-PAC 2.5).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct LogonInfo {
+    /// `LogonTime`: when the user logged on (FILETIME).
     pub logon_time: FileTime,
+    /// `LogoffTime`: when the logon session expires; "never" if none.
     pub logoff_time: FileTime,
+    /// `KickOffTime`: when the server should force a logoff; "never" if none.
     pub kickoff_time: FileTime,
+    /// `PasswordLastSet`: when the password last changed.
     pub password_last_set: FileTime,
+    /// `PasswordCanChange`: the earliest time the password may change.
     pub password_can_change: FileTime,
+    /// `PasswordMustChange`: when the password expires.
     pub password_must_change: FileTime,
+    /// `EffectiveName`: the SAM account name.
     pub effective_name: String,
+    /// `FullName`: the user's display name.
     pub full_name: String,
+    /// `LogonScript`: the logon script path.
     pub logon_script: String,
+    /// `ProfilePath`: the roaming profile path.
     pub profile_path: String,
+    /// `HomeDirectory`: the home directory path.
     pub home_directory: String,
+    /// `HomeDirectoryDrive`: the drive letter the home directory maps to.
     pub home_directory_drive: String,
+    /// `LogonCount`: successful logons, as the DC counts them.
     pub logon_count: u16,
+    /// `BadPasswordCount`: failed logons since the last success.
     pub bad_password_count: u16,
+    /// `UserId`: the user's RID in the logon domain.
     pub user_id: u32,
+    /// `PrimaryGroupId`: the primary group's RID in the logon domain.
     pub primary_group_id: u32,
+    /// `GroupIds`: the logon domain's groups the user is in.
     pub group_ids: Vec<GroupMembership>,
+    /// `UserFlags`: LOGON_* flags (e.g. LOGON_EXTRA_SIDS, LOGON_RESOURCE_GROUPS).
     pub user_flags: u32,
+    /// `UserSessionKey`: zero in a Kerberos PAC.
     pub user_session_key: [u8; 16],
+    /// `LogonServer`: the NetBIOS name of the DC that authenticated the user.
     pub logon_server: String,
+    /// `LogonDomainName`: the NetBIOS name of the user's domain.
     pub logon_domain_name: String,
+    /// `LogonDomainId`: the domain SID that `user_id` and `group_ids` are relative to.
     pub logon_domain_id: Option<Sid>,
+    /// `UserAccountControl`: USER_* account flags (MS-SAMR 2.2.1.12).
     pub user_account_control: u32,
+    /// `SubAuthStatus`: the subauthentication package's status; zero if none.
     pub sub_auth_status: u32,
+    /// `LastSuccessfulILogon`: the last interactive logon, if the DC records it.
     pub last_successful_i_logon: FileTime,
+    /// `LastFailedILogon`: the last failed interactive logon, if the DC records it.
     pub last_failed_i_logon: FileTime,
+    /// `FailedILogonCount`: failed interactive logons since the last success.
     pub failed_i_logon_count: u32,
     /// Other SIDs (universal groups from other domains, well-known SIDs),
     /// with their attributes.
     pub extra_sids: Vec<(Sid, u32)>,
+    /// `ResourceGroupDomainSid`: the domain SID that `resource_group_ids` are relative to.
     pub resource_group_domain_sid: Option<Sid>,
+    /// `ResourceGroupIds`: domain-local groups of the resource domain.
     pub resource_group_ids: Vec<GroupMembership>,
 }
 
@@ -728,6 +786,7 @@ impl LogonInfo {
 
 /// PAC_DELEGATION_INFO: `S4U_DELEGATION_INFO` (MS-PAC 2.9).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DelegationInfo {
     /// The service the S4U2Proxy ticket is for.
     pub proxy_target: String,

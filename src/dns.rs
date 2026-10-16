@@ -63,24 +63,35 @@ const UDP_MAX: usize = 512;
 
 /// A DNS answer of the type asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Record {
+    /// An SRV record (RFC 2782).
     Srv {
+        /// Lower is tried first.
         priority: u16,
+        /// Relative share among records of equal priority.
         weight: u16,
+        /// The service's port on `target`.
         port: u16,
         /// Absolute, with the trailing dot; `"."` means "no service".
         target: String,
     },
+    /// A URI record (RFC 7553): MIT's `krb5srv:` KDC locations.
     Uri {
+        /// Lower is tried first.
         priority: u16,
+        /// Relative share among records of equal priority.
         weight: u16,
+        /// The URI, as the record holds it.
         target: String,
     },
 }
 
 /// Where queries go.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Resolver {
+    /// The nameservers, asked in order.
     pub servers: Vec<SocketAddr>,
     /// Per query, per server (`options timeout:`, default 5 s).
     pub timeout: Duration,

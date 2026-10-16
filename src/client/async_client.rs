@@ -330,7 +330,9 @@ mod tests {
         send(c.s4u2proxy(t, t, p));
         send(c.user_to_user(t, p, &[]));
         send(crate::kpasswd::change_password_async(c, p, "a", "b", "s"));
-        send(crate::kpasswd::change_password_with_ticket_async(t, "b", "s"));
+        send(crate::kpasswd::change_password_with_ticket_async(
+            t, "b", "s",
+        ));
         send(crate::kpasswd::set_password_async(t, p, "b", "s"));
         #[cfg(feature = "pkinit")]
         {

@@ -295,10 +295,12 @@ impl TrustAnchors {
         self.certs.extend(other.certs);
     }
 
+    /// The number of anchors.
     pub fn len(&self) -> usize {
         self.certs.len()
     }
 
+    /// True when there are no anchors.
     pub fn is_empty(&self) -> bool {
         self.certs.is_empty()
     }
@@ -385,10 +387,12 @@ impl RevocationLists {
         }
     }
 
+    /// The number of CRLs.
     pub fn len(&self) -> usize {
         self.crls.len()
     }
 
+    /// True when there are no CRLs.
     pub fn is_empty(&self) -> bool {
         self.crls.is_empty()
     }

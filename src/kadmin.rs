@@ -104,22 +104,47 @@ const KADM5_POLICY_ALLOWED_KEYSALTS: u32 = 0x0400_0000;
 /// and [`PrincipalChanges::attributes`]: what `kadmin`'s `+preauth`,
 /// `-allow_tix` and the like set and clear.
 pub mod attributes {
+    /// `-allow_postdated`: no postdated tickets.
     pub const DISALLOW_POSTDATED: u32 = 0x0000_0001;
+    /// `-allow_forwardable`: no forwardable tickets.
     pub const DISALLOW_FORWARDABLE: u32 = 0x0000_0002;
+    /// `-allow_tgs_req`: no service tickets bought with a TGT.
     pub const DISALLOW_TGT_BASED: u32 = 0x0000_0004;
+    /// `-allow_renewable`: no renewable tickets.
     pub const DISALLOW_RENEWABLE: u32 = 0x0000_0008;
+    /// `-allow_proxiable`: no proxiable tickets.
     pub const DISALLOW_PROXIABLE: u32 = 0x0000_0010;
+    /// `-allow_dup_skey`: no user-to-user tickets encrypted in this principal's
+    /// session key.
     pub const DISALLOW_DUP_SKEY: u32 = 0x0000_0020;
+    /// `-allow_tix`: no tickets at all.
     pub const DISALLOW_ALL_TIX: u32 = 0x0000_0040;
+    /// `+requires_preauth`: preauthentication required.
     pub const REQUIRES_PRE_AUTH: u32 = 0x0000_0080;
+    /// `+requires_hwauth`: hardware preauthentication required.
     pub const REQUIRES_HW_AUTH: u32 = 0x0000_0100;
+    /// `+needchange`: the password must be changed before other tickets are
+    /// issued.
     pub const REQUIRES_PWCHANGE: u32 = 0x0000_0200;
+    /// `-allow_svr`: no service tickets for this principal.
     pub const DISALLOW_SVR: u32 = 0x0000_1000;
+    /// `+password_changing_service`: the principal is a password-change
+    /// service.
     pub const PWCHANGE_SERVICE: u32 = 0x0000_2000;
+    /// `KRB5_KDB_NEW_PRINC`: set by the KDC database on new principals;
+    /// `kadmin` has no flag for it.
     pub const NEW_PRINC: u32 = 0x0000_8000;
+    /// `+ok_as_delegate`: the KDC sets ok-as-delegate in this service's
+    /// tickets.
     pub const OK_AS_DELEGATE: u32 = 0x0010_0000;
+    /// `+ok_to_auth_as_delegate`: the service may use S4U2Self protocol
+    /// transition.
     pub const OK_TO_AUTH_AS_DELEGATE: u32 = 0x0020_0000;
+    /// `+no_auth_data_required`: no PAC or other authorization data in this
+    /// service's tickets.
     pub const NO_AUTH_DATA_REQUIRED: u32 = 0x0040_0000;
+    /// `+lockdown_keys`: the keys may not be extracted or changed
+    /// (`KADM5_PROTECT_KEYS`).
     pub const LOCKDOWN_KEYS: u32 = 0x0080_0000;
 }
 
@@ -351,6 +376,7 @@ pub enum Error {
     #[error(transparent)]
     Client(#[from] ClientError),
     #[error("kadmin connection: {0}")]
+    /// Connecting to, reading from or writing to `kadmind`.
     Io(std::io::Error),
     /// The RPC layer refused the call (program, version, authentication).
     #[error("kadmin RPC: {0}")]
@@ -359,6 +385,8 @@ pub enum Error {
     #[error("kadmin protocol: {0}")]
     Protocol(String),
     #[error("kadmin: {0}")]
+    /// Not possible with this configuration or server: no `admin_server` for
+    /// the realm, or an API version too old for the call.
     Config(String),
     /// Writing the keytab (`ktadd`).
     #[error("keytab: {0}")]
@@ -381,6 +409,7 @@ impl Error {
     }
 }
 
+/// A kadmin result.
 pub type Result<T> = std::result::Result<T, Error>;
 
 // ------------------------------------------------------- principal names
@@ -464,8 +493,11 @@ pub(crate) fn parse_name(s: &str) -> Result<Principal> {
 /// these): its kvno, enctype and salt type. The key itself never leaves
 /// `kadmind` here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct KeyInfo {
+    /// Key version number.
     pub kvno: u32,
+    /// Encryption type number (RFC 3961).
     pub enctype: i32,
     /// `KRB5_KDB_SALTTYPE_*`: 0 normal, 3 only-realm, 4 special.
     pub salt_type: i32,
@@ -474,24 +506,41 @@ pub struct KeyInfo {
 /// `kadm5_principal_ent_rec`: a principal's database entry. Times are
 /// Unix seconds and durations seconds, 0 meaning never or unset.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PrincipalEntry {
+    /// The principal's name.
     pub principal: Principal,
+    /// When the principal expires (`-expire`).
     pub princ_expire_time: i64,
+    /// When the password or keys last changed.
     pub last_pwd_change: i64,
+    /// When the password expires (`-pwexpire`).
     pub pw_expiration: i64,
+    /// Maximum ticket life (`-maxlife`).
     pub max_life: i64,
+    /// Who last modified the entry; `None` if kadmind sent none.
     pub mod_name: Option<Principal>,
+    /// When the entry was last modified.
     pub mod_date: i64,
     /// [`attributes`] bits.
     pub attributes: u32,
+    /// Current key version number.
     pub kvno: u32,
+    /// Version of the master key the keys are encrypted in.
     pub mkvno: u32,
+    /// The password policy (`-policy`); `None` for none.
     pub policy: Option<String>,
+    /// `KADM5_POLICY`'s bit (0x800) set when a policy applies.
     pub aux_attributes: u32,
+    /// Maximum renewable life (`-maxrenewlife`).
     pub max_renewable_life: i64,
+    /// Last successful AS-REQ authentication, if the KDC records it.
     pub last_success: i64,
+    /// Last failed authentication, if the KDC records it.
     pub last_failed: i64,
+    /// Failed authentications since the last success or unlock; drives lockout.
     pub fail_auth_count: u32,
+    /// The principal's keys, without their contents.
     pub keys: Vec<KeyInfo>,
     /// Tagged data (`KRB5_TL_*`), as kadmind sent it.
     pub tl_data: Vec<(i16, Vec<u8>)>,
@@ -501,6 +550,7 @@ pub struct PrincipalEntry {
 /// sent, with its bit in the field mask, as `kadmin`'s `addprinc` and
 /// `modprinc` options do.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PrincipalChanges {
     /// `-expire`: Unix seconds, 0 for never.
     pub princ_expire_time: Option<i64>,
@@ -555,23 +605,43 @@ impl PrincipalChanges {
 /// with no options: minimum length, character classes and history 1,
 /// everything else 0 (no limit). kadmind refuses less than 1 for those.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Policy {
+    /// The policy's name.
     pub name: String,
+    /// `-minlife`: least time between password changes.
     pub pw_min_life: i64,
+    /// `-maxlife`: how long a password lasts before it expires.
     pub pw_max_life: i64,
+    /// `-minlength`: least password length, in characters.
     pub pw_min_length: i64,
+    /// `-minclasses`: least number of character classes (1 to 5).
     pub pw_min_classes: i64,
+    /// `-history`: how many recent passwords, the current one included, may
+    /// not be reused.
     pub pw_history_num: i64,
     /// Principals using the policy, read only; MIT has not kept this count
     /// since 1.12 and reports 0.
     pub policy_refcnt: i64,
+    /// `-maxfailure`: failed authentications before lockout; 0 for no lockout.
+    /// API version 3 and later.
     pub pw_max_fail: u32,
+    /// `-failurecountinterval`: time after which the failure count resets; 0
+    /// for never. API version 3 and later.
     pub pw_failcnt_interval: i64,
+    /// `-lockoutduration`: how long a lockout lasts; 0 for until unlocked. API
+    /// version 3 and later.
     pub pw_lockout_duration: i64,
     /// API version 4 (MIT 1.18+) only.
     pub attributes: u32,
+    /// Policy maximum ticket life; MIT reserves it and does not enforce it. API
+    /// version 4 only.
     pub max_life: i64,
+    /// Policy maximum renewable life; MIT reserves it and does not enforce it.
+    /// API version 4 only.
     pub max_renewable_life: i64,
+    /// `-allowedkeysalts`: the enctype:salt list keys may be made with; `None`
+    /// for any. API version 4 only.
     pub allowed_keysalts: Option<String>,
 }
 
@@ -601,15 +671,19 @@ impl Default for Policy {
 pub struct Privileges(pub u32);
 
 impl Privileges {
+    /// `KADM5_PRIV_GET`: may read principals and policies (`i` in the ACL).
     pub fn get(self) -> bool {
         self.0 & 0x01 != 0
     }
+    /// `KADM5_PRIV_ADD`: may create principals and policies (`a`).
     pub fn add(self) -> bool {
         self.0 & 0x02 != 0
     }
+    /// `KADM5_PRIV_MODIFY`: may modify principals and policies (`m`).
     pub fn modify(self) -> bool {
         self.0 & 0x04 != 0
     }
+    /// `KADM5_PRIV_DELETE`: may delete principals and policies (`d`).
     pub fn delete(self) -> bool {
         self.0 & 0x08 != 0
     }

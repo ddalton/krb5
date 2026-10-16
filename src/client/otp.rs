@@ -26,23 +26,34 @@ const KU_PA_OTP_REQUEST: u32 = 45;
 
 /// OTPFlags (RFC 6560 §4.1), as MIT numbers them.
 pub const OTP_FLAG_NEXT_OTP: u32 = 0x4000_0000;
+/// The client is to combine the OTP with its long-term key in the reply key.
 pub const OTP_FLAG_COMBINE: u32 = 0x2000_0000;
+/// The client is to collect a PIN.
 pub const OTP_FLAG_COLLECT_PIN: u32 = 0x1000_0000;
+/// The client is not to collect a PIN.
 pub const OTP_FLAG_DO_NOT_COLLECT_PIN: u32 = 0x0800_0000;
+/// The request must encrypt the challenge's nonce, not a timestamp.
 pub const OTP_FLAG_MUST_ENCRYPT_NONCE: u32 = 0x0400_0000;
+/// The PIN goes in its own field, not before the value.
 pub const OTP_FLAG_SEPARATE_PIN_REQUIRED: u32 = 0x0200_0000;
+/// The token's values end in a check digit.
 pub const OTP_FLAG_CHECK_DIGIT: u32 = 0x0100_0000;
 
 /// OTP formats (RFC 6560 §4.1, `otp-format`).
 pub const OTP_FORMAT_DECIMAL: i32 = 0;
+/// Hexadecimal digits.
 pub const OTP_FORMAT_HEXADECIMAL: i32 = 1;
+/// Letters and digits.
 pub const OTP_FORMAT_ALPHANUMERIC: i32 = 2;
+/// Arbitrary octets.
 pub const OTP_FORMAT_BINARY: i32 = 3;
+/// Base64.
 pub const OTP_FORMAT_BASE64: i32 = 4;
 
 /// What the KDC asks for: its PA-OTP-CHALLENGE, less the tokens this
 /// client cannot answer for.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct OtpChallenge {
     /// The service the OTP is for, to show the user.
     pub service: Option<String>,
@@ -52,9 +63,11 @@ pub struct OtpChallenge {
 
 /// One token the KDC accepts a value from (RFC 6560 OTP-TOKENINFO).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct OtpTokenInfo {
     /// `OTP_FLAG_*`: whether a PIN is collected, and how.
     pub flags: u32,
+    /// The token's vendor, to show the user.
     pub vendor: Option<String>,
     /// A challenge to show the user (for challenge-response tokens).
     pub challenge: Option<String>,
@@ -62,7 +75,10 @@ pub struct OtpTokenInfo {
     pub length: Option<i32>,
     /// `OTP_FORMAT_*`, if the KDC said.
     pub format: Option<i32>,
+    /// The KDC's identifier for the token (`otp-tokenID`), sent back in the
+    /// request.
     pub token_id: Option<Vec<u8>>,
+    /// The token's algorithm (`otp-algID`, a URI), sent back in the request.
     pub alg_id: Option<String>,
 }
 
@@ -88,6 +104,7 @@ impl OtpTokenInfo {
 
 /// The answer to an [`OtpChallenge`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct OtpAnswer {
     /// Which of the challenge's tokens (an index into `tokens`).
     pub token: usize,
@@ -97,6 +114,23 @@ pub struct OtpAnswer {
     /// [`OTP_FLAG_SEPARATE_PIN_REQUIRED`], else put before the value, as
     /// MIT does.
     pub pin: Option<String>,
+}
+
+impl OtpAnswer {
+    /// `value` for the challenge's token number `token`, with no PIN.
+    pub fn new(token: usize, value: impl Into<String>) -> Self {
+        OtpAnswer {
+            token,
+            value: value.into(),
+            pin: None,
+        }
+    }
+
+    /// With `pin`, for a token that collects one.
+    pub fn with_pin(mut self, pin: impl Into<String>) -> Self {
+        self.pin = Some(pin.into());
+        self
+    }
 }
 
 /// MIT's choice for `kinit` given one value and no further prompting:
