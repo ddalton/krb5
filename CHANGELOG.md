@@ -7,10 +7,13 @@ may break the API).
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-15
+
 ### Added
 
 - Certificate revocation for PKINIT: the KDC's certificate chain is
-  checked against CRLs, as MIT's client checks it through OpenSSL.
+  checked against CRLs, as MIT's client checks it through OpenSSL. A
+  `pkinit_revoke` already in krb5.conf, ignored before, now takes effect.
   - Every certificate below the trust anchor is looked up in a CRL from
     its issuer: those of `pkinit_revoke` in krb5.conf (`FILE:` and `DIR:`
     locations of PEM CRLs) or `pkinit::RevocationLists`
@@ -636,7 +639,8 @@ Initial release: the GSS-API acceptor extracted from
 - RFC 3961 n-fold and DR/DK, RFC 3962 and RFC 8009 AES enctypes.
 - RFC 4121 Wrap and MIC tokens.
 
-[Unreleased]: https://github.com/ddalton/krb5/compare/v0.12.1...HEAD
+[Unreleased]: https://github.com/ddalton/krb5/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/ddalton/krb5/compare/v0.12.1...v0.13.0
 [0.12.1]: https://github.com/ddalton/krb5/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/ddalton/krb5/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/ddalton/krb5/compare/v0.10.0...v0.11.0
