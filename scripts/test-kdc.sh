@@ -19,7 +19,8 @@
 # krb5-pkinit), KRB5.TEST and CROSS.TEST also do PKINIT: a CA, a KDC
 # certificate naming both realms, client certificates for alice (RSA, and
 # P-256 in pki/alice-ec.pem) made as MIT's PKINIT guide makes them, and
-# WELLKNOWN/ANONYMOUS for anonymous PKINIT. CROSS.TEST's KDC wants a
+# WELLKNOWN/ANONYMOUS for anonymous PKINIT; and the CA's CRLs (pki/crl-ok.pem,
+# crl-kdc-revoked.pem, crl-expired.pem). CROSS.TEST's KDC wants a
 # stronger group than the default (pkinit_dh_min_bits 4096, or P-384 where
 # the KDC has ECDH), so clients must negotiate. KRB5_TEST_PKINIT=1 then,
 # and KRB5_TEST_PKINIT_ECDH=1 for an MIT 1.22+ KDC. With
@@ -197,6 +198,24 @@ EXT
         -passout pass:alicep12 -out "$P/alice.p12"
     o pkcs12 -export -legacy -in "$P/alice.pem" -inkey "$P/alice-key.pem" \
         -passout pass:alicep12 -out "$P/alice-legacy.p12" || rm -f "$P/alice-legacy.p12"
+    # CRLs from the CA, for pkinit_revoke: current and empty, current and
+    # revoking the KDC's certificate, and expired.
+    cat >"$P/ca.cnf" <<EOF
+[ca]
+default_ca = d
+[d]
+database = $P/index.txt
+crlnumber = $P/crlnumber
+default_md = sha256
+default_crl_days = 30
+EOF
+    : >"$P/index.txt"
+    echo 01 >"$P/crlnumber"
+    crl() { o ca -config "$P/ca.cnf" -gencrl -cert "$P/ca.pem" -keyfile "$P/ca-key.pem" "$@"; }
+    crl -out "$P/crl-ok.pem"
+    crl -out "$P/crl-expired.pem" -crl_lastupdate 20200101000000Z -crl_nextupdate 20200201000000Z
+    o ca -config "$P/ca.cnf" -revoke "$P/kdc.pem" -cert "$P/ca.pem" -keyfile "$P/ca-key.pem"
+    crl -out "$P/crl-kdc-revoked.pem"
     cat >>"$DIR/krb5.conf" <<EOF
 [realms]
     $REALM = {

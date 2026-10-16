@@ -12,6 +12,10 @@
 //!
 //! * the KDC's signature, and its certificate's chain to one of the
 //!   trust anchors (`pkinit_anchors`): see [`TrustAnchors`];
+//! * that no certificate in the chain is revoked, by the CRLs of
+//!   `pkinit_revoke` or those the KDC sends, and, with
+//!   `pkinit_require_crl_checking`, that each has one: see
+//!   [`RevocationLists`];
 //! * that the certificate names the KDC: a PKINIT subjectAltName of
 //!   `krbtgt/REALM@REALM`, or else a dNSName listed in
 //!   `pkinit_kdc_hostname` together with the `id-pkinit-KPKdc` key
@@ -27,12 +31,13 @@
 //! or PKCS #12 files (`PKCS12:`, [`Identity::from_pkcs12`]);
 //! key exchange by finite-field DH or, against MIT 1.22 and later, ECDH
 //! ([`DhGroup`]). Not supported: RSA key transport (which MIT's client
-//! also refuses), PKCS #11 identities (smart cards), and revocation
-//! checking.
+//! also refuses), PKCS #11 identities (smart cards), and OCSP (nor does
+//! MIT do it).
 
 mod asn1;
 mod bigint;
 mod cms;
+mod crl;
 mod dh;
 mod ec;
 mod kdf;
@@ -299,6 +304,96 @@ impl TrustAnchors {
     }
 }
 
+// ------------------------------------------------------------ revocation
+
+/// Certificate revocation lists for the KDC's certificate chain: MIT's
+/// `pkinit_revoke`.
+///
+/// Every certificate in the chain but the trust anchor is looked up in a
+/// CRL from its issuer, here or among those the KDC sends; a listed one
+/// fails the login, as does a CRL that has expired or is not yet valid,
+/// is not its issuer's signature, or has an unhandled critical
+/// extension. A certificate with no CRL passes unless CRLs are required
+/// ([`KdcClient::with_pkinit_require_crl_checking`],
+/// `pkinit_require_crl_checking`).
+///
+/// As MIT's client keeps them, only the first CRL from each issuer is
+/// kept: a later one from the same CA is ignored, so give the current one
+/// first.
+///
+/// [`KdcClient::with_pkinit_require_crl_checking`]: crate::client::KdcClient::with_pkinit_require_crl_checking
+#[derive(Debug, Clone, Default)]
+pub struct RevocationLists {
+    crls: Vec<crl::Crl>,
+}
+
+impl RevocationLists {
+    /// No CRLs.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The CRLs in PEM `data` (`X509 CRL` blocks; anything else in it is
+    /// ignored, as OpenSSL ignores it).
+    pub fn from_pem(data: &[u8]) -> Result<Self> {
+        let mut out = RevocationLists::new();
+        for c in crl::from_pem(data).map_err(ClientError::Pkinit)? {
+            crl::add_local(&mut out.crls, c);
+        }
+        Ok(out)
+    }
+
+    /// A CRL location as `pkinit_revoke` writes one: `FILE:path`, a PEM
+    /// file, or `DIR:path`, every file in a directory but those whose
+    /// names start with a dot, in name order. A missing file or directory
+    /// is an error, as with MIT.
+    pub fn load(spec: &str) -> Result<Self> {
+        let read = |p: &Path| {
+            std::fs::read(p).map_err(|e| ClientError::Pkinit(format!("{}: {e}", p.display())))
+        };
+        let parse = |p: &Path| {
+            Self::from_pem(&read(p)?)
+                .map_err(|e| ClientError::Pkinit(format!("{}: {e}", p.display())))
+        };
+        if let Some(dir) = spec.strip_prefix("DIR:") {
+            let entries =
+                std::fs::read_dir(dir).map_err(|e| ClientError::Pkinit(format!("{dir}: {e}")))?;
+            let mut paths: Vec<_> = entries
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| {
+                    p.file_name()
+                        .is_some_and(|n| !n.as_encoded_bytes().starts_with(b"."))
+                })
+                .collect();
+            paths.sort();
+            let mut out = RevocationLists::new();
+            for p in &paths {
+                out.extend(parse(p)?);
+            }
+            return Ok(out);
+        }
+        match spec.strip_prefix("FILE:") {
+            Some(file) => parse(Path::new(file)),
+            None => pk_err(format!("pkinit_revoke {spec:?}: FILE: or DIR: expected")),
+        }
+    }
+
+    /// Add `other`'s CRLs to these: those from an issuer not already here.
+    pub fn extend(&mut self, other: RevocationLists) {
+        for c in other.crls {
+            crl::add_local(&mut self.crls, c);
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.crls.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.crls.is_empty()
+    }
+}
+
 // --------------------------------------------------------------- identity
 
 /// A client's certificate and private key: MIT's `X509_user_identity`.
@@ -404,6 +499,11 @@ pub(crate) struct Settings {
     /// Anchors given in code, else the `pkinit_anchors` locations.
     pub(crate) anchors: Option<TrustAnchors>,
     pub(crate) anchor_specs: Vec<String>,
+    /// CRLs given in code, else the `pkinit_revoke` locations.
+    pub(crate) crls: Option<RevocationLists>,
+    pub(crate) crl_specs: Vec<String>,
+    /// `pkinit_require_crl_checking`.
+    pub(crate) require_crl_checking: bool,
     pub(crate) kdc_hostnames: Vec<String>,
     pub(crate) dh_group: DhGroup,
     /// `[realms] REALM auto_fast_armor`.
@@ -440,6 +540,9 @@ impl Settings {
         Settings {
             anchors: None,
             anchor_specs: Self::values(conf, realm, "pkinit_anchors"),
+            crls: None,
+            crl_specs: Self::values(conf, realm, "pkinit_revoke"),
+            require_crl_checking: truthy(one("pkinit_require_crl_checking").as_deref()),
             kdc_hostnames: Self::values(conf, realm, "pkinit_kdc_hostname"),
             dh_group: one("pkinit_dh_min_bits")
                 .and_then(|v| DhGroup::from_config(&v))
@@ -460,6 +563,17 @@ impl Settings {
         }
         if out.is_empty() {
             return pk_err("no pkinit_anchors supplied");
+        }
+        Ok(out)
+    }
+
+    fn crls(&self) -> Result<RevocationLists> {
+        if let Some(c) = &self.crls {
+            return Ok(c.clone());
+        }
+        let mut out = RevocationLists::new();
+        for spec in &self.crl_specs {
+            out.extend(RevocationLists::load(spec)?);
         }
         Ok(out)
     }
@@ -610,8 +724,19 @@ impl Request {
         info.done("DHRepInfo")?;
 
         let anchors = r.settings.anchors()?;
-        let verified = cms::verify(signed, cms::ID_PKINIT_DHKEY_DATA, &anchors.certs, r.now)
-            .map_err(|e| ClientError::Pkinit(format!("KDC's reply: {}", e.0)))?;
+        let crls = r.settings.crls()?;
+        let revocation = crl::Policy {
+            local: &crls.crls,
+            require: r.settings.require_crl_checking,
+        };
+        let verified = cms::verify(
+            signed,
+            cms::ID_PKINIT_DHKEY_DATA,
+            &anchors.certs,
+            revocation,
+            r.now,
+        )
+        .map_err(|e| ClientError::Pkinit(format!("KDC's reply: {}", e.0)))?;
         check_kdc_certificate(&verified.signer, r.realm, &r.settings.kdc_hostnames)?;
 
         let f = der::Fields::parse_tagged("KDCDHKeyInfo", der::SEQUENCE, &verified.content)?;
@@ -942,9 +1067,14 @@ mod tests {
                 let signed = r.expect(asn1::implicit(0)).unwrap();
                 let auth_pack = match (identity, rfc6112_kdc) {
                     (Some(_), _) => {
-                        let v =
-                            cms::verify(signed, cms::ID_PKINIT_AUTH_DATA, &[fixture("ca")], NOW)
-                                .unwrap();
+                        let v = cms::verify(
+                            signed,
+                            cms::ID_PKINIT_AUTH_DATA,
+                            &[fixture("ca")],
+                            crl::Policy::default(),
+                            NOW,
+                        )
+                        .unwrap();
                         assert_eq!(v.signer, fixture("kdc"));
                         v.content
                     }
@@ -953,10 +1083,16 @@ mod tests {
                         let mut ci = Reader::new(signed).seq().unwrap();
                         assert_eq!(ci.oid().unwrap(), asn1::oid("1.2.840.113549.1.7.2"));
                         assert!(
-                            cms::verify(signed, cms::ID_PKINIT_AUTH_DATA, &[fixture("ca")], NOW)
-                                .unwrap_err()
-                                .0
-                                .contains("signer")
+                            cms::verify(
+                                signed,
+                                cms::ID_PKINIT_AUTH_DATA,
+                                &[fixture("ca")],
+                                crl::Policy::default(),
+                                NOW
+                            )
+                            .unwrap_err()
+                            .0
+                            .contains("signer")
                         );
                         continue;
                     }
@@ -1050,6 +1186,82 @@ mod tests {
         let b = Settings::from_config(&conf, "B.ORG");
         assert_eq!(b.anchor_specs, ["FILE:/lib"]);
         assert!(!b.auto_fast_armor);
+    }
+
+    #[test]
+    fn crl_settings_come_from_krb5_conf_as_mit_looks_them_up() {
+        let conf = Krb5Conf::parse(
+            "[libdefaults]\n pkinit_revoke = FILE:/lib.crl\n pkinit_require_crl_checking = true\n\
+             [realms]\n A.ORG = {\n  pkinit_revoke = FILE:/a.crl\n  pkinit_revoke = DIR:/crls\n\
+             pkinit_require_crl_checking = no\n }\n",
+        )
+        .unwrap();
+        let a = Settings::from_config(&conf, "A.ORG");
+        assert_eq!(a.crl_specs, ["FILE:/a.crl", "DIR:/crls"]);
+        assert!(!a.require_crl_checking);
+        let b = Settings::from_config(&conf, "B.ORG");
+        assert_eq!(b.crl_specs, ["FILE:/lib.crl"]);
+        assert!(b.require_crl_checking);
+        let none = Settings::from_config(&Krb5Conf::parse("").unwrap(), "A.ORG");
+        assert!(none.crl_specs.is_empty() && !none.require_crl_checking);
+    }
+
+    /// `pkinit_revoke` locations, read as MIT reads them.
+    #[test]
+    fn crl_locations_load_as_mit_loads_them() {
+        let dir = std::env::temp_dir().join(format!("krb5-crls-{:016x}", rand::random::<u64>()));
+        std::fs::create_dir_all(dir.join("d")).unwrap();
+        let ca_crl = include_bytes!("pkinit/testdata/ca-crl.pem");
+        let w = |name: &str, data: &[u8]| std::fs::write(dir.join(name), data).unwrap();
+        w("crl.pem", ca_crl);
+        w("certs.pem", include_bytes!("pkinit/testdata/ca.pem"));
+        w(
+            "bad.pem",
+            b"-----BEGIN X509 CRL-----\nAAAA\n-----END X509 CRL-----\n",
+        );
+        w(
+            "d/.hidden.pem",
+            b"-----BEGIN X509 CRL-----\nAAAA\n-----END X509 CRL-----\n",
+        );
+        w("d/a.pem", ca_crl);
+        w("d/b.txt", b"not PEM at all");
+        let path = |p: &str| dir.join(p).display().to_string();
+
+        assert_eq!(
+            RevocationLists::load(&format!("FILE:{}", path("crl.pem")))
+                .unwrap()
+                .len(),
+            1
+        );
+        // Certificates and other text: no CRLs, and no error.
+        assert!(
+            RevocationLists::load(&format!("FILE:{}", path("certs.pem")))
+                .unwrap()
+                .is_empty()
+        );
+        // A directory: its files in order, dotfiles skipped.
+        assert_eq!(
+            RevocationLists::load(&format!("DIR:{}", path("d")))
+                .unwrap()
+                .len(),
+            1
+        );
+        // Errors: a broken CRL, a missing file or directory, and a path
+        // with no FILE: or DIR: (MIT's ENOTSUP/EINVAL).
+        for bad in [
+            format!("FILE:{}", path("bad.pem")),
+            format!("FILE:{}", path("missing.pem")),
+            format!("DIR:{}", path("missing")),
+            path("crl.pem"),
+        ] {
+            assert!(RevocationLists::load(&bad).is_err(), "{bad}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // One CRL per issuer, the first kept.
+        let mut two = RevocationLists::from_pem(ca_crl).unwrap();
+        two.extend(RevocationLists::from_pem(ca_crl).unwrap());
+        assert_eq!(two.len(), 1);
     }
 
     #[test]

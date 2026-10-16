@@ -2609,7 +2609,7 @@ fn kinit_renew_needs_a_tgt_in_the_cache() {
 mod pkinit {
     use super::*;
     use krb5::CacheName;
-    use krb5::pkinit::{DhGroup, Identity, TrustAnchors};
+    use krb5::pkinit::{DhGroup, Identity, RevocationLists, TrustAnchors};
 
     macro_rules! pk {
         () => {{
@@ -2655,6 +2655,103 @@ mod pkinit {
             .service_ticket(&tgt, &e.p("host/svc.krb5.test"))
             .unwrap();
         establish(&e, &st);
+    }
+
+    /// `pkinit_revoke` and `pkinit_require_crl_checking`, case by case, for
+    /// us from krb5.conf and for MIT's `kinit -n` from the same lines: the
+    /// same outcome each time. The CA's CRLs come from test-kdc.sh.
+    #[test]
+    fn crls_are_checked_as_mit_checks_them() {
+        let e = pk!();
+        let pki = format!("{}/pki", e.dir);
+        let cases: &[(&str, &[&str], bool, Option<&str>)] = &[
+            ("no CRLs", &[], false, None),
+            (
+                "no CRLs, required",
+                &[],
+                true,
+                Some("pkinit_require_crl_checking"),
+            ),
+            ("current CRL, required", &["crl-ok.pem"], true, None),
+            (
+                "KDC revoked",
+                &["crl-kdc-revoked.pem"],
+                false,
+                Some("revoked"),
+            ),
+            ("expired CRL", &["crl-expired.pem"], false, Some("expired")),
+            // The first CRL from an issuer is the one used.
+            (
+                "current, then revoking",
+                &["crl-ok.pem", "crl-kdc-revoked.pem"],
+                false,
+                None,
+            ),
+            (
+                "revoking, then current",
+                &["crl-kdc-revoked.pem", "crl-ok.pem"],
+                false,
+                Some("revoked"),
+            ),
+        ];
+        for (what, files, require, want) in cases {
+            let mut extra = String::from("[libdefaults]\n");
+            for f in *files {
+                extra += &format!(" pkinit_revoke = FILE:{pki}/{f}\n");
+            }
+            if *require {
+                extra += " pkinit_require_crl_checking = true\n";
+            }
+            let ours = KdcClient::from_config(&conf(&e, &extra), &e.realm)
+                .unwrap()
+                .login_anonymous();
+            match (want, &ours) {
+                (None, Ok(_)) => {}
+                (Some(w), Err(err)) => assert!(err.to_string().contains(w), "{what}: {err}"),
+                _ => panic!("{what}: {:?}", ours.map(|t| t.client)),
+            }
+            if !mit_tools_installed() {
+                continue;
+            }
+            let file = format!("{}/crl-{}.conf", e.dir, std::process::id());
+            std::fs::write(&file, &extra).unwrap();
+            let mit = std::process::Command::new("kinit")
+                .args(["-n", &format!("@{}", e.realm)])
+                .env("KRB5_CONFIG", format!("{file}:{}/krb5.conf", e.dir))
+                .env("KRB5CCNAME", format!("MEMORY:crl-{}", std::process::id()))
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            let _ = std::fs::remove_file(&file);
+            assert_eq!(
+                mit.status.success(),
+                want.is_none(),
+                "{what}: MIT disagrees"
+            );
+        }
+
+        // The same, given in code: CRLs here override krb5.conf's.
+        let crls = |f: &str| RevocationLists::load(&format!("FILE:{pki}/{f}")).unwrap();
+        let err = client(&e)
+            .with_pkinit_revocation_lists(crls("crl-kdc-revoked.pem"))
+            .login_anonymous()
+            .unwrap_err();
+        assert!(err.to_string().contains("revoked"), "{err}");
+        let err = client(&e)
+            .with_pkinit_require_crl_checking(true)
+            .login_anonymous()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("pkinit_require_crl_checking"),
+            "{err}"
+        );
+        let revoking = format!("[libdefaults]\n pkinit_revoke = FILE:{pki}/crl-kdc-revoked.pem\n");
+        KdcClient::from_config(&conf(&e, &revoking), &e.realm)
+            .unwrap()
+            .with_pkinit_revocation_lists(crls("crl-ok.pem"))
+            .with_pkinit_require_crl_checking(true)
+            .login_anonymous()
+            .unwrap();
     }
 
     /// alice's P-256 certificate and key.

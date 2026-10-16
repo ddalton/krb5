@@ -7,6 +7,32 @@ may break the API).
 
 ## [Unreleased]
 
+### Added
+
+- Certificate revocation for PKINIT: the KDC's certificate chain is
+  checked against CRLs, as MIT's client checks it through OpenSSL.
+  - Every certificate below the trust anchor is looked up in a CRL from
+    its issuer: those of `pkinit_revoke` in krb5.conf (`FILE:` and `DIR:`
+    locations of PEM CRLs) or `pkinit::RevocationLists`
+    (`KdcClient::with_pkinit_revocation_lists`), and those the KDC sends
+    in its SignedData. A revoked certificate fails the login, and so does
+    a CRL that has expired or is not yet valid, is not signed by its
+    issuer (or one without `cRLSign`), does not cover the certificate
+    (issuingDistributionPoint), or has an unhandled critical extension.
+  - With `pkinit_require_crl_checking` (or
+    `KdcClient::with_pkinit_require_crl_checking`), a certificate with no
+    CRL from its issuer fails too; without, it passes, as in MIT.
+  - MIT's quirks are kept: only the first CRL loaded from each issuer
+    counts, the trust anchor itself is never checked, and of several
+    CRLs for a certificate OpenSSL's choice is made (current first, then
+    the latest). Delta, indirect and reason-partitioned CRLs are not used,
+    as OpenSSL does not use them for MIT; OCSP is not done, nor by MIT.
+  - Tested live against MIT 1.21 and 1.22: our client and MIT's `kinit`
+    reach the same outcome for each case (no CRL, a current CRL, the KDC's
+    certificate revoked, an expired CRL, the order of two CRLs, with and
+    without the requirement); unit tests make CRLs to order for the rest.
+  - The `pkinit` fuzz target parses and checks CRLs too.
+
 ## [0.12.1] - 2026-10-15
 
 ### Security

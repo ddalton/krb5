@@ -58,6 +58,8 @@ def main():
         put("dns", n, b"\x00" + m)
     for n, c in files("src/pkinit/testdata"):
         sel = {".pem": 1, ".p12": 2, ".der": 3}.get(os.path.splitext(n)[1])
+        if "crl" in n:
+            sel = 6
         if sel is not None:
             put("pkinit", n, bytes([sel]) + c)
     put("text", "krb5.conf", open(os.path.join(ROOT, "testdata", "mit-settings.tsv"), "rb").read())

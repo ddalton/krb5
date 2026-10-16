@@ -1,6 +1,6 @@
 //! Entry point for `fuzz/` (`cfg(fuzzing)` only): what PKINIT parses —
-//! certificates, PEM and PKCS #12 files, keys, CMS from the KDC, and the
-//! KDC's PA-PK-AS-REP.
+//! certificates, CRLs, PEM and PKCS #12 files, keys, CMS from the KDC,
+//! and the KDC's PA-PK-AS-REP.
 
 use super::*;
 use std::sync::OnceLock;
@@ -30,7 +30,7 @@ pub fn input(data: &[u8]) {
     let Some((&sel, d)) = data.split_first() else {
         return;
     };
-    match sel % 7 {
+    match sel % 8 {
         0 => {
             if let Ok(c) = x509::Cert::from_der(d) {
                 let _ = c.public_key();
@@ -53,8 +53,20 @@ pub fn input(data: &[u8]) {
             let _ = pkcs12::parse(d, None);
         }
         3 => {
-            let _ = cms::verify(d, cms::ID_PKINIT_DHKEY_DATA, &[], 1_700_000_000);
-            let _ = cms::verify(d, cms::ID_PKINIT_AUTH_DATA, &[], 1_700_000_000);
+            let _ = cms::verify(
+                d,
+                cms::ID_PKINIT_DHKEY_DATA,
+                &[],
+                crl::Policy::default(),
+                1_700_000_000,
+            );
+            let _ = cms::verify(
+                d,
+                cms::ID_PKINIT_AUTH_DATA,
+                &[],
+                crl::Policy::default(),
+                1_700_000_000,
+            );
         }
         4 => {
             let _ = rsa::PublicKey::from_der(d);
@@ -78,6 +90,30 @@ pub fn input(data: &[u8]) {
                 enctype: 18,
                 now: 1_700_000_000,
             });
+        }
+        6 => {
+            // A CRL, alone and in a PEM file, checked against the test
+            // chain: kdc.pem, inter.pem, ca.pem.
+            let _ = crl::from_pem(d);
+            if let Ok(c) = crl::Crl::from_der(d) {
+                let chain: Vec<x509::Cert> = [
+                    &include_bytes!("testdata/kdc.pem")[..],
+                    include_bytes!("testdata/inter.pem"),
+                    include_bytes!("testdata/ca.pem"),
+                ]
+                .iter()
+                .map(|p| x509::parse_certs(p).expect("a fixture").remove(0))
+                .collect();
+                let path: Vec<&x509::Cert> = chain.iter().collect();
+                for require in [false, true] {
+                    let policy = crl::Policy {
+                        local: std::slice::from_ref(&c),
+                        require,
+                    };
+                    let _ =
+                        crl::check_chain(&path, policy, std::slice::from_ref(&c), 1_900_000_000);
+                }
+            }
         }
         _ => {
             let key = Key::new(18, vec![1; 32]).expect("AES-256 key");

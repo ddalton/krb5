@@ -54,8 +54,9 @@ tickets without shelling out to `kinit`.
   Diffie-Hellman over MODP groups 14 and 16, or by ECDH on P-256, P-384
   and P-521 against MIT 1.22 and later (RFC 5349), with the RFC 8636 KDFs
   and MIT's group negotiation; the KDC's signature (RSA or ECDSA),
-  certificate chain (`pkinit_anchors`) and name are checked as MIT checks
-  them. Pure Rust, no OpenSSL: crypto-bigint's constant-time arithmetic
+  certificate chain (`pkinit_anchors`), its revocation (CRLs:
+  `pkinit_revoke`, `pkinit_require_crl_checking`) and name are checked as
+  MIT checks them. Pure Rust, no OpenSSL: crypto-bigint's constant-time arithmetic
   for DH and RSA, RustCrypto's `p256`/`p384`/`p521` for the curves.
   Identities from PEM files or PKCS #12 (`PKCS12:file.p12`, modern AES or
   legacy 3DES/RC2 encryption). Not yet: PKCS #11 (smart cards).

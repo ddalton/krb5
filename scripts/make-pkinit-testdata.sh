@@ -11,6 +11,8 @@
 #               id-pkinit-KPKdc and digitalSignature; key kdc-key.pem
 # leafsigned.pem a "CA" signed by kdc.pem's key, which is not a CA
 # sub.pem       a CA under inter, beyond inter's path length; subleaf.pem under it
+# ca-crl.pem    ca's CRL as OpenSSL writes one (CRL number, authorityKeyIdentifier),
+#               revoking inter.pem (keyCompromise), current 2026-2126
 # other-ca.pem  an unrelated root
 # ec-ca.pem     a P-384 root; ec-kdc.pem, a P-256 KDC certificate under it
 #               (as kdc.pem, ECDSA throughout), key ec-kdc-key.pem (SEC1)
@@ -70,6 +72,23 @@ o x509 -req -in sub.req -CA inter.pem -CAkey inter-key.pem -set_serial 6 -out su
     -days 36500 -extfile ext.cnf -extensions fake_ca
 o x509 -req -in kdc.req -CA sub.pem -CAkey inter-key.pem -set_serial 7 -out subleaf.pem \
     -days 36500 -extfile ext.cnf -extensions kdc
+cat >ca.cnf <<CA
+[ca]
+default_ca = d
+[d]
+database = index.txt
+crlnumber = crlnumber
+default_md = sha256
+crl_extensions = crl_ext
+[crl_ext]
+authorityKeyIdentifier = keyid:always
+CA
+touch index.txt
+echo 01 >crlnumber
+o ca -config ca.cnf -revoke inter.pem -cert ca.pem -keyfile rsa2048.pem -crl_reason keyCompromise
+o ca -config ca.cnf -gencrl -cert ca.pem -keyfile rsa2048.pem -out ca-crl.pem \
+    -crl_lastupdate 20260101000000Z -crl_nextupdate 21260101000000Z
+rm -f ca.cnf index.txt* crlnumber*
 o genrsa -out other-key.pem 2048
 o req -x509 -new -key other-key.pem -out other-ca.pem -days 36500 -subj "/CN=PKINIT Test Root" \
     -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign

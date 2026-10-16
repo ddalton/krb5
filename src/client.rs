@@ -966,6 +966,23 @@ impl KdcClient {
         self
     }
 
+    /// Check the KDC's certificate chain against `crls`, in place of the
+    /// `pkinit_revoke` CRLs from `krb5.conf`.
+    #[cfg(feature = "pkinit")]
+    pub fn with_pkinit_revocation_lists(mut self, crls: pkinit::RevocationLists) -> Self {
+        self.pkinit.crls = Some(crls);
+        self
+    }
+
+    /// Whether every certificate in the KDC's chain below the trust anchor
+    /// must have a CRL from its issuer, as `pkinit_require_crl_checking`
+    /// says (by default, no). See [`pkinit::RevocationLists`].
+    #[cfg(feature = "pkinit")]
+    pub fn with_pkinit_require_crl_checking(mut self, require: bool) -> Self {
+        self.pkinit.require_crl_checking = require;
+        self
+    }
+
     /// Accept a KDC certificate whose dNSName is one of `hostnames` (with
     /// the KDC key purpose), as `pkinit_kdc_hostname` does, besides one
     /// naming `krbtgt/REALM@REALM`.

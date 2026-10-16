@@ -6,8 +6,8 @@
 //! the certificates at hand, checking each signature, validity period,
 //! CA flag, `keyCertSign` and path length on the way. A critical
 //! extension this module does not understand fails the chain, as RFC 5280
-//! §4.2 requires. Revocation (CRLs, OCSP) is not checked, as MIT does not
-//! by default.
+//! §4.2 requires. Revocation is the CRL module's (`super::crl`), over the
+//! path [`verify_chain`] returns.
 
 use super::asn1::{self, ReaderExt, implicit};
 use super::keys::{PublicKey, SigAlg};
@@ -70,10 +70,38 @@ pub(crate) struct Cert {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Extension {
-    oid: Vec<u8>,
-    critical: bool,
-    value: Vec<u8>,
+pub(super) struct Extension {
+    pub(super) oid: Vec<u8>,
+    pub(super) critical: bool,
+    pub(super) value: Vec<u8>,
+}
+
+/// `Extensions ::= SEQUENCE OF Extension`, from the SEQUENCE's encoding.
+/// An extension may appear only once (RFC 5280 §4.2, §5.2).
+pub(super) fn read_extensions(exts: &[u8]) -> Result<Vec<Extension>> {
+    let mut extensions = Vec::new();
+    let mut seq = Reader::new(exts).seq()?;
+    while !seq.is_empty() {
+        let mut e = seq.seq()?;
+        let oid = e.oid()?.to_vec();
+        let critical = match e.optional(asn1::BOOLEAN)? {
+            Some([0xFF]) => true,
+            Some([0x00]) => return err("DEFAULT FALSE encoded (not DER)"),
+            Some(_) => return err("bad BOOLEAN"),
+            None => false,
+        };
+        let value = e.octets()?.to_vec();
+        e.done("Extension")?;
+        if extensions.iter().any(|x: &Extension| x.oid == oid) {
+            return err("an extension appears twice");
+        }
+        extensions.push(Extension {
+            oid,
+            critical,
+            value,
+        });
+    }
+    Ok(extensions)
 }
 
 impl Cert {
@@ -122,27 +150,7 @@ impl Cert {
             if version != 2 {
                 return err("extensions in a certificate before v3");
             }
-            let mut seq = Reader::new(exts).seq()?;
-            while !seq.is_empty() {
-                let mut e = seq.seq()?;
-                let oid = e.oid()?.to_vec();
-                let critical = match e.optional(asn1::BOOLEAN)? {
-                    Some([0xFF]) => true,
-                    Some([0x00]) => return err("DEFAULT FALSE encoded (not DER)"),
-                    Some(_) => return err("bad BOOLEAN"),
-                    None => false,
-                };
-                let value = e.octets()?.to_vec();
-                e.done("Extension")?;
-                if extensions.iter().any(|x: &Extension| x.oid == oid) {
-                    return err("an extension appears twice");
-                }
-                extensions.push(Extension {
-                    oid,
-                    critical,
-                    value,
-                });
-            }
+            extensions = read_extensions(exts)?;
         }
         t.done("TBSCertificate")?;
         Ok(Cert {
@@ -162,7 +170,7 @@ impl Cert {
         })
     }
 
-    fn extension(&self, dotted: &str) -> Option<&Extension> {
+    pub(super) fn extension(&self, dotted: &str) -> Option<&Extension> {
         let oid = asn1::oid(dotted);
         self.extensions.iter().find(|e| e.oid == oid)
     }
@@ -174,12 +182,22 @@ impl Cert {
 
     /// Whether `issuer`'s key made this certificate's signature.
     fn signed_by(&self, issuer: &Cert) -> bool {
-        let Some(alg) = SigAlg::from_oid(&self.sig_alg) else {
+        issuer.made(&self.sig_alg, &self.tbs, &self.signature)
+    }
+
+    /// Whether this certificate's key made `signature` over `tbs` with
+    /// `sig_alg`.
+    pub(super) fn made(&self, sig_alg: &[u8], tbs: &[u8], signature: &[u8]) -> bool {
+        let Some(alg) = SigAlg::from_oid(sig_alg) else {
             return false;
         };
-        issuer
-            .public_key()
-            .is_ok_and(|k| k.verify(alg, &alg.hash().digest(&self.tbs), &self.signature))
+        self.public_key()
+            .is_ok_and(|k| k.verify(alg, &alg.hash().digest(tbs), signature))
+    }
+
+    /// Whether basicConstraints makes this a CA.
+    pub(super) fn is_ca(&self) -> bool {
+        self.basic_constraints().is_ok_and(|(ca, _)| ca)
     }
 
     /// `basicConstraints`: (cA, pathLenConstraint).
@@ -263,7 +281,7 @@ impl Cert {
 
 /// UTCTime (`YYMMDDHHMMSSZ`, years 1950–2049) or GeneralizedTime
 /// (`YYYYMMDDHHMMSSZ`), as RFC 5280 §4.1.2.5 allows them.
-fn read_time(r: &mut Reader<'_>) -> Result<i64> {
+pub(super) fn read_time(r: &mut Reader<'_>) -> Result<i64> {
     let (tag, c) = r.next()?;
     let s = std::str::from_utf8(c)
         .ok()
@@ -300,7 +318,15 @@ pub(crate) fn parse_certs(data: &[u8]) -> std::result::Result<Vec<Cert>, String>
 /// OpenSSL checks them), each issuer below the anchor a CA allowed to sign
 /// certificates at that depth. A certificate that is itself an anchor is
 /// trusted as is.
-pub(crate) fn verify_chain(leaf: &Cert, pool: &[Cert], anchors: &[Cert], now: i64) -> Result<()> {
+///
+/// Returns the path, `leaf` first and the anchor last.
+pub(crate) fn verify_chain<'a>(
+    leaf: &'a Cert,
+    pool: &'a [Cert],
+    anchors: &'a [Cert],
+    now: i64,
+) -> Result<Vec<&'a Cert>> {
+    let mut path = vec![leaf];
     let mut cur = leaf;
     // CA certificates passed below the current one, for pathLenConstraint.
     let mut below = 0i64;
@@ -310,14 +336,16 @@ pub(crate) fn verify_chain(leaf: &Cert, pool: &[Cert], anchors: &[Cert], now: i6
         }
         check_current(cur, now)?;
         if anchors.iter().any(|a| a.der == cur.der) {
-            return Ok(());
+            return Ok(path);
         }
         if let Some(a) = anchors
             .iter()
             .find(|a| a.subject == cur.issuer && cur.signed_by(a))
         {
             check_current(a, now)?;
-            return check_issuer(a, below);
+            check_issuer(a, below)?;
+            path.push(a);
+            return Ok(path);
         }
         let Some(next) = pool
             .iter()
@@ -326,6 +354,7 @@ pub(crate) fn verify_chain(leaf: &Cert, pool: &[Cert], anchors: &[Cert], now: i6
             return err("the certificate does not chain to a trusted anchor (pkinit_anchors)");
         };
         check_issuer(next, below)?;
+        path.push(next);
         cur = next;
     }
     err("certificate chain too long")

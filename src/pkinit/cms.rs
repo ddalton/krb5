@@ -17,6 +17,7 @@
 //! ```
 
 use super::asn1::{self, ReaderExt};
+use super::crl;
 use super::keys::{Hash, PrivateKey, PublicKey, SigAlg};
 use super::rsa;
 use super::x509::{self, Cert};
@@ -127,11 +128,13 @@ pub(crate) struct Verified {
 /// among the certificates sent by issuer and serial number, whose
 /// signature over the signed attributes verifies, whose attributes name
 /// the content type and carry the content's digest, and whose certificate
-/// chains to one of `anchors` at `now`.
+/// chains to one of `anchors` at `now`, none of it revoked by the CRLs of
+/// `revocation` or those sent along.
 pub(crate) fn verify(
     data: &[u8],
     content_type: &str,
     anchors: &[Cert],
+    revocation: crl::Policy<'_>,
     now: i64,
 ) -> Result<Verified> {
     let mut outer = Reader::new(data);
@@ -162,7 +165,18 @@ pub(crate) fn verify(
             }
         }
     }
-    sd.optional(der::ctx(1))?; // crls
+    // crls [1] IMPLICIT SET OF RevocationInfoChoice: CertificateLists;
+    // the other choice ([1] OtherRevocationInfoFormat) is skipped.
+    let mut crls = Vec::new();
+    if let Some(set) = sd.optional(der::ctx(1))? {
+        let mut r = Reader::new(set);
+        while !r.is_empty() {
+            let (tag, _, raw) = r.next_raw()?;
+            if tag == der::SEQUENCE {
+                crls.push(crl::Crl::from_der(raw)?);
+            }
+        }
+    }
     let mut infos = Reader::new(sd.expect(asn1::SET)?);
     sd.done("SignedData")?;
     if infos.is_empty() {
@@ -234,7 +248,8 @@ pub(crate) fn verify(
     if !key.verify(alg, &hash.digest(&signed), signature) {
         return err("SignedData signature does not verify");
     }
-    x509::verify_chain(signer, &certs, anchors, now)?;
+    let path = x509::verify_chain(signer, &certs, anchors, now)?;
+    crl::check_chain(&path, revocation, &crls, now)?;
     Ok(Verified {
         content,
         signer: signer.clone(),
@@ -250,6 +265,64 @@ pub(crate) mod tests {
     pub(crate) fn kdc_key() -> PrivateKey {
         PrivateKey::from_pem_blocks(&pem::blocks(include_bytes!("testdata/kdc-key.pem")).unwrap())
             .unwrap()
+    }
+
+    /// `sd` with a `crls` field holding `crls`, as a KDC may send them.
+    fn with_crls(sd: &[u8], crls: &[Vec<u8>]) -> Vec<u8> {
+        let mut ci = Reader::new(sd).seq().unwrap();
+        let oid = ci.next_raw().unwrap().2.to_vec();
+        let mut s = Reader::new(ci.expect(der::ctx(0)).unwrap()).seq().unwrap();
+        let mut parts = vec![];
+        while !s.is_empty() {
+            parts.push(s.next_raw().unwrap().2.to_vec());
+        }
+        let infos = parts.pop().unwrap();
+        parts.push(der::cons(der::ctx(1), crls));
+        parts.push(infos);
+        der::seq(&[oid, der::field(0, der::seq(&parts))])
+    }
+
+    /// The KDC's CRLs count with ours: ca-crl.pem revokes the
+    /// intermediate its certificate is under.
+    #[test]
+    fn crls_the_kdc_sends_are_checked() {
+        let ca = [fixture("ca")];
+        let crl = pem::blocks(include_bytes!("testdata/ca-crl.pem"))
+            .unwrap()
+            .remove(0)
+            .1;
+        let sd = kdc_signed(ID_PKINIT_DHKEY_DATA, b"key info");
+        verify(&sd, ID_PKINIT_DHKEY_DATA, &ca, crl::Policy::default(), NOW).unwrap();
+        let sent = with_crls(&sd, &[crl]);
+        let e = verify(
+            &sent,
+            ID_PKINIT_DHKEY_DATA,
+            &ca,
+            crl::Policy::default(),
+            NOW,
+        )
+        .unwrap_err();
+        assert!(e.0.contains("depth 1 of the KDC's chain: revoked"), "{e}");
+        // Not a CRL: the SignedData is malformed.
+        let junk = with_crls(&sd, &[der::seq(&[der::int(1)])]);
+        verify(
+            &junk,
+            ID_PKINIT_DHKEY_DATA,
+            &ca,
+            crl::Policy::default(),
+            NOW,
+        )
+        .unwrap_err();
+        // Required: no CRL from the intermediate for the KDC's certificate.
+        let required = crl::Policy {
+            local: &[],
+            require: true,
+        };
+        let e = verify(&sd, ID_PKINIT_DHKEY_DATA, &ca, required, NOW).unwrap_err();
+        assert!(
+            e.0.contains("depth 0") && e.0.contains("pkinit_require_crl_checking"),
+            "{e}"
+        );
     }
 
     /// A SignedData as the test KDC would sign it, with its chain.
@@ -270,7 +343,14 @@ pub(crate) mod tests {
     #[test]
     fn a_signed_data_verifies_to_its_anchor() {
         let sd = kdc_signed(ID_PKINIT_DHKEY_DATA, b"key info");
-        let v = verify(&sd, ID_PKINIT_DHKEY_DATA, &[fixture("ca")], NOW).unwrap();
+        let v = verify(
+            &sd,
+            ID_PKINIT_DHKEY_DATA,
+            &[fixture("ca")],
+            crl::Policy::default(),
+            NOW,
+        )
+        .unwrap();
         assert_eq!(v.content, b"key info");
         assert_eq!(v.signer, fixture("kdc"));
     }
@@ -280,23 +360,41 @@ pub(crate) mod tests {
         let sd = kdc_signed(ID_PKINIT_DHKEY_DATA, b"key info");
         let ca = [fixture("ca")];
         // The wrong content type expected; an untrusted anchor.
-        assert!(verify(&sd, ID_PKINIT_AUTH_DATA, &ca, NOW).is_err());
-        assert!(verify(&sd, ID_PKINIT_DHKEY_DATA, &[fixture("other-ca")], NOW).is_err());
+        assert!(verify(&sd, ID_PKINIT_AUTH_DATA, &ca, crl::Policy::default(), NOW).is_err());
+        assert!(
+            verify(
+                &sd,
+                ID_PKINIT_DHKEY_DATA,
+                &[fixture("other-ca")],
+                crl::Policy::default(),
+                NOW
+            )
+            .is_err()
+        );
         // The content altered after signing: the digest no longer matches.
         let mut bad = sd.clone();
         let at = bad.windows(8).position(|w| w == b"key info").unwrap();
         bad[at] = b'K';
-        let e = verify(&bad, ID_PKINIT_DHKEY_DATA, &ca, NOW).unwrap_err();
+        let e = verify(&bad, ID_PKINIT_DHKEY_DATA, &ca, crl::Policy::default(), NOW).unwrap_err();
         assert!(e.0.contains("signed attributes"), "{e}");
         // The signature altered: its last octet sits at the very end.
         let mut bad = sd.clone();
         let n = bad.len();
         bad[n - 1] ^= 1;
-        let e = verify(&bad, ID_PKINIT_DHKEY_DATA, &ca, NOW).unwrap_err();
+        let e = verify(&bad, ID_PKINIT_DHKEY_DATA, &ca, crl::Policy::default(), NOW).unwrap_err();
         assert!(e.0.contains("signature"), "{e}");
         // No signer at all, as an anonymous client sends.
         let unsigned = signed_data(ID_PKINIT_DHKEY_DATA, b"key info", None).unwrap();
-        assert!(verify(&unsigned, ID_PKINIT_DHKEY_DATA, &ca, NOW).is_err());
+        assert!(
+            verify(
+                &unsigned,
+                ID_PKINIT_DHKEY_DATA,
+                &ca,
+                crl::Policy::default(),
+                NOW
+            )
+            .is_err()
+        );
         // Without the intermediate the chain is incomplete; naming a
         // signer whose key did not sign fails the signature.
         let key = kdc_key();
@@ -308,18 +406,35 @@ pub(crate) mod tests {
             )
             .unwrap()
         };
-        let e = verify(&sign(&[fixture("kdc")]), ID_PKINIT_DHKEY_DATA, &ca, NOW).unwrap_err();
+        let e = verify(
+            &sign(&[fixture("kdc")]),
+            ID_PKINIT_DHKEY_DATA,
+            &ca,
+            crl::Policy::default(),
+            NOW,
+        )
+        .unwrap_err();
         assert!(e.0.contains("anchor"), "{e}");
         let e = verify(
             &sign(&[fixture("inter"), fixture("kdc")]),
             ID_PKINIT_DHKEY_DATA,
             &ca,
+            crl::Policy::default(),
             NOW,
         )
         .unwrap_err();
         assert!(e.0.contains("signature"), "{e}");
         for cut in [0, 10, sd.len() / 2, sd.len() - 1] {
-            assert!(verify(&sd[..cut], ID_PKINIT_DHKEY_DATA, &ca, NOW).is_err());
+            assert!(
+                verify(
+                    &sd[..cut],
+                    ID_PKINIT_DHKEY_DATA,
+                    &ca,
+                    crl::Policy::default(),
+                    NOW
+                )
+                .is_err()
+            );
         }
     }
 
@@ -334,13 +449,29 @@ pub(crate) mod tests {
             crate::pkinit::x509::parse_certs(include_bytes!("testdata/mit121-ca.pem")).unwrap();
         let rsa_label = der::tlv(asn1::OID, &asn1::oid("1.2.840.113549.1.1.11"));
         assert!(sd.windows(rsa_label.len()).any(|w| w == rsa_label));
-        let v = verify(sd, ID_PKINIT_DHKEY_DATA, &ca, 1_792_100_000).unwrap();
+        let v = verify(
+            sd,
+            ID_PKINIT_DHKEY_DATA,
+            &ca,
+            crl::Policy::default(),
+            1_792_100_000,
+        )
+        .unwrap();
         assert!(matches!(v.signer.public_key().unwrap(), PublicKey::Ec(_)));
         // Any alteration of the signed content still fails.
         let mut bad = sd.to_vec();
         let n = bad.len();
         bad[n - 1] ^= 1;
-        assert!(verify(&bad, ID_PKINIT_DHKEY_DATA, &ca, 1_792_100_000).is_err());
+        assert!(
+            verify(
+                &bad,
+                ID_PKINIT_DHKEY_DATA,
+                &ca,
+                crl::Policy::default(),
+                1_792_100_000
+            )
+            .is_err()
+        );
     }
 
     #[test]

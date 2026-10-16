@@ -12,7 +12,7 @@ libFuzzer targets for every parser that reads what a peer sends:
 | `dns` | DNS answers (SRV, URI, CNAME), resolv.conf |
 | `kadmin` | kadmind's RPC replies and their XDR (principals, policies, keys, name lists) |
 | `kpasswd` | a kpasswd server's reply, its KRB-PRIV, the result |
-| `pkinit` | X.509 certificates and chains, PEM, PKCS #12, CMS SignedData, RSA/EC/DH keys, PA-PK-AS-REP |
+| `pkinit` | X.509 certificates and chains, CRLs, PEM, PKCS #12, CMS SignedData, RSA/EC/DH keys, PA-PK-AS-REP |
 | `ccache`, `keytab`, `text` | credential caches, keytabs, krb5.conf, principal and cache names |
 
 Most targets take a first octet that picks the parser for the rest. The
