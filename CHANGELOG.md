@@ -7,6 +7,8 @@ may break the API).
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-10-16
+
 ### Added
 
 - An async KDC client on tokio, with the new `tokio` feature:
@@ -719,7 +721,8 @@ Initial release: the GSS-API acceptor extracted from
 - RFC 3961 n-fold and DR/DK, RFC 3962 and RFC 8009 AES enctypes.
 - RFC 4121 Wrap and MIC tokens.
 
-[Unreleased]: https://github.com/ddalton/krb5/compare/v0.13.1...HEAD
+[Unreleased]: https://github.com/ddalton/krb5/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/ddalton/krb5/compare/v0.13.1...v1.0.0
 [0.13.1]: https://github.com/ddalton/krb5/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/ddalton/krb5/compare/v0.12.1...v0.13.0
 [0.12.1]: https://github.com/ddalton/krb5/compare/v0.12.0...v0.12.1
