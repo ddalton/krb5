@@ -25,6 +25,9 @@
 //!   protocol transition and constrained delegation, traditional and
 //!   resource-based; user-to-user tickets ([`KdcClient::user_to_user`],
 //!   `kvno --u2u`).
+//! * `AsyncKdcClient` (with the `tokio` feature) — the same client on
+//!   tokio: every exchange `async`, its futures `Send`, holding no thread
+//!   while a KDC answers; and [`kpasswd`]'s functions likewise.
 //! * `pkinit` (with the `pkinit` feature) — PKINIT: login with an X.509
 //!   certificate (`kinit -X`), anonymous PKINIT (`kinit -n`), and FAST
 //!   armor from it (`auto_fast_armor`), in pure Rust.
@@ -122,6 +125,7 @@ pub mod kdf; // RFC 3961 §5.1 DR/DK, RFC 3962 §4, RFC 8009 §3
 pub mod key;
 pub mod kpasswd; // password changes over the kpasswd protocol (RFC 3244)
 mod md5; // RFC 1321 and HMAC-MD5: channel bindings, PAC signatures, MS-SFU
+mod net; // the sockets, blocking or tokio's
 pub mod nfold; // RFC 3961 §5.1 n-fold
 pub mod pac; // MS-PAC: the authorization data Windows and MIT put in tickets
 #[cfg(feature = "pkinit")]
@@ -195,6 +199,8 @@ pub use acceptor::{
 };
 pub use bindings::ChannelBindings;
 pub use ccache::{CCache, CacheError, CacheName};
+#[cfg(feature = "tokio")]
+pub use client::AsyncKdcClient;
 pub use client::{ClientError, Credentials, KdcClient, Principal};
 pub use config::{ConfigError, Krb5Conf};
 pub use initiator::InitiatorContext;

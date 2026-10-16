@@ -3429,6 +3429,42 @@ mod kadmin {
         assert!(a.get_policy(&name).is_err());
     }
 
+    /// kpasswd's change and set on tokio.
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn kpasswd_on_tokio() {
+        let (e, server) = kadm!();
+        let kp = std::env::var("KRB5_TEST_KPASSWD").unwrap();
+        let mut a = admin(&e, &server);
+        let p = fresh(&e, "kpwt");
+        a.create_principal(&p, &PrincipalChanges::default(), Some("kpwt-old-1"))
+            .unwrap();
+        let kdc = krb5::AsyncKdcClient::new(e.client.clone());
+        let svc = kpasswd::changepw_service(&e.realm);
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            kpasswd::change_password_async(&kdc, &p, "kpwt-old-1", "kpwt-new-2", &kp)
+                .await
+                .unwrap();
+            kdc.login_with_password(&p, "kpwt-new-2").await.unwrap();
+            let t = kdc
+                .initial_ticket_with_password(&e.p("admin/admin"), "adminpw", &svc)
+                .await
+                .unwrap();
+            kpasswd::set_password_async(&t, &p, "kpwt-set-3", &kp)
+                .await
+                .unwrap();
+            let t = kdc
+                .initial_ticket_with_password(&p, "kpwt-set-3", &svc)
+                .await
+                .unwrap();
+            kpasswd::change_password_with_ticket_async(&t, "kpwt-new-4", &kp)
+                .await
+                .unwrap();
+            kdc.login_with_password(&p, "kpwt-new-4").await.unwrap();
+        });
+        a.delete_principal(&p).unwrap();
+    }
+
     #[test]
     fn kpasswd_changes_and_sets_passwords() {
         let (e, server) = kadm!();
@@ -3646,5 +3682,257 @@ mod kadmin {
             kpasswd::kpasswd_server(&conf, &e.realm).unwrap(),
             std::env::var("KRB5_TEST_KPASSWD").unwrap()
         );
+    }
+}
+
+// ------------------------------------------------------------- on tokio
+
+/// `AsyncKdcClient` against the same KDC: the exchanges the blocking
+/// tests prove, on tokio's sockets, and many of them at once.
+#[cfg(feature = "tokio")]
+mod on_tokio {
+    use super::*;
+    use krb5::AsyncKdcClient;
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Runtime::new().unwrap()
+    }
+
+    /// Password and keytab logins, service tickets that our acceptor
+    /// takes, and a renewal; over UDP first, then over TCP only.
+    #[test]
+    fn logins_service_tickets_and_renewal() {
+        let e = live!();
+        rt().block_on(async {
+            for kdc in [e.client.clone(), e.client.clone().with_udp(false)] {
+                let kdc = AsyncKdcClient::new(
+                    kdc.with_lifetime(std::time::Duration::from_secs(3600))
+                        .with_renew_lifetime(Some(std::time::Duration::from_secs(7200))),
+                );
+                let tgt = kdc
+                    .login_with_password(&e.p("alice"), "alicepw")
+                    .await
+                    .unwrap();
+                assert_eq!(tgt.client, e.p("alice"));
+                let svc = e.p("host/svc.krb5.test");
+                establish(&e, &kdc.service_ticket(&tgt, &svc).await.unwrap());
+
+                let robot = kdc
+                    .login_with_keytab(&e.p("robot"), &e.keytab("robot.keytab"))
+                    .await
+                    .unwrap();
+                establish(&e, &kdc.service_ticket(&robot, &svc).await.unwrap());
+
+                let err = kdc
+                    .login_with_password(&e.p("alice"), "wrong")
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(err.kdc_code(), Some(KDC_ERR_PREAUTH_FAILED) | None),
+                    "{err}"
+                );
+
+                let new = kdc.renew(&tgt).await.unwrap();
+                assert_eq!(new.renew_till, tgt.renew_till);
+                assert_ne!(new.session_key.bytes(), tgt.session_key.bytes());
+            }
+        });
+    }
+
+    /// Logins spawned across the runtime's threads at once, each with a
+    /// service ticket: no exchange waits on another.
+    #[test]
+    fn many_logins_at_once() {
+        let e = live!();
+        let kdc = AsyncKdcClient::new(e.client.clone());
+        let (alice, svc) = (e.p("alice"), e.p("host/svc.krb5.test"));
+        let tickets = rt().block_on(async {
+            let tasks: Vec<_> = (0..64)
+                .map(|_| {
+                    let (kdc, alice, svc) = (kdc.clone(), alice.clone(), svc.clone());
+                    tokio::spawn(async move {
+                        let tgt = kdc.login_with_password(&alice, "alicepw").await?;
+                        kdc.service_ticket(&tgt, &svc).await
+                    })
+                })
+                .collect();
+            let mut out = Vec::new();
+            for t in tasks {
+                out.push(t.await.unwrap().unwrap());
+            }
+            out
+        });
+        assert_eq!(tickets.len(), 64);
+        establish(&e, &tickets[63]);
+    }
+
+    /// FAST armor (the encrypted challenge) and armored TGS requests.
+    #[test]
+    fn fast_armored_login() {
+        let e = live!();
+        let kdc = AsyncKdcClient::new(
+            e.client
+                .clone()
+                .with_fast_armor(armor_tgt(&e))
+                .with_spake_groups(&[]),
+        );
+        rt().block_on(async {
+            let tgt = kdc
+                .login_with_password(&e.p("alice"), "alicepw")
+                .await
+                .unwrap();
+            let st = kdc
+                .service_ticket(&tgt, &e.p("host/svc.krb5.test"))
+                .await
+                .unwrap();
+            establish(&e, &st);
+        });
+    }
+
+    /// `kinit`, `kvno` and `kinit -R` through a cache MIT's klist reads.
+    #[test]
+    fn caches_shared_with_mit() {
+        let e = live!();
+        let path = scratch(&e, "tokio-cache");
+        let cache = krb5::CacheName::parse(&format!("FILE:{}", path.display())).unwrap();
+        let kdc = AsyncKdcClient::new(
+            e.client
+                .clone()
+                .with_renew_lifetime(Some(std::time::Duration::from_secs(7200))),
+        );
+        rt().block_on(async {
+            kdc.kinit_with_password(&e.p("alice"), "alicepw", &cache)
+                .await
+                .unwrap();
+            let svc = e.p("host/svc.krb5.test");
+            let st = kdc.service_ticket_cached(&cache, &svc).await.unwrap();
+            assert_eq!(
+                kdc.service_ticket_cached(&cache, &svc)
+                    .await
+                    .unwrap()
+                    .ticket,
+                st.ticket
+            );
+            kdc.kinit_renew(&cache).await.unwrap();
+        });
+        if let Some(out) = mit(&e, &cache.to_string(), "klist", &[], None) {
+            assert!(out.contains(&format!("krbtgt/{0}@{0}", e.realm)), "{out}");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The KDC found through DNS SRV records, asked on tokio.
+    #[test]
+    fn a_kdc_found_through_dns_srv() {
+        let e = live!();
+        let port: u16 = std::env::var("KRB5_TEST_KDC")
+            .unwrap()
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let resolver = krb5::dns::Resolver::new(vec![srv_server(&e.realm, port)]);
+        rt().block_on(async {
+            let kdc = AsyncKdcClient::from_config_with_resolver(
+                &krb5::Krb5Conf::empty(),
+                &e.realm,
+                &resolver,
+            )
+            .await
+            .unwrap();
+            assert_eq!(kdc.client().kdcs(), [format!("localhost.:{port}")]);
+            kdc.login_with_password(&e.p("alice"), "alicepw")
+                .await
+                .unwrap();
+        });
+    }
+
+    /// Referrals across the three test realms.
+    #[test]
+    fn cross_realm_referrals() {
+        let e = live!();
+        let (kdc, _) = cross!(e);
+        let kdc = AsyncKdcClient::new(kdc);
+        rt().block_on(async {
+            let tgt = kdc
+                .login_with_password(&e.p("alice"), "alicepw")
+                .await
+                .unwrap();
+            let svc = Principal::new(krb5::client::NT_SRV_HST, ["host", "server.far.test"], "");
+            let st = kdc.service_ticket(&tgt, &svc).await.unwrap();
+            assert_eq!(ticket_realm(&st), "FAR.TEST");
+            establish_with(&e, &st, "far.keytab");
+        });
+    }
+
+    /// S4U2Self, and S4U2Proxy where the KDC has the delegation rules.
+    #[test]
+    fn s4u() {
+        let e = live!();
+        let kdc = AsyncKdcClient::new(e.client.clone().with_forwardable(true));
+        let keytab = e.keytab("service.keytab");
+        let svc = e.p("s4u/svc.krb5.test");
+        rt().block_on(async {
+            let tgt = kdc.login_with_keytab(&svc, &keytab).await.unwrap();
+            let creds = kdc.s4u2self(&tgt, &e.p("alice")).await.unwrap();
+            assert_eq!((&creds.client, &creds.server), (&e.p("alice"), &svc));
+        });
+        let realm = std::env::var("KRB5_TEST_S4U_REALM").unwrap_or_default();
+        if realm.is_empty() {
+            return;
+        }
+        let p = |n: &str| Principal::parse_in_realm(n, &realm).unwrap();
+        let kdc = AsyncKdcClient::new(
+            KdcClient::new(realm.clone(), e.client.kdcs().to_vec()).with_forwardable(true),
+        );
+        rt().block_on(async {
+            let tgt = kdc
+                .login_with_keytab(&p("proxy"), &e.keytab("s4u.keytab"))
+                .await
+                .unwrap();
+            let evidence = kdc.s4u2self(&tgt, &p("user")).await.unwrap();
+            let creds = kdc
+                .s4u2proxy(&tgt, &evidence, &Principal::new(1, ["target"], ""))
+                .await
+                .unwrap();
+            assert_eq!((creds.client, creds.server), (p("user"), p("target")));
+        });
+    }
+
+    /// Anonymous PKINIT, a certificate login, and `auto_fast_armor`.
+    #[cfg(feature = "pkinit")]
+    #[test]
+    fn pkinit() {
+        let e = live!();
+        if std::env::var("KRB5_TEST_PKINIT").ok().as_deref() != Some("1") {
+            eprintln!("KRB5_TEST_PKINIT not set; skipping PKINIT test");
+            return;
+        }
+        let conf = krb5::Krb5Conf::load([format!("{}/krb5.conf", e.dir)]).unwrap();
+        let id = krb5::pkinit::Identity::load(&format!(
+            "FILE:{0}/pki/alice.pem,{0}/pki/alice-key.pem",
+            e.dir
+        ))
+        .unwrap();
+        rt().block_on(async {
+            let kdc = AsyncKdcClient::from_config(&conf, &e.realm).await.unwrap();
+            let anon = kdc.login_anonymous().await.unwrap();
+            assert_eq!(
+                anon.client.to_string(),
+                "WELLKNOWN/ANONYMOUS@WELLKNOWN:ANONYMOUS"
+            );
+            let tgt = kdc
+                .login_with_certificate(&e.p("alice"), &id)
+                .await
+                .unwrap();
+            assert_eq!(tgt.client, e.p("alice"));
+            let armored = AsyncKdcClient::new(kdc.client().clone().with_auto_fast_armor(true));
+            let tgt = armored
+                .login_with_password(&e.p("alice"), "alicepw")
+                .await
+                .unwrap();
+            assert_eq!(tgt.client, e.p("alice"));
+        });
     }
 }

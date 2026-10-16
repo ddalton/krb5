@@ -5,15 +5,23 @@
 //! trades it for a ticket to a service. The result is a [`Credentials`],
 //! which [`crate::InitiatorContext`] turns into a GSS-API context.
 //!
-//! Transport is TCP (RFC 4120 §7.2.2: a four-octet big-endian length, then
-//! the message), tried against each configured KDC in order. There is no
-//! UDP, no DNS SRV discovery, no krb5.conf parsing, no cross-realm and no
-//! FAST: the caller names the realm and its KDCs.
+//! Requests go over UDP or TCP (RFC 4120 §7.2.2: a four-octet big-endian
+//! length, then the message) as MIT's `k5_sendto_kdc` chooses: UDP first
+//! for small requests, TCP for large ones and for a reply too big for
+//! UDP, each KDC in turn with MIT's waits and retries. The KDCs come from
+//! [`KdcClient::new`], `krb5.conf` ([`KdcClient::from_config`]) or DNS
+//! ([`crate::dns`]); other realms' are found the same way for cross-realm
+//! tickets.
+//!
+//! With the `tokio` feature, `AsyncKdcClient` makes the same exchanges on
+//! tokio's sockets.
 
 use crate::acceptor::Keytab;
 use crate::ccache::{CCache, CacheError, CacheName, same_principal};
 use std::collections::HashMap;
 
+#[cfg(feature = "tokio")]
+mod async_client;
 mod fast;
 #[cfg(any(fuzzing, test))]
 pub mod fuzz;
@@ -27,11 +35,12 @@ use crate::config::{self, ClientDefaults, ConfigError, Krb5Conf};
 use crate::der::{self, Fields, Reader, app};
 use crate::dns::{self, Resolver};
 use crate::key::{Key, KeyError};
+use crate::net::{Blocking, Net, block_on};
+#[cfg(feature = "tokio")]
+pub use async_client::AsyncKdcClient;
 use rand::RngCore;
 use s4u::{S4u, TgsReply};
 use std::fmt;
-use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::debug;
 pub use xrealm::MAX_HOPS;
@@ -485,7 +494,7 @@ enum Secret<'a> {
     #[cfg(feature = "pkinit")]
     Pkinit(Option<&'a pkinit::Identity>),
     /// A one-time password, chosen once the KDC's challenge is known.
-    Otp(&'a dyn Fn(&otp::OtpChallenge) -> Result<otp::OtpAnswer>),
+    Otp(&'a (dyn Fn(&otp::OtpChallenge) -> Result<otp::OtpAnswer> + Sync)),
 }
 
 /// Where an AS exchange is with PKINIT.
@@ -666,13 +675,17 @@ impl KdcClient {
     /// [`KdcClient::with_realm_kdcs`] entry, or the realm's KDCs located
     /// through the `krb5.conf` and resolver this client was made with.
     pub fn for_realm(&self, realm: &str) -> Result<KdcClient> {
+        block_on(self.for_realm_with(&Blocking, realm))
+    }
+
+    pub(crate) async fn for_realm_with<N: Net>(&self, net: &N, realm: &str) -> Result<KdcClient> {
         if realm == self.realm {
             return Ok(self.clone());
         }
         let (kdcs, transports) = match self.realm_kdcs.get(realm) {
             Some(k) => (k.clone(), vec![Transport::Either; k.len()]),
             None => {
-                let c = Self::locate(&self.conf, realm, self.resolver.as_ref())?;
+                let c = Self::locate(net, &self.conf, realm, self.resolver.as_ref()).await?;
                 (c.kdcs, c.transports)
             }
         };
@@ -691,7 +704,18 @@ impl KdcClient {
     /// `conf` too ([`Krb5Conf::client_defaults`]); `with_*` calls made
     /// afterwards override them.
     pub fn from_config(conf: &Krb5Conf, realm: &str) -> config::Result<Self> {
-        Ok(Self::locate(conf, realm, None)?.with_defaults(&conf.client_defaults(realm)?))
+        block_on(Self::from_config_on(&Blocking, conf, realm, None))
+    }
+
+    pub(crate) async fn from_config_on<N: Net>(
+        net: &N,
+        conf: &Krb5Conf,
+        realm: &str,
+        resolver: Option<&Resolver>,
+    ) -> config::Result<Self> {
+        Ok(Self::locate(net, conf, realm, resolver)
+            .await?
+            .with_defaults(&conf.client_defaults(realm)?))
     }
 
     /// [`KdcClient::from_config`] with DNS queries sent to `resolver`
@@ -701,10 +725,15 @@ impl KdcClient {
         realm: &str,
         resolver: &Resolver,
     ) -> config::Result<Self> {
-        Ok(Self::locate(conf, realm, Some(resolver))?.with_defaults(&conf.client_defaults(realm)?))
+        block_on(Self::from_config_on(&Blocking, conf, realm, Some(resolver)))
     }
 
-    fn locate(conf: &Krb5Conf, realm: &str, resolver: Option<&Resolver>) -> config::Result<Self> {
+    async fn locate<N: Net>(
+        net: &N,
+        conf: &Krb5Conf,
+        realm: &str,
+        resolver: Option<&Resolver>,
+    ) -> config::Result<Self> {
         match conf.kdcs(realm) {
             Ok(kdcs) => return Ok(KdcClient::new(realm, kdcs).remembering(conf, resolver)),
             // Entries this crate cannot use are not "none": MIT would use
@@ -726,8 +755,10 @@ impl KdcClient {
                     &system
                 }
             };
-            let servers = dns::locate_kdc_servers(resolver, realm, dns::dns_uri_lookup(conf))
-                .map_err(dns_err)?;
+            let servers =
+                dns::locate_kdc_servers_on(net, resolver, realm, dns::dns_uri_lookup(conf))
+                    .await
+                    .map_err(dns_err)?;
             if !servers.is_empty() {
                 debug!("{realm}: KDCs from DNS: {servers:?}");
                 let (kdcs, transports): (Vec<String>, Vec<Transport>) = servers.into_iter().unzip();
@@ -893,11 +924,24 @@ impl KdcClient {
         password: &str,
         cache: &CacheName,
     ) -> Result<Credentials> {
-        let (creds, info) = self.as_exchange(
-            client,
-            Secret::Password(password),
-            self.tkt_enctypes.clone(),
-        )?;
+        block_on(self.kinit_with_password_on(&Blocking, client, password, cache))
+    }
+
+    pub(crate) async fn kinit_with_password_on<N: Net>(
+        &self,
+        net: &N,
+        client: &Principal,
+        password: &str,
+        cache: &CacheName,
+    ) -> Result<Credentials> {
+        let (creds, info) = self
+            .as_exchange(
+                net,
+                client,
+                Secret::Password(password),
+                self.tkt_enctypes.clone(),
+            )
+            .await?;
         write_kinit_cache(cache, &creds, &info)?;
         Ok(creds)
     }
@@ -909,18 +953,39 @@ impl KdcClient {
         keytab: &Keytab,
         cache: &CacheName,
     ) -> Result<Credentials> {
-        let tgt = self.login_with_keytab_info(client, keytab)?;
+        block_on(self.kinit_with_keytab_on(&Blocking, client, keytab, cache))
+    }
+
+    pub(crate) async fn kinit_with_keytab_on<N: Net>(
+        &self,
+        net: &N,
+        client: &Principal,
+        keytab: &Keytab,
+        cache: &CacheName,
+    ) -> Result<Credentials> {
+        let tgt = self.login_with_keytab_info(net, client, keytab).await?;
         write_kinit_cache(cache, &tgt.0, &tgt.1)?;
         Ok(tgt.0)
     }
 
     /// AS exchange with a password-derived key: `kinit`.
     pub fn login_with_password(&self, client: &Principal, password: &str) -> Result<Credentials> {
+        block_on(self.login_with_password_on(&Blocking, client, password))
+    }
+
+    pub(crate) async fn login_with_password_on<N: Net>(
+        &self,
+        net: &N,
+        client: &Principal,
+        password: &str,
+    ) -> Result<Credentials> {
         self.as_exchange(
+            net,
             client,
             Secret::Password(password),
             self.tkt_enctypes.clone(),
         )
+        .await
         .map(|(c, _)| c)
     }
 
@@ -929,16 +994,29 @@ impl KdcClient {
     /// Only enctypes the keytab holds for `client` are requested, so the
     /// KDC cannot pick one the client has no key for.
     pub fn login_with_keytab(&self, client: &Principal, keytab: &Keytab) -> Result<Credentials> {
-        self.login_with_keytab_info(client, keytab).map(|(c, _)| c)
+        block_on(self.login_with_keytab_on(&Blocking, client, keytab))
     }
 
-    fn login_with_keytab_info(
+    pub(crate) async fn login_with_keytab_on<N: Net>(
         &self,
+        net: &N,
+        client: &Principal,
+        keytab: &Keytab,
+    ) -> Result<Credentials> {
+        self.login_with_keytab_info(net, client, keytab)
+            .await
+            .map(|(c, _)| c)
+    }
+
+    async fn login_with_keytab_info<N: Net>(
+        &self,
+        net: &N,
         client: &Principal,
         keytab: &Keytab,
     ) -> Result<(Credentials, AsInfo)> {
         let have = self.keytab_enctypes(client, keytab)?;
-        self.as_exchange(client, Secret::Keytab(keytab), have)
+        self.as_exchange(net, client, Secret::Keytab(keytab), have)
+            .await
     }
 
     /// The enctypes to ask for with `keytab`'s keys for `client`: only
@@ -1025,24 +1103,35 @@ impl KdcClient {
     /// accept anonymous clients.
     #[cfg(feature = "pkinit")]
     pub fn login_anonymous(&self) -> Result<Credentials> {
-        self.anonymous(&self.realm).map(|(c, _)| c)
+        block_on(self.anonymous(&Blocking, &self.realm)).map(|(c, _)| c)
     }
 
     /// `kinit -n`: [`KdcClient::login_anonymous`], written to `cache`.
     #[cfg(feature = "pkinit")]
     pub fn kinit_anonymous(&self, cache: &CacheName) -> Result<Credentials> {
-        let (creds, info) = self.anonymous(&self.realm)?;
+        block_on(self.kinit_anonymous_on(&Blocking, cache))
+    }
+
+    #[cfg(feature = "pkinit")]
+    pub(crate) async fn kinit_anonymous_on<N: Net>(
+        &self,
+        net: &N,
+        cache: &CacheName,
+    ) -> Result<Credentials> {
+        let (creds, info) = self.anonymous(net, &self.realm).await?;
         write_kinit_cache(cache, &creds, &info)?;
         Ok(creds)
     }
 
     #[cfg(feature = "pkinit")]
-    fn anonymous(&self, realm: &str) -> Result<(Credentials, AsInfo)> {
+    async fn anonymous<N: Net>(&self, net: &N, realm: &str) -> Result<(Credentials, AsInfo)> {
         self.as_exchange(
+            net,
             &pkinit::anonymous_principal(realm),
             Secret::Pkinit(None),
             self.tkt_enctypes.clone(),
         )
+        .await
     }
 
     /// PKINIT with a certificate (RFC 4556), `kinit -X
@@ -1055,11 +1144,23 @@ impl KdcClient {
         client: &Principal,
         identity: &pkinit::Identity,
     ) -> Result<Credentials> {
+        block_on(self.login_with_certificate_on(&Blocking, client, identity))
+    }
+
+    #[cfg(feature = "pkinit")]
+    pub(crate) async fn login_with_certificate_on<N: Net>(
+        &self,
+        net: &N,
+        client: &Principal,
+        identity: &pkinit::Identity,
+    ) -> Result<Credentials> {
         self.as_exchange(
+            net,
             client,
             Secret::Pkinit(Some(identity)),
             self.tkt_enctypes.clone(),
         )
+        .await
         .map(|(c, _)| c)
     }
 
@@ -1072,11 +1173,25 @@ impl KdcClient {
         identity: &pkinit::Identity,
         cache: &CacheName,
     ) -> Result<Credentials> {
-        let (creds, info) = self.as_exchange(
-            client,
-            Secret::Pkinit(Some(identity)),
-            self.tkt_enctypes.clone(),
-        )?;
+        block_on(self.kinit_with_certificate_on(&Blocking, client, identity, cache))
+    }
+
+    #[cfg(feature = "pkinit")]
+    pub(crate) async fn kinit_with_certificate_on<N: Net>(
+        &self,
+        net: &N,
+        client: &Principal,
+        identity: &pkinit::Identity,
+        cache: &CacheName,
+    ) -> Result<Credentials> {
+        let (creds, info) = self
+            .as_exchange(
+                net,
+                client,
+                Secret::Pkinit(Some(identity)),
+                self.tkt_enctypes.clone(),
+            )
+            .await?;
         write_kinit_cache(cache, &creds, &info)?;
         Ok(creds)
     }
@@ -1091,12 +1206,24 @@ impl KdcClient {
         password: &str,
         service: &Principal,
     ) -> Result<Credentials> {
+        block_on(self.initial_ticket_with_password_on(&Blocking, client, password, service))
+    }
+
+    pub(crate) async fn initial_ticket_with_password_on<N: Net>(
+        &self,
+        net: &N,
+        client: &Principal,
+        password: &str,
+        service: &Principal,
+    ) -> Result<Credentials> {
         self.as_exchange_to(
+            net,
             client,
             service,
             Secret::Password(password),
             self.tkt_enctypes.clone(),
         )
+        .await
         .map(|(c, _)| c)
     }
 
@@ -1107,8 +1234,19 @@ impl KdcClient {
         keytab: &Keytab,
         service: &Principal,
     ) -> Result<Credentials> {
+        block_on(self.initial_ticket_with_keytab_on(&Blocking, client, keytab, service))
+    }
+
+    pub(crate) async fn initial_ticket_with_keytab_on<N: Net>(
+        &self,
+        net: &N,
+        client: &Principal,
+        keytab: &Keytab,
+        service: &Principal,
+    ) -> Result<Credentials> {
         let have = self.keytab_enctypes(client, keytab)?;
-        self.as_exchange_to(client, service, Secret::Keytab(keytab), have)
+        self.as_exchange_to(net, client, service, Secret::Keytab(keytab), have)
+            .await
             .map(|(c, _)| c)
     }
 
@@ -1123,6 +1261,15 @@ impl KdcClient {
     /// process cached meanwhile is not dropped.
     pub fn service_ticket_cached(
         &self,
+        cache: &CacheName,
+        service: &Principal,
+    ) -> Result<Credentials> {
+        block_on(self.service_ticket_cached_on(&Blocking, cache, service))
+    }
+
+    pub(crate) async fn service_ticket_cached_on<N: Net>(
+        &self,
+        net: &N,
         cache: &CacheName,
         service: &Principal,
     ) -> Result<Credentials> {
@@ -1142,7 +1289,7 @@ impl KdcClient {
             now,
             got: Vec::new(),
         };
-        let creds = self.get_creds(&tgt, service, &mut store)?;
+        let creds = self.get_creds(net, &tgt, service, &mut store).await?;
         let got = store.got;
         let mut cc = cache.read()?;
         for t in got.iter().chain([&creds]) {
@@ -1160,7 +1307,7 @@ impl KdcClient {
     /// Give `service` an empty realm (or build it with
     /// [`Principal::host_service`]) to let the KDC say where it lives.
     pub fn service_ticket(&self, tgt: &Credentials, service: &Principal) -> Result<Credentials> {
-        self.get_creds(tgt, service, &mut NoStore)
+        block_on(self.get_creds(&Blocking, tgt, service, &mut NoStore))
     }
 
     /// A forwarded copy of `tgt` (the client's own TGT) for delegation: a
@@ -1170,14 +1317,23 @@ impl KdcClient {
     /// will not. The TGT must be forwardable; the KDC refuses otherwise
     /// (`KDC_ERR_BADOPTION`).
     pub fn forwarded_tgt(&self, tgt: &Credentials, enctype: Option<i32>) -> Result<Credentials> {
+        block_on(self.forwarded_tgt_on(&Blocking, tgt, enctype))
+    }
+
+    pub(crate) async fn forwarded_tgt_on<N: Net>(
+        &self,
+        net: &N,
+        tgt: &Credentials,
+        enctype: Option<i32>,
+    ) -> Result<Credentials> {
         let me = Principal::krbtgt(&tgt.client.realm);
         if let Some(e) = enctype {
             let pref = self.clone().with_tgs_enctypes(&[e]);
-            if let Ok(c) = pref.tgs(tgt, &me, KDC_OPT_FORWARDED) {
+            if let Ok(c) = pref.tgs(net, tgt, &me, KDC_OPT_FORWARDED).await {
                 return Ok(c);
             }
         }
-        self.tgs(tgt, &me, KDC_OPT_FORWARDED)
+        self.tgs(net, tgt, &me, KDC_OPT_FORWARDED).await
     }
 
     /// `creds` renewed (`kinit -R`, MIT's `krb5_get_renewed_creds`): a TGS
@@ -1192,7 +1348,22 @@ impl KdcClient {
     /// `KDC_ERR_BADOPTION` for a ticket that is not renewable and
     /// `KRB_AP_ERR_TKT_EXPIRED` for one past its end.
     pub fn renew(&self, creds: &Credentials) -> Result<Credentials> {
-        self.tgs_to(&creds.server.realm, creds, &creds.server, KDC_OPT_RENEW)
+        block_on(self.renew_on(&Blocking, creds))
+    }
+
+    pub(crate) async fn renew_on<N: Net>(
+        &self,
+        net: &N,
+        creds: &Credentials,
+    ) -> Result<Credentials> {
+        self.tgs_to(
+            net,
+            &creds.server.realm,
+            creds,
+            &creds.server,
+            KDC_OPT_RENEW,
+        )
+        .await
     }
 
     /// `creds`, a postdated ticket, made valid (`kinit -v`, MIT's
@@ -1202,23 +1373,43 @@ impl KdcClient {
     /// `invalid`, and refuses (`KRB_AP_ERR_TKT_NYV`) before its start time,
     /// or (`KDC_ERR_BADOPTION`) a ticket that is valid already.
     pub fn validate(&self, creds: &Credentials) -> Result<Credentials> {
-        self.tgs_to(&creds.server.realm, creds, &creds.server, KDC_OPT_VALIDATE)
+        block_on(self.validate_on(&Blocking, creds))
+    }
+
+    pub(crate) async fn validate_on<N: Net>(
+        &self,
+        net: &N,
+        creds: &Credentials,
+    ) -> Result<Credentials> {
+        self.tgs_to(
+            net,
+            &creds.server.realm,
+            creds,
+            &creds.server,
+            KDC_OPT_VALIDATE,
+        )
+        .await
     }
 
     /// `kinit -R`: renew the TGT in `cache` (the one for its principal's
     /// realm) and leave the cache holding only the renewed TGT, as MIT's
     /// `kinit` does.
     pub fn kinit_renew(&self, cache: &CacheName) -> Result<Credentials> {
-        self.kinit_again(cache, KDC_OPT_RENEW)
+        block_on(self.kinit_again(&Blocking, cache, KDC_OPT_RENEW))
     }
 
     /// `kinit -v`: as [`KdcClient::kinit_renew`], validating a postdated
     /// TGT instead.
     pub fn kinit_validate(&self, cache: &CacheName) -> Result<Credentials> {
-        self.kinit_again(cache, KDC_OPT_VALIDATE)
+        block_on(self.kinit_again(&Blocking, cache, KDC_OPT_VALIDATE))
     }
 
-    fn kinit_again(&self, cache: &CacheName, kdc_option: u32) -> Result<Credentials> {
+    pub(crate) async fn kinit_again<N: Net>(
+        &self,
+        net: &N,
+        cache: &CacheName,
+        kdc_option: u32,
+    ) -> Result<Credentials> {
         let cache = cache.resolved()?;
         let cc = cache.read()?;
         // MIT asks the cache for the TGT by name alone, not for one valid
@@ -1234,7 +1425,9 @@ impl KdcClient {
                 principal: cc.principal.to_string(),
                 cache: cache.to_string(),
             })?;
-        let new = self.tgs_to(&krbtgt.realm, &old, &krbtgt, kdc_option)?;
+        let new = self
+            .tgs_to(net, &krbtgt.realm, &old, &krbtgt, kdc_option)
+            .await?;
         let mut fresh = CCache::new(cc.principal.clone());
         fresh.store(&new);
         cache.write(&fresh)?;
@@ -1244,33 +1437,43 @@ impl KdcClient {
     /// One TGS exchange with the KDC of the realm `tgt` is for: a ticket
     /// for `server` (whose realm is the request realm), checked as MIT's
     /// `krb5int_process_tgs_reply` checks it.
-    fn tgs(&self, tgt: &Credentials, server: &Principal, kdc_options: u32) -> Result<Credentials> {
-        self.tgs_to(tgt_realm(tgt), tgt, server, kdc_options)
+    async fn tgs<N: Net>(
+        &self,
+        net: &N,
+        tgt: &Credentials,
+        server: &Principal,
+        kdc_options: u32,
+    ) -> Result<Credentials> {
+        self.tgs_to(net, tgt_realm(tgt), tgt, server, kdc_options)
+            .await
     }
 
     /// [`KdcClient::tgs`] to the KDC of `realm`.
-    fn tgs_to(
+    async fn tgs_to<N: Net>(
         &self,
+        net: &N,
         realm: &str,
         tgt: &Credentials,
         server: &Principal,
         kdc_options: u32,
     ) -> Result<Credentials> {
-        self.tgs_ext(realm, tgt, server, kdc_options, &S4u::None)
+        self.tgs_ext(net, realm, tgt, server, kdc_options, &S4u::None)
+            .await
             .map(|r| r.creds)
     }
 
     /// [`KdcClient::tgs_to`], with S4U: the reply, its PA-DATA and the
     /// subkey that keyed it.
-    fn tgs_ext(
+    async fn tgs_ext<N: Net>(
         &self,
+        net: &N,
         realm: &str,
         tgt: &Credentials,
         server: &Principal,
         kdc_options: u32,
         s4u: &S4u<'_>,
     ) -> Result<TgsReply> {
-        let kdc = self.for_realm(realm)?;
+        let kdc = self.for_realm_with(net, realm).await?;
         let (now, usec) = now();
         let nonce = random_nonce();
         // MIT's FLAGS2OPTS: the TGT's forwardable, proxiable, may-postdate
@@ -1331,7 +1534,7 @@ impl KdcClient {
                 encode_kdc_req(12, &[(PA_TGS_REQ, ap_req), fx], body)
             }
         };
-        let rep = match parse_reply(&kdc.exchange(&req)?, 13)? {
+        let rep = match parse_reply(&kdc.exchange(net, &req).await?, 13)? {
             Reply::Error(e) => {
                 let Some(a) = &armor else {
                     return Err(e.into_error());
@@ -1423,20 +1626,71 @@ impl KdcClient {
     }
 
     /// The AS exchange for a TGT.
-    fn as_exchange(
+    async fn as_exchange<N: Net>(
         &self,
+        net: &N,
         client: &Principal,
         secret: Secret<'_>,
         enctypes: Vec<i32>,
     ) -> Result<(Credentials, AsInfo)> {
-        self.as_exchange_to(client, &Principal::krbtgt(&client.realm), secret, enctypes)
+        self.as_exchange_to(
+            net,
+            client,
+            &Principal::krbtgt(&client.realm),
+            secret,
+            enctypes,
+        )
+        .await
     }
 
     /// The AS exchange for a ticket to `server`: a TGT, or an initial
     /// ticket for a service that accepts no others (`kadmin/admin`,
     /// `kadmin/changepw`), as `kinit -S` gets one.
-    fn as_exchange_to(
+    async fn as_exchange_to<N: Net>(
         &self,
+        net: &N,
+        client: &Principal,
+        server: &Principal,
+        secret: Secret<'_>,
+        enctypes: Vec<i32>,
+    ) -> Result<(Credentials, AsInfo)> {
+        // MIT's auto_fast_armor: armor with an anonymous PKINIT TGT good
+        // for an hour, unless armor was given.
+        #[cfg(feature = "pkinit")]
+        if self.fast_armor.is_none()
+            && self.pkinit.auto_fast_armor
+            && !matches!(secret, Secret::Pkinit(None))
+        {
+            debug!("auto_fast_armor: getting armor by anonymous PKINIT");
+            let anon = self
+                .clone()
+                .with_lifetime(Duration::from_secs(3600))
+                .with_renew_lifetime(None)
+                .with_start_time(None);
+            let armor = anon
+                .as_rounds(
+                    net,
+                    &pkinit::anonymous_principal(&client.realm),
+                    &Principal::krbtgt(&client.realm),
+                    Secret::Pkinit(None),
+                    self.tkt_enctypes.clone(),
+                )
+                .await?
+                .0;
+            return self
+                .clone()
+                .with_fast_armor(armor)
+                .as_rounds(net, client, server, secret, enctypes)
+                .await;
+        }
+        self.as_rounds(net, client, server, secret, enctypes).await
+    }
+
+    /// [`KdcClient::as_exchange_to`], armored as this client says: the
+    /// request and its answers, pre-authentication round by round.
+    async fn as_rounds<N: Net>(
+        &self,
+        net: &N,
         client: &Principal,
         server: &Principal,
         secret: Secret<'_>,
@@ -1448,26 +1702,8 @@ impl KdcClient {
         #[cfg(feature = "pkinit")]
         let anonymous = matches!(secret, Secret::Pkinit(None));
         #[cfg(feature = "pkinit")]
-        {
-            if anonymous {
-                kdc_options |= pkinit::KDC_OPT_REQUEST_ANONYMOUS;
-            }
-            // MIT's auto_fast_armor: armor with an anonymous PKINIT TGT
-            // good for an hour, unless armor was given.
-            if self.fast_armor.is_none() && self.pkinit.auto_fast_armor && !anonymous {
-                debug!("auto_fast_armor: getting armor by anonymous PKINIT");
-                let armor = self
-                    .clone()
-                    .with_lifetime(Duration::from_secs(3600))
-                    .with_renew_lifetime(None)
-                    .with_start_time(None)
-                    .anonymous(&client.realm)?
-                    .0;
-                return self
-                    .clone()
-                    .with_fast_armor(armor)
-                    .as_exchange_to(client, server, secret, enctypes);
-            }
+        if anonymous {
+            kdc_options |= pkinit::KDC_OPT_REQUEST_ANONYMOUS;
         }
         // MIT's state: whether we armor, whether we may still upgrade to
         // FAST or drop the informational PA-DATA (each once), and the
@@ -1551,7 +1787,7 @@ impl KdcClient {
                 }
             };
 
-            let rep = match parse_reply(&self.exchange(&req)?, 11)? {
+            let rep = match parse_reply(&self.exchange(net, &req).await?, 11)? {
                 Reply::Rep(r) => r,
                 Reply::Error(outer) => {
                     // Under FAST the real error, and the PA-DATA that goes
@@ -1983,11 +2219,11 @@ impl KdcClient {
     /// does: UDP first for a request of at most `udp_preference_limit`
     /// octets (1465), TCP first for a larger one, and over TCP only if a
     /// UDP reply is `KRB_ERR_RESPONSE_TOO_BIG`.
-    fn exchange(&self, req: &[u8]) -> Result<Vec<u8>> {
-        let reply = self.send(req, self.use_udp)?;
+    async fn exchange<N: Net>(&self, net: &N, req: &[u8]) -> Result<Vec<u8>> {
+        let reply = self.send(net, req, self.use_udp).await?;
         if reply.via_udp && is_too_big(&reply.data) {
             debug!(realm = %self.realm, "KDC reply too big for UDP; retrying over TCP");
-            return Ok(self.send(req, false)?.data);
+            return Ok(self.send(net, req, false).await?.data);
         }
         Ok(reply.data)
     }
@@ -1996,7 +2232,7 @@ impl KdcClient {
     /// preferred transport first and the other one after (UDP waiting a
     /// second for its answer), then up to two more passes resending over
     /// UDP with a growing wait. TCP gets one connection per server.
-    fn send(&self, req: &[u8], allow_udp: bool) -> Result<Answer> {
+    async fn send<N: Net>(&self, net: &N, req: &[u8], allow_udp: bool) -> Result<Answer> {
         let udp_first = allow_udp && req.len() <= self.udp_preference_limit;
         let mut first = Vec::new();
         let mut deferred = Vec::new();
@@ -2033,8 +2269,8 @@ impl KdcClient {
         };
         for (addr, t) in &attempts {
             let r = match t {
-                Transport::Udp => self.exchange_udp(addr, req, UDP_FIRST_WAIT),
-                _ => self.exchange_tcp(addr, req),
+                Transport::Udp => self.exchange_udp(net, addr, req, UDP_FIRST_WAIT).await,
+                _ => self.exchange_tcp(net, addr, req).await,
             };
             match r {
                 Ok(data) => {
@@ -2049,7 +2285,7 @@ impl KdcClient {
         let mut wait = UDP_FIRST_WAIT * 2;
         for _ in 1..UDP_PASSES {
             for (addr, _) in attempts.iter().filter(|(_, t)| *t == Transport::Udp) {
-                match self.exchange_udp(addr, req, wait) {
+                match self.exchange_udp(net, addr, req, wait).await {
                     Ok(data) => {
                         return Ok(Answer {
                             data,
@@ -2069,25 +2305,25 @@ impl KdcClient {
 
     /// One datagram to each address `addr` resolves to, accepting a reply
     /// only from the address asked (a connected socket).
-    fn exchange_udp(&self, addr: &str, req: &[u8], wait: Duration) -> std::io::Result<Vec<u8>> {
+    async fn exchange_udp<N: Net>(
+        &self,
+        net: &N,
+        addr: &str,
+        req: &[u8],
+        wait: Duration,
+    ) -> std::io::Result<Vec<u8>> {
         use std::io::{Error, ErrorKind};
         let mut last = Error::new(ErrorKind::NotFound, format!("{addr} did not resolve"));
-        for sa in addr.to_socket_addrs()? {
-            let bind: std::net::SocketAddr = match sa {
-                std::net::SocketAddr::V4(_) => (std::net::Ipv4Addr::UNSPECIFIED, 0).into(),
-                std::net::SocketAddr::V6(_) => (std::net::Ipv6Addr::UNSPECIFIED, 0).into(),
-            };
-            let attempt = || -> std::io::Result<Vec<u8>> {
-                let sock = UdpSocket::bind(bind)?;
-                sock.connect(sa)?;
-                sock.set_read_timeout(Some(wait.min(self.timeout)))?;
-                sock.send(req)?;
+        for sa in net.resolve(addr).await? {
+            let attempt = async {
+                let sock = net.udp(sa).await?;
+                net.send(&sock, req).await?;
                 let mut buf = vec![0u8; UDP_MAX_REPLY];
-                let n = sock.recv(&mut buf)?;
+                let n = net.recv(&sock, &mut buf, wait.min(self.timeout)).await?;
                 buf.truncate(n);
                 Ok(buf)
             };
-            match attempt() {
+            match attempt.await {
                 Ok(r) => return Ok(r),
                 Err(e) => last = e,
             }
@@ -2095,24 +2331,27 @@ impl KdcClient {
         Err(last)
     }
 
-    fn exchange_tcp(&self, addr: &str, req: &[u8]) -> std::io::Result<Vec<u8>> {
+    async fn exchange_tcp<N: Net>(
+        &self,
+        net: &N,
+        addr: &str,
+        req: &[u8],
+    ) -> std::io::Result<Vec<u8>> {
         use std::io::{Error, ErrorKind};
         let mut last = Error::new(ErrorKind::NotFound, format!("{addr} did not resolve"));
-        for sa in addr.to_socket_addrs()? {
-            let mut s = match TcpStream::connect_timeout(&sa, self.timeout) {
+        for sa in net.resolve(addr).await? {
+            let mut s = match net.connect(sa, self.timeout).await {
                 Ok(s) => s,
                 Err(e) => {
                     last = e;
                     continue;
                 }
             };
-            s.set_read_timeout(Some(self.timeout))?;
-            s.set_write_timeout(Some(self.timeout))?;
             let mut framed = (req.len() as u32).to_be_bytes().to_vec();
             framed.extend_from_slice(req);
-            s.write_all(&framed)?;
+            net.write_all(&mut s, &framed, self.timeout).await?;
             let mut len = [0u8; 4];
-            s.read_exact(&mut len)?;
+            net.read_exact(&mut s, &mut len, self.timeout).await?;
             let len = u32::from_be_bytes(len);
             // RFC 4120 §7.2.2: the high bit is reserved and must be zero.
             if len & 0x8000_0000 != 0 || len as usize > MAX_REPLY {
@@ -2122,7 +2361,7 @@ impl KdcClient {
                 ));
             }
             let mut buf = vec![0u8; len as usize];
-            s.read_exact(&mut buf)?;
+            net.read_exact(&mut s, &mut buf, self.timeout).await?;
             return Ok(buf);
         }
         Err(last)
@@ -2502,6 +2741,7 @@ impl KdcRep {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
 
     #[test]
     fn principals_parse_like_mit() {
@@ -2833,87 +3073,126 @@ mod tests {
         assert_eq!(*seen.lock().unwrap(), [true, false]);
     }
 
-    #[test]
-    fn a_small_request_goes_over_udp_first() {
-        let (addr, log) = fake_kdc(Does::Answer, Does::Answer);
-        assert_eq!(client(&addr).exchange(&[0; 100]).unwrap(), b"udp");
-        assert_eq!(*log.lock().unwrap(), ["udp"]);
+    type Ex = fn(&KdcClient, &[u8]) -> Result<Vec<u8>>;
+
+    trait ExchangeWith {
+        fn exchange_with(&self, ex: Ex, req: &[u8]) -> Result<Vec<u8>>;
     }
 
-    #[test]
-    fn a_request_over_the_preference_limit_goes_over_tcp_first() {
-        let (addr, log) = fake_kdc(Does::Answer, Does::Answer);
-        let c = client(&addr).with_udp_preference_limit(50);
-        assert_eq!(c.exchange(&[0; 100]).unwrap(), b"tcp");
-        assert_eq!(*log.lock().unwrap(), ["tcp"]);
-        // The default limit, MIT's 1465, is the boundary.
-        let (addr, log) = fake_kdc(Does::Answer, Does::Answer);
-        assert_eq!(client(&addr).exchange(&[0; 1465]).unwrap(), b"udp");
-        assert_eq!(client(&addr).exchange(&[0; 1466]).unwrap(), b"tcp");
-        assert_eq!(*log.lock().unwrap(), ["udp", "tcp"]);
+    impl ExchangeWith for KdcClient {
+        fn exchange_with(&self, ex: Ex, req: &[u8]) -> Result<Vec<u8>> {
+            ex(self, req)
+        }
     }
 
-    #[test]
-    fn response_too_big_over_udp_is_asked_again_over_tcp() {
-        let (addr, log) = fake_kdc(Does::TooBig, Does::Answer);
-        assert_eq!(client(&addr).exchange(&[0; 100]).unwrap(), b"tcp");
-        assert_eq!(*log.lock().unwrap(), ["udp", "tcp"]);
+    fn on_blocking(c: &KdcClient, req: &[u8]) -> Result<Vec<u8>> {
+        block_on(c.exchange(&Blocking, req))
     }
 
-    #[test]
-    fn a_silent_udp_server_gives_way_to_tcp_after_a_second() {
-        let (addr, log) = fake_kdc(Does::Silent, Does::Answer);
-        let t = std::time::Instant::now();
-        assert_eq!(client(&addr).exchange(&[0; 100]).unwrap(), b"tcp");
-        assert!(
-            t.elapsed() >= Duration::from_millis(900),
-            "{:?}",
-            t.elapsed()
-        );
-        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
-        assert_eq!(*log.lock().unwrap(), ["udp", "tcp"]);
+    #[cfg(feature = "tokio")]
+    fn on_tokio(c: &KdcClient, req: &[u8]) -> Result<Vec<u8>> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(c.exchange(&crate::net::Tokio, req))
     }
 
-    #[test]
-    fn udp_is_resent_on_later_passes_when_tcp_is_refused() {
-        let (addr, log) = fake_kdc(Does::Silent, Does::Refuse);
-        let c = client(&addr).with_timeout(Duration::from_millis(300));
-        assert!(matches!(
-            c.exchange(&[0; 100]),
-            Err(ClientError::Unreachable { .. })
-        ));
-        assert_eq!(*log.lock().unwrap(), ["udp", "udp", "udp"], "three passes");
+    /// Each test once with blocking sockets and once on tokio's.
+    macro_rules! on_both {
+        ($(fn $name:ident($ex:ident) $body:block)*) => {$(
+            mod $name {
+                use super::*;
+                fn run($ex: Ex) $body
+                #[test]
+                fn blocking() {
+                    run(on_blocking)
+                }
+                #[cfg(feature = "tokio")]
+                #[test]
+                fn tokio() {
+                    run(on_tokio)
+                }
+            }
+        )*};
     }
 
-    #[test]
-    fn with_udp_off_everything_is_tcp() {
-        let (addr, log) = fake_kdc(Does::Answer, Does::Answer);
-        assert_eq!(
-            client(&addr).with_udp(false).exchange(&[0; 10]).unwrap(),
-            b"tcp"
-        );
-        assert_eq!(*log.lock().unwrap(), ["tcp"]);
-    }
+    on_both! {
+        fn a_small_request_goes_over_udp_first(ex) {
+            let (addr, log) = fake_kdc(Does::Answer, Does::Answer);
+            assert_eq!(client(&addr).exchange_with(ex, &[0; 100]).unwrap(), b"udp");
+            assert_eq!(*log.lock().unwrap(), ["udp"]);
+        }
 
-    #[test]
-    fn a_tcp_only_address_is_never_sent_udp() {
-        let (addr, log) = fake_kdc(Does::Answer, Does::Answer);
-        let mut c = client(&addr);
-        c.transports = vec![Transport::Tcp];
-        assert_eq!(c.exchange(&[0; 10]).unwrap(), b"tcp");
-        let mut u = client(&addr);
-        u.transports = vec![Transport::Udp];
-        assert_eq!(
-            u.clone()
-                .with_udp_preference_limit(1)
-                .exchange(&[0; 10])
-                .unwrap(),
-            b"udp"
-        );
-        assert!(matches!(
-            u.with_udp(false).exchange(&[0; 10]),
-            Err(ClientError::Unreachable { .. })
-        ));
-        assert_eq!(*log.lock().unwrap(), ["tcp", "udp"]);
+        fn a_request_over_the_preference_limit_goes_over_tcp_first(ex) {
+            let (addr, log) = fake_kdc(Does::Answer, Does::Answer);
+            let c = client(&addr).with_udp_preference_limit(50);
+            assert_eq!(c.exchange_with(ex, &[0; 100]).unwrap(), b"tcp");
+            assert_eq!(*log.lock().unwrap(), ["tcp"]);
+            // The default limit, MIT's 1465, is the boundary.
+            let (addr, log) = fake_kdc(Does::Answer, Does::Answer);
+            assert_eq!(client(&addr).exchange_with(ex, &[0; 1465]).unwrap(), b"udp");
+            assert_eq!(client(&addr).exchange_with(ex, &[0; 1466]).unwrap(), b"tcp");
+            assert_eq!(*log.lock().unwrap(), ["udp", "tcp"]);
+        }
+
+        fn response_too_big_over_udp_is_asked_again_over_tcp(ex) {
+            let (addr, log) = fake_kdc(Does::TooBig, Does::Answer);
+            assert_eq!(client(&addr).exchange_with(ex, &[0; 100]).unwrap(), b"tcp");
+            assert_eq!(*log.lock().unwrap(), ["udp", "tcp"]);
+        }
+
+        fn a_silent_udp_server_gives_way_to_tcp_after_a_second(ex) {
+            let (addr, log) = fake_kdc(Does::Silent, Does::Answer);
+            let t = std::time::Instant::now();
+            assert_eq!(client(&addr).exchange_with(ex, &[0; 100]).unwrap(), b"tcp");
+            assert!(
+                t.elapsed() >= Duration::from_millis(900),
+                "{:?}",
+                t.elapsed()
+            );
+            assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+            assert_eq!(*log.lock().unwrap(), ["udp", "tcp"]);
+        }
+
+        fn udp_is_resent_on_later_passes_when_tcp_is_refused(ex) {
+            let (addr, log) = fake_kdc(Does::Silent, Does::Refuse);
+            let c = client(&addr).with_timeout(Duration::from_millis(300));
+            assert!(matches!(
+                c.exchange_with(ex, &[0; 100]),
+                Err(ClientError::Unreachable { .. })
+            ));
+            assert_eq!(*log.lock().unwrap(), ["udp", "udp", "udp"], "three passes");
+        }
+
+        fn with_udp_off_everything_is_tcp(ex) {
+            let (addr, log) = fake_kdc(Does::Answer, Does::Answer);
+            assert_eq!(
+                client(&addr).with_udp(false).exchange_with(ex, &[0; 10]).unwrap(),
+                b"tcp"
+            );
+            assert_eq!(*log.lock().unwrap(), ["tcp"]);
+        }
+
+        fn a_tcp_only_address_is_never_sent_udp(ex) {
+            let (addr, log) = fake_kdc(Does::Answer, Does::Answer);
+            let mut c = client(&addr);
+            c.transports = vec![Transport::Tcp];
+            assert_eq!(c.exchange_with(ex, &[0; 10]).unwrap(), b"tcp");
+            let mut u = client(&addr);
+            u.transports = vec![Transport::Udp];
+            assert_eq!(
+                u.clone()
+                    .with_udp_preference_limit(1)
+                    .exchange_with(ex, &[0; 10])
+                    .unwrap(),
+                b"udp"
+            );
+            assert!(matches!(
+                u.with_udp(false).exchange_with(ex, &[0; 10]),
+                Err(ClientError::Unreachable { .. })
+            ));
+            assert_eq!(*log.lock().unwrap(), ["tcp", "udp"]);
+        }
     }
 }

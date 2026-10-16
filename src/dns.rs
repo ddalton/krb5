@@ -41,9 +41,10 @@
 
 use crate::client::Transport;
 use crate::config::{Krb5Conf, conf_boolean, parse_host_string};
+use crate::net::{Blocking, Net, block_on};
 use std::fs;
-use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::time::Duration;
 use tracing::debug;
@@ -153,10 +154,19 @@ impl Resolver {
     /// within the answer. A name that does not exist is an empty list;
     /// an error means no server gave a usable answer.
     pub fn query(&self, name: &str, qtype: u16) -> io::Result<Vec<Record>> {
+        block_on(self.query_on(&Blocking, name, qtype))
+    }
+
+    pub(crate) async fn query_on<N: Net>(
+        &self,
+        net: &N,
+        name: &str,
+        qtype: u16,
+    ) -> io::Result<Vec<Record>> {
         let mut last = io::Error::new(io::ErrorKind::NotFound, "no nameservers");
         for _ in 0..self.attempts {
             for &server in &self.servers {
-                match self.ask(server, name, qtype) {
+                match self.ask(net, server, name, qtype).await {
                     Ok(records) => return Ok(records),
                     Err(e) => {
                         debug!("DNS {name} via {server}: {e}");
@@ -168,22 +178,22 @@ impl Resolver {
         Err(last)
     }
 
-    fn ask(&self, server: SocketAddr, name: &str, qtype: u16) -> io::Result<Vec<Record>> {
+    async fn ask<N: Net>(
+        &self,
+        net: &N,
+        server: SocketAddr,
+        name: &str,
+        qtype: u16,
+    ) -> io::Result<Vec<Record>> {
         let id: u16 = rand::random();
         let query = encode_query(id, name, qtype)?;
 
-        let bind: SocketAddr = match server {
-            SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
-            SocketAddr::V6(_) => (std::net::Ipv6Addr::UNSPECIFIED, 0).into(),
-        };
-        let sock = UdpSocket::bind(bind)?;
-        // Connecting makes the kernel drop datagrams from anyone else.
-        sock.connect(server)?;
-        sock.set_read_timeout(Some(self.timeout))?;
-        sock.send(&query)?;
+        // Connected, so the kernel drops datagrams from anyone else.
+        let sock = net.udp(server).await?;
+        net.send(&sock, &query).await?;
         let mut buf = [0u8; UDP_MAX];
         let reply = loop {
-            let n = sock.recv(&mut buf)?;
+            let n = net.recv(&sock, &mut buf, self.timeout).await?;
             // A reply to some other query (or garbage) is ignored, not fatal:
             // keep waiting for ours until the timeout.
             match parse_reply(&buf[..n], id, name, qtype) {
@@ -193,30 +203,29 @@ impl Resolver {
         };
         match reply {
             Ok(Reply::Answer(records)) => Ok(records),
-            Ok(Reply::Truncated) => self.ask_tcp(server, id, &query, name, qtype),
+            Ok(Reply::Truncated) => self.ask_tcp(net, server, id, &query, name, qtype).await,
             Err(Reject::Bad(e)) => Err(e),
             Err(Reject::NotOurs) => unreachable!(),
         }
     }
 
-    fn ask_tcp(
+    async fn ask_tcp<N: Net>(
         &self,
+        net: &N,
         server: SocketAddr,
         id: u16,
         query: &[u8],
         name: &str,
         qtype: u16,
     ) -> io::Result<Vec<Record>> {
-        let mut s = TcpStream::connect_timeout(&server, self.timeout)?;
-        s.set_read_timeout(Some(self.timeout))?;
-        s.set_write_timeout(Some(self.timeout))?;
+        let mut s = net.connect(server, self.timeout).await?;
         let mut framed = (query.len() as u16).to_be_bytes().to_vec();
         framed.extend_from_slice(query);
-        s.write_all(&framed)?;
+        net.write_all(&mut s, &framed, self.timeout).await?;
         let mut len = [0u8; 2];
-        s.read_exact(&mut len)?;
+        net.read_exact(&mut s, &mut len, self.timeout).await?;
         let mut buf = vec![0u8; u16::from_be_bytes(len) as usize];
-        s.read_exact(&mut buf)?;
+        net.read_exact(&mut s, &mut buf, self.timeout).await?;
         match parse_reply(&buf, id, name, qtype) {
             Ok(Reply::Answer(records)) => Ok(records),
             Ok(Reply::Truncated) => Err(bad("truncated reply over TCP")),
@@ -288,11 +297,6 @@ pub fn locate_kdcs(resolver: &Resolver, realm: &str, use_uri: bool) -> io::Resul
         .collect())
 }
 
-/// [`locate_kdcs`] with the transport each address may be used over, in
-/// MIT's order: the URI records' `tcp` and `udp` entries by priority; or,
-/// without usable URI records, the `_udp` SRV records and then the `_tcp`
-/// ones. An address found for both transports may use either. `udp`
-/// entries may also be tried over TCP (see the module docs).
 /// Add `addr`, or widen its transport to `Either` if it is already there.
 fn add(found: &mut Vec<(String, Transport)>, addr: String, t: Transport) {
     match found.iter_mut().find(|(a, _)| *a == addr) {
@@ -302,7 +306,21 @@ fn add(found: &mut Vec<(String, Transport)>, addr: String, t: Transport) {
     }
 }
 
+/// [`locate_kdcs`] with the transport each address may be used over, in
+/// MIT's order: the URI records' `tcp` and `udp` entries by priority; or,
+/// without usable URI records, the `_udp` SRV records and then the `_tcp`
+/// ones. An address found for both transports may use either. `udp`
+/// entries may also be tried over TCP (see the module docs).
 pub fn locate_kdc_servers(
+    resolver: &Resolver,
+    realm: &str,
+    use_uri: bool,
+) -> io::Result<Vec<(String, Transport)>> {
+    block_on(locate_kdc_servers_on(&Blocking, resolver, realm, use_uri))
+}
+
+pub(crate) async fn locate_kdc_servers_on<N: Net>(
+    net: &N,
     resolver: &Resolver,
     realm: &str,
     use_uri: bool,
@@ -313,7 +331,8 @@ pub fn locate_kdc_servers(
         // As in MIT, a URI query that fails (some servers refuse the type)
         // just means "no URI records".
         let mut uris = resolver
-            .query(&lookup_name("_kerberos", None, realm), TYPE_URI)
+            .query_on(net, &lookup_name("_kerberos", None, realm), TYPE_URI)
+            .await
             .unwrap_or_else(|e| {
                 debug!("{realm}: URI lookup failed ({e}); trying SRV");
                 Vec::new()
@@ -343,14 +362,20 @@ pub fn locate_kdc_servers(
 
     let mut failed = None;
     for (protocol, t) in [("_udp", Transport::Either), ("_tcp", Transport::Tcp)] {
-        let mut srvs =
-            match resolver.query(&lookup_name("_kerberos", Some(protocol), realm), TYPE_SRV) {
-                Ok(r) => r,
-                Err(e) => {
-                    failed.get_or_insert(e);
-                    continue;
-                }
-            };
+        let mut srvs = match resolver
+            .query_on(
+                net,
+                &lookup_name("_kerberos", Some(protocol), realm),
+                TYPE_SRV,
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                failed.get_or_insert(e);
+                continue;
+            }
+        };
         by_priority(&mut srvs);
         let targets: Vec<(u16, &str)> = srvs
             .iter()
@@ -576,7 +601,8 @@ pub mod fuzz;
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::net::TcpListener;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, UdpSocket};
     use std::sync::{Arc, Mutex};
 
     /// Replies recorded from a real resolver (scripts/record-dns-fixtures.py).
@@ -1139,6 +1165,55 @@ mod tests {
                 .query(name, TYPE_SRV)
                 .is_err()
         );
+    }
+
+    /// The same queries on tokio: truncation sends it to TCP, a stray
+    /// reply is skipped, a failing or silent server gives way, and
+    /// `AsyncKdcClient` finds the KDCs through them.
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn on_tokio_queries_go_the_same_way() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let q = |r: &Resolver, name: &'static str| {
+            rt.block_on(r.query_on(&crate::net::Tokio, name, TYPE_SRV))
+        };
+        let name = "_kerberos._udp.athena.mit.edu.";
+        let trunc = fake(zone(&[(name, TYPE_SRV, Says::Truncated("athena-udp-srv"))]));
+        assert_eq!(q(&resolver(&[trunc.addr]), name).unwrap().len(), 3);
+        let via: Vec<_> = trunc
+            .asked
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, _, v)| *v)
+            .collect();
+        assert_eq!(via, ["udp", "tcp"]);
+
+        let stray = fake(zone(&[(
+            name,
+            TYPE_SRV,
+            Says::StrayFirst("athena-udp-srv"),
+        )]));
+        assert_eq!(q(&resolver(&[stray.addr]), name).unwrap().len(), 3);
+
+        let fail = fake(zone(&[(name, TYPE_SRV, Says::Rcode(2))]));
+        let mute = fake(zone(&[(name, TYPE_SRV, Says::Silent)]));
+        let good = fake(zone(&[(name, TYPE_SRV, Says::Fixture("athena-udp-srv"))]));
+        let r = resolver(&[fail.addr, mute.addr, good.addr]);
+        assert_eq!(q(&r, name).unwrap().len(), 3);
+        assert!(q(&resolver(&[fail.addr, mute.addr]), name).is_err());
+
+        let c = rt
+            .block_on(crate::AsyncKdcClient::from_config_with_resolver(
+                &Krb5Conf::empty(),
+                "ATHENA.MIT.EDU",
+                &resolver(&[good.addr]),
+            ))
+            .unwrap();
+        assert_eq!(c.client().kdcs().len(), 3);
     }
 
     /// MIT's place_srv_entry: lower priority first, DNS order kept within

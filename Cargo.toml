@@ -28,6 +28,7 @@ p521 = { version = "0.14", optional = true, default-features = false, features =
 pbkdf2 = { version = "0.13", optional = true, default-features = false, features = ["hmac"] }
 des = { version = "0.9", optional = true }
 rc2 = { version = "0.9", optional = true }
+tokio = { version = "1.38", optional = true, default-features = false, features = ["net", "time", "io-util"] }
 
 [features]
 # PKINIT (RFC 4556), anonymous PKINIT (RFC 8062) and ECDH/ECDSA (RFC 5349):
@@ -36,6 +37,8 @@ pkinit = ["spake-nist", "dep:crypto-bigint", "dep:des", "dep:rc2", "dep:pbkdf2"]
 # SPAKE pre-authentication over the NIST curves P-256, P-384 and P-521
 # (edwards25519, MIT's default, needs no feature).
 spake-nist = ["dep:p256", "dep:p384", "dep:p521"]
+# An async KDC client on tokio's sockets: `krb5::AsyncKdcClient`.
+tokio = ["dep:tokio"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -43,6 +46,7 @@ all-features = true
 [dev-dependencies]
 pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
 serde_json = "1.0"
+tokio = { version = "1.38", default-features = false, features = ["rt", "rt-multi-thread", "macros", "net", "time", "io-util"] }
 
 [lints.rust]
 # `cargo fuzz` builds with --cfg fuzzing (see fuzz/).

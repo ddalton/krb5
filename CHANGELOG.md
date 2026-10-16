@@ -7,6 +7,34 @@ may break the API).
 
 ## [Unreleased]
 
+### Added
+
+- An async KDC client on tokio, with the new `tokio` feature:
+  `AsyncKdcClient`, with every `KdcClient` exchange as an `async fn`
+  (logins with a password, keytab, OTP or certificate, anonymous PKINIT,
+  service tickets across realms, `kinit` and `kvno` through caches,
+  renewal and validation, forwarded TGTs, S4U2Self and S4U2Proxy,
+  user-to-user), its DNS lookups too (`AsyncKdcClient::from_config`,
+  `discover`, `for_realm`), and `kpasswd::change_password_async`,
+  `change_password_with_ticket_async` and `set_password_async`. Every
+  future is `Send`. Make one from a configured `KdcClient`
+  (`AsyncKdcClient::new`).
+  - The exchanges are written once and driven by both clients: the
+    blocking one runs them on `std::net`'s sockets, the async one on
+    tokio's, so the requests, the checks on the replies, and the choice
+    and order of UDP and TCP (MIT's waits and retries) are the same.
+  - Tested live against MIT's KDC as the blocking client is (logins,
+    FAST, referrals, S4U, PKINIT, caches MIT's tools read, kpasswd, DNS
+    SRV), with 64 logins at once across a multi-threaded runtime, and the
+    transport and DNS unit tests run on both.
+  - Cache reads and writes (`service_ticket_cached`, the `kinit_*`
+    methods) stay synchronous: a local file, or the KCM daemon over a
+    Unix socket. kadmin has no async client.
+
+### Changed
+
+- `KdcClient::login_with_otp_by`'s callback must be `Sync`.
+
 ## [0.13.1] - 2026-10-15
 
 ### Changed

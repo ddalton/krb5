@@ -24,8 +24,8 @@ use crate::client::{
 use crate::config::Krb5Conf;
 use crate::der::{self, Fields, app};
 use crate::key::Key;
-use std::io::{Read, Write};
-use std::net::{IpAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use crate::net::{Blocking, Net, block_on};
+use std::net::IpAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// The default `kpasswd_port`.
@@ -108,9 +108,36 @@ pub fn change_password(
     new_password: &str,
     server: &str,
 ) -> Result<()> {
+    block_on(change_password_on(
+        &Blocking,
+        kdc,
+        client,
+        old_password,
+        new_password,
+        server,
+    ))
+}
+
+pub(crate) async fn change_password_on<N: Net>(
+    net: &N,
+    kdc: &KdcClient,
+    client: &Principal,
+    old_password: &str,
+    new_password: &str,
+    server: &str,
+) -> Result<()> {
     let svc = changepw_service(&client.realm);
-    let ticket = kdc.initial_ticket_with_password(client, old_password, &svc)?;
-    change_password_with_ticket(&ticket, new_password, server)
+    let ticket = kdc
+        .initial_ticket_with_password_on(net, client, old_password, &svc)
+        .await?;
+    exchange(
+        net,
+        &ticket,
+        VERSION_CHANGE,
+        new_password.as_bytes(),
+        server,
+    )
+    .await
 }
 
 /// Change the password of `ticket`'s client, `ticket` being an initial
@@ -120,13 +147,35 @@ pub fn change_password_with_ticket(
     new_password: &str,
     server: &str,
 ) -> Result<()> {
-    exchange(ticket, VERSION_CHANGE, new_password.as_bytes(), server)
+    block_on(exchange(
+        &Blocking,
+        ticket,
+        VERSION_CHANGE,
+        new_password.as_bytes(),
+        server,
+    ))
 }
 
 /// RFC 3244 set-password: give `target` the password `new_password`,
 /// `ticket` being a ticket for `kadmin/changepw@REALM` whose client the
 /// server allows to (an administrator, in MIT's ACL; or `target` itself).
 pub fn set_password(
+    ticket: &Credentials,
+    target: &Principal,
+    new_password: &str,
+    server: &str,
+) -> Result<()> {
+    block_on(set_password_on(
+        &Blocking,
+        ticket,
+        target,
+        new_password,
+        server,
+    ))
+}
+
+pub(crate) async fn set_password_on<N: Net>(
+    net: &N,
     ticket: &Credentials,
     target: &Principal,
     new_password: &str,
@@ -139,7 +188,49 @@ pub fn set_password(
         der::field(1, target.encode_name()),
         der::field(2, der::general_string(&target.realm)),
     ]);
-    exchange(ticket, VERSION_SET, &data, server)
+    exchange(net, ticket, VERSION_SET, &data, server).await
+}
+
+/// [`change_password`] on tokio (the `tokio` feature).
+#[cfg(feature = "tokio")]
+pub async fn change_password_async(
+    kdc: &crate::AsyncKdcClient,
+    client: &Principal,
+    old_password: &str,
+    new_password: &str,
+    server: &str,
+) -> Result<()> {
+    change_password_on(
+        &crate::net::Tokio,
+        kdc.client(),
+        client,
+        old_password,
+        new_password,
+        server,
+    )
+    .await
+}
+
+/// [`change_password_with_ticket`] on tokio (the `tokio` feature).
+#[cfg(feature = "tokio")]
+pub async fn change_password_with_ticket_async(
+    ticket: &Credentials,
+    new_password: &str,
+    server: &str,
+) -> Result<()> {
+    let new = new_password.as_bytes();
+    exchange(&crate::net::Tokio, ticket, VERSION_CHANGE, new, server).await
+}
+
+/// [`set_password`] on tokio (the `tokio` feature).
+#[cfg(feature = "tokio")]
+pub async fn set_password_async(
+    ticket: &Credentials,
+    target: &Principal,
+    new_password: &str,
+    server: &str,
+) -> Result<()> {
+    set_password_on(&crate::net::Tokio, ticket, target, new_password, server).await
 }
 
 /// `kadmin/changepw@realm`.
@@ -240,11 +331,18 @@ fn rd_priv(key: &Key, msg: &[u8]) -> Result<Vec<u8>> {
 
 /// Send one request (TCP first, then UDP, as MIT does: a UDP retransmit
 /// could look like a replay) and read the result.
-fn exchange(ticket: &Credentials, version: u16, data: &[u8], server: &str) -> Result<()> {
-    let addr = server
-        .to_socket_addrs()
+async fn exchange<N: Net>(
+    net: &N,
+    ticket: &Credentials,
+    version: u16,
+    data: &[u8],
+    server: &str,
+) -> Result<()> {
+    let addr = *net
+        .resolve(server)
+        .await
         .map_err(Error::Io)?
-        .next()
+        .first()
         .ok_or_else(|| Error::Config(format!("{server}: no address")))?;
     let subkey = Key::random(ticket.session_key.enctype()).map_err(ClientError::from)?;
     let seq = rand::random::<u32>() & 0x3FFF_FFFF;
@@ -278,37 +376,35 @@ fn exchange(ticket: &Credentials, version: u16, data: &[u8], server: &str) -> Re
         Ok(m)
     };
     let timeout = Duration::from_secs(10);
-    let reply = match TcpStream::connect_timeout(&addr, timeout) {
+    let reply = match net.connect(addr, timeout).await {
         Ok(mut s) => {
-            s.set_read_timeout(Some(timeout)).map_err(Error::Io)?;
-            let local = s.local_addr().map_err(Error::Io)?.ip();
+            let local = net.tcp_local(&s).map_err(Error::Io)?.ip();
             let req = request(local)?;
             let mut framed = (req.len() as u32).to_be_bytes().to_vec();
             framed.extend_from_slice(&req);
-            s.write_all(&framed).map_err(Error::Io)?;
+            net.write_all(&mut s, &framed, timeout)
+                .await
+                .map_err(Error::Io)?;
             let mut len = [0u8; 4];
-            s.read_exact(&mut len).map_err(Error::Io)?;
+            net.read_exact(&mut s, &mut len, timeout)
+                .await
+                .map_err(Error::Io)?;
             let n = u32::from_be_bytes(len) as usize;
             if n > 65536 {
                 return bad("kpasswd reply too long");
             }
             let mut r = vec![0; n];
-            s.read_exact(&mut r).map_err(Error::Io)?;
+            net.read_exact(&mut s, &mut r, timeout)
+                .await
+                .map_err(Error::Io)?;
             r
         }
         Err(_) => {
-            let bind = if addr.is_ipv4() {
-                "0.0.0.0:0"
-            } else {
-                "[::]:0"
-            };
-            let u = UdpSocket::bind(bind).map_err(Error::Io)?;
-            u.connect(addr).map_err(Error::Io)?;
-            u.set_read_timeout(Some(timeout)).map_err(Error::Io)?;
-            let local = u.local_addr().map_err(Error::Io)?.ip();
-            u.send(&request(local)?).map_err(Error::Io)?;
+            let u = net.udp(addr).await.map_err(Error::Io)?;
+            let local = net.udp_local(&u).map_err(Error::Io)?.ip();
+            net.send(&u, &request(local)?).await.map_err(Error::Io)?;
             let mut buf = vec![0u8; 65536];
-            let n = u.recv(&mut buf).map_err(Error::Io)?;
+            let n = net.recv(&u, &mut buf, timeout).await.map_err(Error::Io)?;
             buf.truncate(n);
             buf
         }

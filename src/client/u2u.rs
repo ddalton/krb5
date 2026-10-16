@@ -31,6 +31,16 @@ impl KdcClient {
         server: &Principal,
         server_tgt: &[u8],
     ) -> Result<Credentials> {
+        block_on(self.user_to_user_on(&Blocking, tgt, server, server_tgt))
+    }
+
+    pub(crate) async fn user_to_user_on<N: Net>(
+        &self,
+        net: &N,
+        tgt: &Credentials,
+        server: &Principal,
+        server_tgt: &[u8],
+    ) -> Result<Credentials> {
         let realm = tgt_realm(tgt).to_string();
         let mut server = server.clone();
         if server.realm.is_empty() {
@@ -45,12 +55,14 @@ impl KdcClient {
             )));
         }
         self.tgs_ext(
+            net,
             &realm,
             tgt,
             &server,
             KDC_OPT_ENC_TKT_IN_SKEY,
             &S4u::UserToUser(server_tgt),
         )
+        .await
         .map(|r| r.creds)
     }
 }

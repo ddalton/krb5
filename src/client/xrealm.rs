@@ -23,6 +23,7 @@
 
 use super::{ClientError, Credentials, KdcClient, Principal, Result};
 use crate::config::Krb5Conf;
+use crate::net::Net;
 use tracing::debug;
 
 /// MIT's `KRB5_REFERRAL_MAXHOPS`.
@@ -32,7 +33,7 @@ pub const MAX_HOPS: usize = 10;
 pub(crate) const KDC_OPT_CANONICALIZE: u32 = 1 << 16;
 
 /// TGTs picked up along the way, and the cache they may come from.
-pub(crate) trait TgtStore {
+pub(crate) trait TgtStore: Send {
     /// An unexpired TGT for `realm` (`krbtgt/realm@ANY`).
     fn cached_tgt(&self, realm: &str) -> Option<Credentials>;
     /// A TGT obtained on the way, worth keeping.
@@ -88,29 +89,53 @@ fn fallback_realm(conf: &Krb5Conf, host: &str) -> Option<String> {
 impl KdcClient {
     /// The whole MIT algorithm: from `start` (a TGT for the client's realm)
     /// to a ticket for `service`.
-    pub(crate) fn get_creds(
+    pub(crate) async fn get_creds<N: Net>(
         &self,
+        net: &N,
         start: &Credentials,
         service: &Principal,
         store: &mut dyn TgtStore,
     ) -> Result<Credentials> {
-        let mut tgs =
-            |tgt: &Credentials, server: &Principal, opts: u32| self.tgs(tgt, server, opts);
-        get_creds_with(&self.conf, start, service, store, &mut tgs)
+        let mut tgs = Exchange { kdc: self, net };
+        get_creds_with(&self.conf, start, service, store, &mut tgs).await
     }
 }
 
 /// One TGS exchange: (TGT, requested server, KDC options) -> reply.
-pub(crate) type Tgs<'a> = dyn FnMut(&Credentials, &Principal, u32) -> Result<Credentials> + 'a;
+pub(crate) trait Tgs: Send {
+    fn tgs(
+        &mut self,
+        tgt: &Credentials,
+        server: &Principal,
+        kdc_options: u32,
+    ) -> impl Future<Output = Result<Credentials>> + Send;
+}
+
+/// The exchange with the KDCs.
+struct Exchange<'a, N> {
+    kdc: &'a KdcClient,
+    net: &'a N,
+}
+
+impl<N: Net> Tgs for Exchange<'_, N> {
+    fn tgs(
+        &mut self,
+        tgt: &Credentials,
+        server: &Principal,
+        kdc_options: u32,
+    ) -> impl Future<Output = Result<Credentials>> + Send {
+        self.kdc.tgs(self.net, tgt, server, kdc_options)
+    }
+}
 
 /// The algorithm, with the exchange abstracted so it can be tested
 /// against a scripted set of realms.
-pub(crate) fn get_creds_with(
+pub(crate) async fn get_creds_with(
     conf: &Krb5Conf,
     start: &Credentials,
     service: &Principal,
     store: &mut dyn TgtStore,
-    tgs: &mut Tgs<'_>,
+    tgs: &mut impl Tgs,
 ) -> Result<Credentials> {
     if !is_tgs(&start.server) {
         return Err(ClientError::Protocol(format!(
@@ -125,16 +150,16 @@ pub(crate) fn get_creds_with(
         server.realm = start_realm.clone();
     }
 
-    let mut cur = tgt_for(conf, start, &server.realm, store, tgs)?;
+    let mut cur = tgt_for(conf, start, &server.realm, store, tgs).await?;
     let mut seen: Vec<String> = Vec::new();
     for count in 1.. {
-        let reply = match tgs(&cur, &server, KDC_OPT_CANONICALIZE) {
+        let reply = match tgs.tgs(&cur, &server, KDC_OPT_CANONICALIZE).await {
             Ok(r) => r,
             // Only the first referral request has a fallback.
             Err(e) if count > 1 => return Err(e),
             Err(e) if !referral_req => {
                 debug!("{server}: referral request failed ({e}); asking without canonicalize");
-                return non_referral(&cur, &server, service, tgs);
+                return non_referral(&cur, &server, service, tgs).await;
             }
             Err(e) => {
                 let Some(realm) = server
@@ -148,9 +173,9 @@ pub(crate) fn get_creds_with(
                 debug!("{server}: referral request failed ({e}); falling back to {realm}");
                 if realm != server.realm {
                     server.realm = realm;
-                    cur = tgt_for(conf, start, &server.realm, store, tgs)?;
+                    cur = tgt_for(conf, start, &server.realm, store, tgs).await?;
                 }
-                return non_referral(&cur, &server, service, tgs);
+                return non_referral(&cur, &server, service, tgs).await;
             }
         };
 
@@ -160,12 +185,12 @@ pub(crate) fn get_creds_with(
         }
         // Old Active Directory rewrites the name instead of referring.
         if !is_tgs(&reply.server) {
-            return non_referral(&cur, &server, service, tgs);
+            return non_referral(&cur, &server, service, tgs).await;
         }
         let next = tgt_realm(&reply).to_string();
         // Active Directory may hand back a TGT for the realm we are in.
         if next == tgt_realm(&cur) {
-            return non_referral(&cur, &server, service, tgs);
+            return non_referral(&cur, &server, service, tgs).await;
         }
         if count >= MAX_HOPS {
             return Err(ClientError::Referral(format!(
@@ -187,22 +212,22 @@ pub(crate) fn get_creds_with(
 }
 
 /// One plain request for the service, no canonicalize, no fallbacks.
-fn non_referral(
+async fn non_referral(
     tgt: &Credentials,
     server: &Principal,
     service: &Principal,
-    tgs: &mut Tgs<'_>,
+    tgs: &mut impl Tgs,
 ) -> Result<Credentials> {
-    Ok(as_requested(tgs(tgt, server, 0)?, service))
+    Ok(as_requested(tgs.tgs(tgt, server, 0).await?, service))
 }
 
 /// A TGT usable at `realm`'s KDC, starting from `start`.
-fn tgt_for(
+async fn tgt_for(
     conf: &Krb5Conf,
     start: &Credentials,
     realm: &str,
     store: &mut dyn TgtStore,
-    tgs: &mut Tgs<'_>,
+    tgs: &mut impl Tgs,
 ) -> Result<Credentials> {
     let start_realm = tgt_realm(start).to_string();
     if realm == start_realm {
@@ -224,7 +249,7 @@ fn tgt_for(
             continue;
         }
         let want = Principal::krbtgt_for(&path[next_i], tgt_realm(&cur));
-        match tgs(&cur, &want, 0) {
+        match tgs.tgs(&cur, &want, 0).await {
             Err(e) => {
                 // Try the next-closest realm on the path.
                 next_i -= 1;
@@ -256,7 +281,7 @@ fn tgt_for(
                             "referred back to {start_realm} on the way to {realm}"
                         )));
                     }
-                    None => return offpath(reply, realm, seen, store, tgs),
+                    None => return offpath(reply, realm, seen, store, tgs).await,
                 }
             }
         }
@@ -265,17 +290,17 @@ fn tgt_for(
 
 /// MIT's STATE_GET_TGT_OFFPATH: a KDC gave a TGT for a realm off our
 /// path; keep asking whoever we can reach for `realm`'s TGT.
-fn offpath(
+async fn offpath(
     mut cur: Credentials,
     realm: &str,
     mut seen: Vec<String>,
     store: &mut dyn TgtStore,
-    tgs: &mut Tgs<'_>,
+    tgs: &mut impl Tgs,
 ) -> Result<Credentials> {
     debug!("off the path to {realm} at {}", tgt_realm(&cur));
     for count in 1.. {
         let want = Principal::krbtgt_for(realm, tgt_realm(&cur));
-        let reply = tgs(&cur, &want, 0)?;
+        let reply = tgs.tgs(&cur, &want, 0).await?;
         if !is_tgs(&reply.server) {
             return Err(modified(&reply.server));
         }
@@ -420,12 +445,12 @@ mod tests {
         conf: &str,
         service: Principal,
         store: &mut dyn TgtStore,
-        kdc: impl Fn(&str, &str, bool) -> Ans,
+        kdc: impl Fn(&str, &str, bool) -> Ans + Sync,
     ) -> (Result<Credentials>, Vec<String>) {
         let conf = Krb5Conf::parse(conf).unwrap();
         let start = creds(&alice(), Principal::krbtgt("A"));
         let mut log = Vec::new();
-        let mut tgs = |tgt: &Credentials, server: &Principal, opts: u32| {
+        let tgs = |tgt: &Credentials, server: &Principal, opts: u32| {
             let realm = tgt_realm(tgt).to_string();
             let canon = opts & KDC_OPT_CANONICALIZE != 0;
             log.push(format!(
@@ -446,8 +471,30 @@ mod tests {
                 }),
             }
         };
-        let r = get_creds_with(&conf, &start, &service, store, &mut tgs);
+        let r = crate::net::block_on(get_creds_with(
+            &conf,
+            &start,
+            &service,
+            store,
+            &mut Script(tgs),
+        ));
         (r, log)
+    }
+
+    struct Script<F>(F);
+
+    impl<F> Tgs for Script<F>
+    where
+        F: FnMut(&Credentials, &Principal, u32) -> Result<Credentials> + Send,
+    {
+        fn tgs(
+            &mut self,
+            tgt: &Credentials,
+            server: &Principal,
+            kdc_options: u32,
+        ) -> impl Future<Output = Result<Credentials>> + Send {
+            std::future::ready((self.0)(tgt, server, kdc_options))
+        }
     }
 
     #[derive(Default)]

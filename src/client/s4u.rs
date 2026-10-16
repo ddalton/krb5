@@ -177,6 +177,15 @@ impl KdcClient {
     /// against the KDC's checksummed PA-S4U-X509-USER as MIT checks it.
     /// `user` must be in the service's realm.
     pub fn s4u2self(&self, tgt: &Credentials, user: &Principal) -> Result<Credentials> {
+        block_on(self.s4u2self_on(&Blocking, tgt, user))
+    }
+
+    pub(crate) async fn s4u2self_on<N: Net>(
+        &self,
+        net: &N,
+        tgt: &Credentials,
+        user: &Principal,
+    ) -> Result<Credentials> {
         let realm = tgt_realm(tgt).to_string();
         let mut user = user.clone();
         if user.realm.is_empty() {
@@ -187,13 +196,16 @@ impl KdcClient {
                 "S4U2Self for {user} through a TGT for {realm}: cross-realm S4U2Self is not supported"
             )));
         }
-        let reply = self.tgs_ext(
-            &realm,
-            tgt,
-            &tgt.client,
-            KDC_OPT_CANONICALIZE,
-            &S4u::User(&user),
-        )?;
+        let reply = self
+            .tgs_ext(
+                net,
+                &realm,
+                tgt,
+                &tgt.client,
+                KDC_OPT_CANONICALIZE,
+                &S4u::User(&user),
+            )
+            .await?;
         check_s4u2self_reply(reply, &user)
     }
 
@@ -213,18 +225,31 @@ impl KdcClient {
         evidence: &Credentials,
         target: &Principal,
     ) -> Result<Credentials> {
+        block_on(self.s4u2proxy_on(&Blocking, tgt, evidence, target))
+    }
+
+    pub(crate) async fn s4u2proxy_on<N: Net>(
+        &self,
+        net: &N,
+        tgt: &Credentials,
+        evidence: &Credentials,
+        target: &Principal,
+    ) -> Result<Credentials> {
         let realm = tgt_realm(tgt).to_string();
         let mut target = target.clone();
         if target.realm.is_empty() {
             target.realm = realm.clone();
         }
-        let reply = self.tgs_ext(
-            &realm,
-            tgt,
-            &target,
-            KDC_OPT_CNAME_IN_ADDL_TKT | KDC_OPT_CANONICALIZE,
-            &S4u::Proxy { evidence },
-        )?;
+        let reply = self
+            .tgs_ext(
+                net,
+                &realm,
+                tgt,
+                &target,
+                KDC_OPT_CNAME_IN_ADDL_TKT | KDC_OPT_CANONICALIZE,
+                &S4u::Proxy { evidence },
+            )
+            .await?;
         let got = &reply.creds.server;
         if !(got.components == target.components && got.name_type == target.name_type
             || same_principal(got, &target))

@@ -305,9 +305,19 @@ impl KdcClient {
     pub fn login_with_otp_by(
         &self,
         client: &Principal,
-        answer: impl Fn(&OtpChallenge) -> Result<OtpAnswer>,
+        answer: impl Fn(&OtpChallenge) -> Result<OtpAnswer> + Sync,
     ) -> Result<Credentials> {
-        self.as_exchange(client, Secret::Otp(&answer), self.tkt_enctypes.clone())
+        block_on(self.login_with_otp_on(&Blocking, client, &answer))
+    }
+
+    pub(crate) async fn login_with_otp_on<N: Net>(
+        &self,
+        net: &N,
+        client: &Principal,
+        answer: &(dyn Fn(&OtpChallenge) -> Result<OtpAnswer> + Sync),
+    ) -> Result<Credentials> {
+        self.as_exchange(net, client, Secret::Otp(answer), self.tkt_enctypes.clone())
+            .await
             .map(|(c, _)| c)
     }
 }
