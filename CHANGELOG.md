@@ -7,6 +7,20 @@ may break the API).
 
 ## [Unreleased]
 
+### Changed
+
+- Faster string-to-key: PBKDF2 now precomputes the HMAC key's inner and
+  outer states and runs each of its thousands of rounds as two calls of
+  the compression function, where the `pbkdf2` crate went through
+  `hmac`'s cloning and buffering every round. That overhead had made
+  string-to-key about 12% slower on x86 in 0.12.1 than in 0.12.0. On an
+  AMD EPYC 7763, against 0.13.0: aes128-cts-hmac-sha1-96 503 µs to
+  416 µs, aes256-cts-hmac-sha1-96 1.0 ms to 0.83 ms,
+  aes256-cts-hmac-sha384-192 17.2 ms to 16.6 ms (aes128-cts-hmac-sha256-128
+  unchanged at 3.5 ms), each now faster than 0.12.0 too.
+- The `pbkdf2` crate is now a dependency only with `pkinit` (for PKCS #12
+  files): the default build has 9 direct dependencies.
+
 ## [0.13.0] - 2026-10-15
 
 ### Added

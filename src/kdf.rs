@@ -40,9 +40,10 @@ use aes::{
     cipher::{BlockCipherEncrypt, KeyInit},
 };
 use hmac::{Hmac, Mac};
-use pbkdf2::pbkdf2_hmac;
 use sha1::{Digest, Sha1};
 use sha2::{Sha256, Sha384};
+
+mod pbkdf2;
 
 use super::nfold::n_fold;
 
@@ -648,17 +649,17 @@ fn string_to_key_inner(
     match enctype {
         Enctype::Aes128CtsHmacSha196 | Enctype::Aes256CtsHmacSha196 => {
             // RFC 3962 §4: PBKDF2's PRF is HMAC-SHA-1, over the bare salt.
-            pbkdf2_hmac::<Sha1>(passphrase, salt, iter, &mut tkey);
+            pbkdf2::pbkdf2_hmac_sha1(passphrase, salt, iter, &mut tkey);
             dk(&tkey, KERBEROS, keylen)
         }
         Enctype::Aes128CtsHmacSha256128 => {
             let saltp = rfc8009_saltp(enctype, salt)?;
-            pbkdf2_hmac::<Sha256>(passphrase, &saltp, iter, &mut tkey);
+            pbkdf2::pbkdf2_hmac_sha256(passphrase, &saltp, iter, &mut tkey);
             kdf_hmac_sha2(enctype, &tkey, KERBEROS, None, keylen as u32 * 8)
         }
         Enctype::Aes256CtsHmacSha384192 => {
             let saltp = rfc8009_saltp(enctype, salt)?;
-            pbkdf2_hmac::<Sha384>(passphrase, &saltp, iter, &mut tkey);
+            pbkdf2::pbkdf2_hmac_sha384(passphrase, &saltp, iter, &mut tkey);
             // keylen here is the AES key size (256 bits), NOT the 192 that
             // Kc and Ki use. One "key length" constant cannot serve both.
             kdf_hmac_sha2(enctype, &tkey, KERBEROS, None, keylen as u32 * 8)
@@ -931,7 +932,7 @@ mod tests {
             .enumerate()
         {
             let mut got128 = [0u8; 16];
-            pbkdf2_hmac::<Sha1>(pass, salt, *iter, &mut got128);
+            pbkdf2::pbkdf2_hmac_sha1(pass, salt, *iter, &mut got128);
             assert_eq!(
                 hexs(&got128),
                 hexs(&h(t128)),
@@ -940,7 +941,7 @@ mod tests {
             );
 
             let mut got256 = [0u8; 32];
-            pbkdf2_hmac::<Sha1>(pass, salt, *iter, &mut got256);
+            pbkdf2::pbkdf2_hmac_sha1(pass, salt, *iter, &mut got256);
             assert_eq!(
                 hexs(&got256),
                 hexs(&h(t256)),
